@@ -13,7 +13,7 @@
  *
  * All parameters are loaded from a JSON configuration file for reproducibility.
  *
- * FIX: Improved metadata extraction with better error handling and micromamba activation
+ * FIX: Proper JSON handling in Python heredocs to avoid boolean parsing errors
  */
 
 nextflow.enable.dsl=2
@@ -317,6 +317,7 @@ process PREPROCESS_DECONVOLVE {
     def cfg = preprocess_config
     def t_formatted = String.format('%04d', timepoint)
     def filename = image_file.name
+    def config_json_str = groovy.json.JsonOutput.toJson(cfg).replace("'", "\\'")
     """
     #!/bin/bash
     set -euo pipefail
@@ -341,8 +342,8 @@ import subprocess
 with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
-# Load config
-config = ${groovy.json.JsonOutput.toJson(cfg)}
+# Load config - parse from JSON string to handle booleans correctly
+config = json.loads('${config_json_str}')
 
 # Build command for preprocessing script
 cmd = [
@@ -481,6 +482,7 @@ process CELLPOSE_SEGMENT {
     def cfg = segment_config
     def t_formatted = String.format('%04d', timepoint)
     def filename = processed_file.name
+    def config_json_str = groovy.json.JsonOutput.toJson(cfg).replace("'", "\\'")
     """
     #!/bin/bash
     set -euo pipefail
@@ -494,27 +496,60 @@ process CELLPOSE_SEGMENT {
     echo "File: ${filename}"
     echo "============================================"
 
-    # Build Cellpose command
-    CELLPOSE_CMD="cellpose --image_path ${filename}"
-    CELLPOSE_CMD+=" --savedir ."
-    CELLPOSE_CMD+=" --pretrained_model ${cfg.model}"
-    CELLPOSE_CMD+=" --diameter ${cfg.diameter}"
-    CELLPOSE_CMD+=" --flow_threshold ${cfg.flow_threshold}"
-    CELLPOSE_CMD+=" --cellprob_threshold ${cfg.cellprob_threshold}"
+    # Build Cellpose command using Python to handle config properly
+    python3 << 'PYTHON_EOF'
+import json
+import sys
+import subprocess
 
-    ${cfg.use_gpu ? 'CELLPOSE_CMD+=" --use_gpu"' : ''}
-    ${cfg.do_3d ? 'CELLPOSE_CMD+=" --do_3D"' : ''}
-    ${cfg.save_tif ? 'CELLPOSE_CMD+=" --save_tif"' : ''}
-    ${cfg.save_flows ? 'CELLPOSE_CMD+=" --save_flows"' : ''}
-    ${cfg.save_npy ? '' : 'CELLPOSE_CMD+=" --no_npy"'}
+# Load config - parse from JSON string to handle booleans correctly
+config = json.loads('${config_json_str}')
 
-    CELLPOSE_CMD+=" --verbose"
+# Build Cellpose command
+cmd = [
+    'cellpose',
+    '--image_path', '${filename}',
+    '--savedir', '.',
+    '--pretrained_model', config['model'],
+    '--diameter', str(config['diameter']),
+    '--flow_threshold', str(config['flow_threshold']),
+    '--cellprob_threshold', str(config['cellprob_threshold']),
+    '--verbose'
+]
 
-    echo "Running Cellpose: \$CELLPOSE_CMD"
-    echo ""
+# Add boolean flags
+if config.get('use_gpu', False):
+    cmd.append('--use_gpu')
+if config.get('do_3d', False):
+    cmd.append('--do_3D')
+if config.get('save_tif', True):
+    cmd.append('--save_tif')
+if config.get('save_flows', False):
+    cmd.append('--save_flows')
+if not config.get('save_npy', True):
+    cmd.append('--no_npy')
 
-    # Run Cellpose and capture output
-    \$CELLPOSE_CMD 2>&1 | tee t${t_formatted}_segment.log
+print("Running Cellpose:", ' '.join(cmd))
+print("")
+
+# Run Cellpose
+result = subprocess.run(cmd, capture_output=True, text=True)
+
+# Save log
+with open('t${t_formatted}_segment.log', 'w') as f:
+    f.write("STDOUT:\\n")
+    f.write(result.stdout)
+    f.write("\\n\\nSTDERR:\\n")
+    f.write(result.stderr)
+
+print(result.stdout)
+if result.stderr:
+    print("STDERR:", result.stderr, file=sys.stderr)
+
+if result.returncode != 0:
+    print(f"ERROR: Cellpose failed with exit code {result.returncode}")
+    sys.exit(result.returncode)
+PYTHON_EOF
 
     # Find and rename Cellpose output
     CELLPOSE_OUTPUT=\$(ls *_cp_masks.tif 2>/dev/null | head -1)
@@ -533,12 +568,15 @@ import numpy as np
 with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
+# Load config
+config = json.loads('${config_json_str}')
+
 # Load mask
 mask = tifffile.imread("t${t_formatted}_segmented.tif")
 
 # Calculate voxel sizes (accounting for preprocessing scaling)
-x_res = metadata['x_resolution_um'] / ${cfg.image_scaling}
-y_res = metadata['y_resolution_um'] / ${cfg.image_scaling}
+x_res = metadata['x_resolution_um'] / config['image_scaling']
+y_res = metadata['y_resolution_um'] / config['image_scaling']
 z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
 
 # Re-save with metadata
@@ -592,6 +630,7 @@ process MERGE_TO_HYPERSTACK {
     container params.container
 
     script:
+    def config_json_str = groovy.json.JsonOutput.toJson(config).replace("'", "\\'")
     """
     #!/bin/bash
     set -e
@@ -635,6 +674,9 @@ timepoint_data.sort(key=lambda x: x[0])
 with open('${metadata_json}', 'r') as f:
     ref_metadata = json.load(f)
 
+# Load config
+config = json.loads('${config_json_str}')
+
 # Load all timepoints
 timepoint_arrays = []
 for t, f in timepoint_data:
@@ -657,7 +699,7 @@ img_4d = np.stack(timepoint_arrays, axis=0)
 print(f"\\nMerged 4D shape: {img_4d.shape} (TZYX)")
 
 # Calculate metadata (accounting for preprocessing scaling)
-scaling = ${config.segmentation.image_scaling}
+scaling = config['segmentation']['image_scaling']
 x_res = ref_metadata['x_resolution_um'] / scaling
 y_res = ref_metadata['y_resolution_um'] / scaling
 z_spacing = ref_metadata['imagej']['spacing'] if 'imagej' in ref_metadata else 1.0
@@ -681,10 +723,10 @@ hyperstack_metadata = {
     'n_timepoints': img_4d.shape[0],
     'is_label_image': True,
     'processing': {
-        'preprocessing_scaling': ${config.preprocessing.image_scaling},
+        'preprocessing_scaling': config['preprocessing']['image_scaling'],
         'segmentation_scaling': scaling,
-        'cellpose_diameter': ${config.segmentation.diameter},
-        'cellpose_model': '${config.segmentation.model}'
+        'cellpose_diameter': config['segmentation']['diameter'],
+        'cellpose_model': config['segmentation']['model']
     },
     'original_metadata': ref_metadata
 }
