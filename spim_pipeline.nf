@@ -147,40 +147,24 @@ process EXTRACT_METADATA {
     import json
     import traceback
 
-    print("="*60, file=sys.stderr)
-    print("EXTRACT_METADATA DEBUG INFO", file=sys.stderr)
-    print("="*60, file=sys.stderr)
-    print(f"Python version: {sys.version}", file=sys.stderr)
-
-    # List files in current directory
-    import os
-    print(f"Working directory: {os.getcwd()}", file=sys.stderr)
-    print(f"\\nFiles in work directory:", file=sys.stderr)
-    for f in os.listdir('.'):
-        print(f"  - {f}", file=sys.stderr)
-
     try:
         import tifffile
         import numpy as np
         from pathlib import Path
 
-        print(f"\\nTifffile version: {tifffile.__version__}", file=sys.stderr)
-        print(f"Numpy version: {np.__version__}", file=sys.stderr)
-
         filename = '${filename}'
-        print(f"\\nAttempting to open: {filename}", file=sys.stderr)
 
-        if not os.path.exists(filename):
-            print(f"ERROR: File does not exist: {filename}", file=sys.stderr)
-            sys.exit(1)
-
-        file_size = os.path.getsize(filename)
-        print(f"File size: {file_size:,} bytes", file=sys.stderr)
-
-        # Read TIFF metadata
-        print(f"Opening TIFF file...", file=sys.stderr)
+        # Open TIFF without loading data
         with tifffile.TiffFile(filename) as tif:
             metadata = {}
+
+            # Get number of pages (Z slices) WITHOUT loading data
+            n_pages = len(tif.pages)
+
+            # Get image dimensions from first page
+            first_page = tif.pages[0]
+            height = first_page.shape[0]
+            width = first_page.shape[1]
 
             # ImageJ metadata
             if tif.imagej_metadata:
@@ -188,11 +172,18 @@ process EXTRACT_METADATA {
                     'spacing': tif.imagej_metadata.get('spacing', 1.0),
                     'unit': tif.imagej_metadata.get('unit', 'micron'),
                     'axes': tif.imagej_metadata.get('axes', 'ZYX'),
-                    'slices': tif.imagej_metadata.get('slices', tif.series[0].shape[0]),
+                    'slices': tif.imagej_metadata.get('slices', n_pages),  # Use n_pages instead
+                }
+            else:
+                # Fallback if no ImageJ metadata
+                metadata['imagej'] = {
+                    'spacing': 1.0,
+                    'unit': 'micron',
+                    'axes': 'ZYX',
+                    'slices': n_pages,
                 }
 
             # TIFF tags from first page
-            first_page = tif.pages[0]
             tags = first_page.tags
 
             # Extract resolution
@@ -208,38 +199,30 @@ process EXTRACT_METADATA {
             else:
                 metadata['y_resolution_um'] = 1.0
 
-            # Image dimensions
+            # Image dimensions - from page info, not loading data
             metadata['shape'] = {
                 'axes': 'ZYX',
-                'dimensions': list(tif.series[0].shape)
+                'dimensions': [n_pages, height, width]
             }
 
-            # Data type
-            metadata['dtype'] = str(tif.series[0].dtype)
+            # Data type from first page
+            metadata['dtype'] = str(first_page.dtype)
 
             # Software info
             if 'Software' in tags:
                 metadata['software'] = tags['Software'].value
 
         # Save metadata
-        print(f"\\nWriting metadata to shared_metadata.json", file=sys.stderr)
         with open('shared_metadata.json', 'w') as f:
             json.dump(metadata, f, indent=2)
 
-        print(f"\\nSUCCESS: Metadata extracted and saved", file=sys.stderr)
-        print("="*60, file=sys.stderr)
-
-        # Also print to stdout for nextflow logs
         print(f"Metadata saved to: shared_metadata.json")
+        print(f"Image shape: {metadata['shape']['dimensions']} (ZYX)")
         print(json.dumps(metadata, indent=2))
 
     except Exception as e:
-        print(f"\\nERROR: Exception occurred", file=sys.stderr)
-        print(f"Exception type: {type(e).__name__}", file=sys.stderr)
-        print(f"Exception message: {str(e)}", file=sys.stderr)
-        print(f"\\nFull traceback:", file=sys.stderr)
+        print(f"ERROR: {type(e).__name__}: {str(e)}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
-        print("="*60, file=sys.stderr)
         sys.exit(1)
     """
 }
