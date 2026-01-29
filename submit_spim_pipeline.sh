@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --no-requeue
-#SBATCH --mem 30G
+#SBATCH --mem 20GB
 #SBATCH -p c
 #SBATCH --qos c_medium
 #SBATCH --time 2-00:00:00
