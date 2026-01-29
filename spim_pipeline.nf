@@ -2,7 +2,7 @@
 
 /*
  * ============================================================================
- * SPIM 4D Image Processing Pipeline - CORRECTED VERSION
+ * SPIM 4D Image Processing Pipeline - CORRECTED VERSION WITH MICROMAMBA
  * ============================================================================
  *
  * This pipeline processes 4D SPIM images through:
@@ -142,88 +142,96 @@ process EXTRACT_METADATA {
     script:
     def filename = image_file.name
     """
-    #!/usr/bin/env python3
-    import sys
-    import json
-    import traceback
+    #!/bin/bash
+    set -e
 
-    try:
-        import tifffile
-        import numpy as np
-        from pathlib import Path
+    # Activate micromamba environment
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
 
-        filename = '${filename}'
+    # Run Python script
+    python3 << 'EOF'
+import sys
+import json
+import traceback
 
-        # Open TIFF without loading data
-        with tifffile.TiffFile(filename) as tif:
-            metadata = {}
+try:
+    import tifffile
+    import numpy as np
+    from pathlib import Path
 
-            # Get number of pages (Z slices) WITHOUT loading data
-            n_pages = len(tif.pages)
+    filename = '${filename}'
 
-            # Get image dimensions from first page
-            first_page = tif.pages[0]
-            height = first_page.shape[0]
-            width = first_page.shape[1]
+    # Open TIFF without loading data
+    with tifffile.TiffFile(filename) as tif:
+        metadata = {}
 
-            # ImageJ metadata
-            if tif.imagej_metadata:
-                metadata['imagej'] = {
-                    'spacing': tif.imagej_metadata.get('spacing', 1.0),
-                    'unit': tif.imagej_metadata.get('unit', 'micron'),
-                    'axes': tif.imagej_metadata.get('axes', 'ZYX'),
-                    'slices': tif.imagej_metadata.get('slices', n_pages),  # Use n_pages instead
-                }
-            else:
-                # Fallback if no ImageJ metadata
-                metadata['imagej'] = {
-                    'spacing': 1.0,
-                    'unit': 'micron',
-                    'axes': 'ZYX',
-                    'slices': n_pages,
-                }
+        # Get number of pages (Z slices) WITHOUT loading data
+        n_pages = len(tif.pages)
 
-            # TIFF tags from first page
-            tags = first_page.tags
+        # Get image dimensions from first page
+        first_page = tif.pages[0]
+        height = first_page.shape[0]
+        width = first_page.shape[1]
 
-            # Extract resolution
-            if 'XResolution' in tags:
-                x_num, x_denom = tags['XResolution'].value
-                metadata['x_resolution_um'] = x_denom / x_num if x_num != 0 else 1.0
-            else:
-                metadata['x_resolution_um'] = 1.0
-
-            if 'YResolution' in tags:
-                y_num, y_denom = tags['YResolution'].value
-                metadata['y_resolution_um'] = y_denom / y_num if y_num != 0 else 1.0
-            else:
-                metadata['y_resolution_um'] = 1.0
-
-            # Image dimensions - from page info, not loading data
-            metadata['shape'] = {
+        # ImageJ metadata
+        if tif.imagej_metadata:
+            metadata['imagej'] = {
+                'spacing': tif.imagej_metadata.get('spacing', 1.0),
+                'unit': tif.imagej_metadata.get('unit', 'micron'),
+                'axes': tif.imagej_metadata.get('axes', 'ZYX'),
+                'slices': tif.imagej_metadata.get('slices', n_pages),
+            }
+        else:
+            metadata['imagej'] = {
+                'spacing': 1.0,
+                'unit': 'micron',
                 'axes': 'ZYX',
-                'dimensions': [n_pages, height, width]
+                'slices': n_pages,
             }
 
-            # Data type from first page
-            metadata['dtype'] = str(first_page.dtype)
+        # TIFF tags from first page
+        tags = first_page.tags
 
-            # Software info
-            if 'Software' in tags:
-                metadata['software'] = tags['Software'].value
+        # Extract resolution
+        if 'XResolution' in tags:
+            x_num, x_denom = tags['XResolution'].value
+            metadata['x_resolution_um'] = x_denom / x_num if x_num != 0 else 1.0
+        else:
+            metadata['x_resolution_um'] = 1.0
 
-        # Save metadata
-        with open('shared_metadata.json', 'w') as f:
-            json.dump(metadata, f, indent=2)
+        if 'YResolution' in tags:
+            y_num, y_denom = tags['YResolution'].value
+            metadata['y_resolution_um'] = y_denom / y_num if y_num != 0 else 1.0
+        else:
+            metadata['y_resolution_um'] = 1.0
 
-        print(f"Metadata saved to: shared_metadata.json")
-        print(f"Image shape: {metadata['shape']['dimensions']} (ZYX)")
-        print(json.dumps(metadata, indent=2))
+        # Image dimensions - from page info, not loading data
+        metadata['shape'] = {
+            'axes': 'ZYX',
+            'dimensions': [n_pages, height, width]
+        }
 
-    except Exception as e:
-        print(f"ERROR: {type(e).__name__}: {str(e)}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
+        # Data type from first page
+        metadata['dtype'] = str(first_page.dtype)
+
+        # Software info
+        if 'Software' in tags:
+            metadata['software'] = tags['Software'].value
+
+    # Save metadata
+    with open('shared_metadata.json', 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"Metadata saved to: shared_metadata.json")
+    print(f"Image shape: {metadata['shape']['dimensions']} (ZYX)")
+    print(json.dumps(metadata, indent=2))
+
+except Exception as e:
+    print(f"ERROR: {type(e).__name__}: {str(e)}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+EOF
     """
 }
 
@@ -263,6 +271,10 @@ process PREPROCESS_DECONVOLVE {
     """
     #!/bin/bash
     set -euo pipefail
+
+    # Activate micromamba environment
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
 
     echo "============================================"
     echo "Preprocessing timepoint: ${timepoint}"
@@ -424,6 +436,10 @@ process CELLPOSE_SEGMENT {
     #!/bin/bash
     set -euo pipefail
 
+    # Activate micromamba environment
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
     echo "============================================"
     echo "Segmentation timepoint: ${timepoint}"
     echo "File: ${filename}"
@@ -528,124 +544,132 @@ process MERGE_TO_HYPERSTACK {
 
     script:
     """
-    #!/usr/bin/env python3
-    import tifffile
-    import numpy as np
-    import json
-    from pathlib import Path
-    import re
+    #!/bin/bash
+    set -e
 
-    print("="*60)
-    print("Merging all timepoints into 4D hyperstack")
-    print("="*60)
+    # Activate micromamba environment
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
 
-    # Get all segmented files and sort by timepoint number
-    seg_files = sorted(Path('.').glob('t*_segmented.tif'))
+    python3 << 'EOF'
+import tifffile
+import numpy as np
+import json
+from pathlib import Path
+import re
 
-    if not seg_files:
-        raise ValueError("No segmented files found!")
+print("="*60)
+print("Merging all timepoints into 4D hyperstack")
+print("="*60)
 
-    print(f"Found {len(seg_files)} timepoint files")
+# Get all segmented files and sort by timepoint number
+seg_files = sorted(Path('.').glob('t*_segmented.tif'))
 
-    # Extract timepoint numbers and sort
-    timepoint_data = []
-    for f in seg_files:
-        match = re.search(r't(\\d+)_segmented\\.tif', f.name)
-        if match:
-            t = int(match.group(1))
-            timepoint_data.append((t, f))
-        else:
-            print(f"Warning: Could not extract timepoint from {f.name}")
+if not seg_files:
+    raise ValueError("No segmented files found!")
 
-    timepoint_data.sort(key=lambda x: x[0])
+print(f"Found {len(seg_files)} timepoint files")
 
-    # Load reference metadata
-    with open('${metadata_json}', 'r') as f:
-        ref_metadata = json.load(f)
+# Extract timepoint numbers and sort
+timepoint_data = []
+for f in seg_files:
+    match = re.search(r't(\\d+)_segmented\\.tif', f.name)
+    if match:
+        t = int(match.group(1))
+        timepoint_data.append((t, f))
+    else:
+        print(f"Warning: Could not extract timepoint from {f.name}")
 
-    # Load all timepoints
-    timepoint_arrays = []
-    for t, f in timepoint_data:
-        img = tifffile.imread(str(f))
-        print(f"  Loaded t{t:04d}: shape={img.shape}, dtype={img.dtype}")
+timepoint_data.sort(key=lambda x: x[0])
 
-        # Ensure 3D (ZYX)
-        if img.ndim != 3:
-            raise ValueError(f"Expected 3D image for t{t:04d}, got {img.ndim}D")
+# Load reference metadata
+with open('${metadata_json}', 'r') as f:
+    ref_metadata = json.load(f)
 
-        timepoint_arrays.append(img)
+# Load all timepoints
+timepoint_arrays = []
+for t, f in timepoint_data:
+    img = tifffile.imread(str(f))
+    print(f"  Loaded t{t:04d}: shape={img.shape}, dtype={img.dtype}")
 
-    # Verify all timepoints have same shape
-    shapes = [arr.shape for arr in timepoint_arrays]
-    if len(set(shapes)) > 1:
-        raise ValueError(f"Inconsistent shapes across timepoints: {set(shapes)}")
+    # Ensure 3D (ZYX)
+    if img.ndim != 3:
+        raise ValueError(f"Expected 3D image for t{t:04d}, got {img.ndim}D")
 
-    # Stack into 4D array (TZYX)
-    img_4d = np.stack(timepoint_arrays, axis=0)
-    print(f"\\nMerged 4D shape: {img_4d.shape} (TZYX)")
+    timepoint_arrays.append(img)
 
-    # Calculate metadata (accounting for preprocessing scaling)
-    scaling = ${config.segmentation.image_scaling}
-    x_res = ref_metadata['x_resolution_um'] / scaling
-    y_res = ref_metadata['y_resolution_um'] / scaling
-    z_spacing = ref_metadata['imagej']['spacing'] if 'imagej' in ref_metadata else 1.0
+# Verify all timepoints have same shape
+shapes = [arr.shape for arr in timepoint_arrays]
+if len(set(shapes)) > 1:
+    raise ValueError(f"Inconsistent shapes across timepoints: {set(shapes)}")
 
-    # Create comprehensive metadata
-    hyperstack_metadata = {
-        'shape': {
-            'axes': 'TZYX',
-            'T': img_4d.shape[0],
-            'Z': img_4d.shape[1],
-            'Y': img_4d.shape[2],
-            'X': img_4d.shape[3]
-        },
-        'voxel_size': {
-            'x_um': x_res,
-            'y_um': y_res,
-            'z_um': z_spacing,
-            'unit': 'um'
-        },
-        'dtype': str(img_4d.dtype),
-        'n_timepoints': img_4d.shape[0],
-        'is_label_image': True,
-        'processing': {
-            'preprocessing_scaling': ${config.preprocessing.image_scaling},
-            'segmentation_scaling': scaling,
-            'cellpose_diameter': ${config.segmentation.diameter},
-            'cellpose_model': '${config.segmentation.model}'
-        },
-        'original_metadata': ref_metadata
+# Stack into 4D array (TZYX)
+img_4d = np.stack(timepoint_arrays, axis=0)
+print(f"\\nMerged 4D shape: {img_4d.shape} (TZYX)")
+
+# Calculate metadata (accounting for preprocessing scaling)
+scaling = ${config.segmentation.image_scaling}
+x_res = ref_metadata['x_resolution_um'] / scaling
+y_res = ref_metadata['y_resolution_um'] / scaling
+z_spacing = ref_metadata['imagej']['spacing'] if 'imagej' in ref_metadata else 1.0
+
+# Create comprehensive metadata
+hyperstack_metadata = {
+    'shape': {
+        'axes': 'TZYX',
+        'T': img_4d.shape[0],
+        'Z': img_4d.shape[1],
+        'Y': img_4d.shape[2],
+        'X': img_4d.shape[3]
+    },
+    'voxel_size': {
+        'x_um': x_res,
+        'y_um': y_res,
+        'z_um': z_spacing,
+        'unit': 'um'
+    },
+    'dtype': str(img_4d.dtype),
+    'n_timepoints': img_4d.shape[0],
+    'is_label_image': True,
+    'processing': {
+        'preprocessing_scaling': ${config.preprocessing.image_scaling},
+        'segmentation_scaling': scaling,
+        'cellpose_diameter': ${config.segmentation.diameter},
+        'cellpose_model': '${config.segmentation.model}'
+    },
+    'original_metadata': ref_metadata
+}
+
+# Save metadata JSON
+with open('4D_hyperstack_metadata.json', 'w') as f:
+    json.dump(hyperstack_metadata, f, indent=2)
+
+# Save 4D TIFF with full ImageJ metadata
+print("\\nSaving 4D hyperstack...")
+tifffile.imwrite(
+    '4D_hyperstack.tif',
+    img_4d.astype(np.uint16),
+    imagej=True,
+    resolution=(1.0/x_res, 1.0/y_res),
+    metadata={
+        'spacing': z_spacing,
+        'unit': 'um',
+        'axes': 'TZYX',
+        'frames': img_4d.shape[0],
+        'slices': img_4d.shape[1],
+        'LabelImage': True
     }
+)
 
-    # Save metadata JSON
-    with open('4D_hyperstack_metadata.json', 'w') as f:
-        json.dump(hyperstack_metadata, f, indent=2)
-
-    # Save 4D TIFF with full ImageJ metadata
-    print("\\nSaving 4D hyperstack...")
-    tifffile.imwrite(
-        '4D_hyperstack.tif',
-        img_4d.astype(np.uint16),
-        imagej=True,
-        resolution=(1.0/x_res, 1.0/y_res),
-        metadata={
-            'spacing': z_spacing,
-            'unit': 'um',
-            'axes': 'TZYX',
-            'frames': img_4d.shape[0],
-            'slices': img_4d.shape[1],
-            'LabelImage': True
-        }
-    )
-
-    print("\\n" + "="*60)
-    print("4D Hyperstack created successfully!")
-    print("="*60)
-    print(f"Shape: {img_4d.shape} (TZYX)")
-    print(f"Voxel size: {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} um")
-    print(f"Timepoints: {img_4d.shape[0]}")
-    print(f"Z slices per timepoint: {img_4d.shape[1]}")
-    print("="*60)
+print("\\n" + "="*60)
+print("4D Hyperstack created successfully!")
+print("="*60)
+print(f"Shape: {img_4d.shape} (TZYX)")
+print(f"Voxel size: {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} um")
+print(f"Timepoints: {img_4d.shape[0]}")
+print(f"Z slices per timepoint: {img_4d.shape[1]}")
+print("="*60)
+EOF
     """
 }
 
@@ -673,43 +697,50 @@ process GENERATE_QC_REPORT {
 
     script:
     """
-    #!/usr/bin/env python3
-    import json
-    from pathlib import Path
-    from datetime import datetime
+    #!/bin/bash
+    set -e
 
-    # Load hyperstack metadata
-    with open('${hyperstack_metadata}', 'r') as f:
-        hyperstack_meta = json.load(f)
+    # Activate micromamba environment
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
 
-    # Load config
-    with open('${config_json}', 'r') as f:
-        config = json.load(f)
+    python3 << 'EOF'
+import json
+from pathlib import Path
+from datetime import datetime
 
-    # Collect all log files
-    preprocess_logs = list(Path('.').glob('*_preprocess.log'))
-    segment_logs = list(Path('.').glob('*_segment.log'))
+# Load hyperstack metadata
+with open('${hyperstack_metadata}', 'r') as f:
+    hyperstack_meta = json.load(f)
 
-    # Generate summary
-    summary = {
-        'pipeline_version': '1.0.0-corrected',
-        'execution_date': datetime.now().isoformat(),
-        'input_channel': ${params.channel},
-        'configuration': config,
-        'results': {
-            'n_timepoints_processed': len(preprocess_logs),
-            'n_timepoints_segmented': len(segment_logs),
-            'final_hyperstack_shape': hyperstack_meta['shape'],
-            'voxel_size_um': hyperstack_meta['voxel_size']
-        }
+# Load config
+with open('${config_json}', 'r') as f:
+    config = json.load(f)
+
+# Collect all log files
+preprocess_logs = list(Path('.').glob('*_preprocess.log'))
+segment_logs = list(Path('.').glob('*_segment.log'))
+
+# Generate summary
+summary = {
+    'pipeline_version': '1.0.0-corrected',
+    'execution_date': datetime.now().isoformat(),
+    'input_channel': ${params.channel},
+    'configuration': config,
+    'results': {
+        'n_timepoints_processed': len(preprocess_logs),
+        'n_timepoints_segmented': len(segment_logs),
+        'final_hyperstack_shape': hyperstack_meta['shape'],
+        'voxel_size_um': hyperstack_meta['voxel_size']
     }
+}
 
-    # Save summary JSON
-    with open('pipeline_summary.json', 'w') as f:
-        json.dump(summary, f, indent=2)
+# Save summary JSON
+with open('pipeline_summary.json', 'w') as f:
+    json.dump(summary, f, indent=2)
 
-    # Generate HTML report
-    html = f'''
+# Generate HTML report
+html = f'''
 <!DOCTYPE html>
 <html>
 <head>
@@ -805,10 +836,11 @@ process GENERATE_QC_REPORT {
 </html>
 '''
 
-    with open('pipeline_report.html', 'w') as f:
-        f.write(html)
+with open('pipeline_report.html', 'w') as f:
+    f.write(html)
 
-    print("QC report generated successfully")
+print("QC report generated successfully")
+EOF
     """
 }
 
