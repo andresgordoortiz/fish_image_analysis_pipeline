@@ -2,7 +2,7 @@
 
 /*
  * ============================================================================
- * SPIM 4D Image Processing Pipeline - CORRECTED VERSION WITH MICROMAMBA
+ * SPIM 4D Image Processing Pipeline - FIXED VERSION
  * ============================================================================
  *
  * This pipeline processes 4D SPIM images through:
@@ -12,6 +12,8 @@
  * 4. Merging all timepoints into a single 4D hyperstack with preserved metadata
  *
  * All parameters are loaded from a JSON configuration file for reproducibility.
+ *
+ * FIX: Improved metadata extraction with better error handling and micromamba activation
  */
 
 nextflow.enable.dsl=2
@@ -99,7 +101,7 @@ config = loadConfig(params.config_json)
 
 log.info """
 ============================================================================
-SPIM 4D Image Processing Pipeline - CORRECTED
+SPIM 4D Image Processing Pipeline - FIXED
 ============================================================================
 Input directory    : ${params.input_dir}
 Output directory   : ${params.output_dir}
@@ -142,40 +144,71 @@ process EXTRACT_METADATA {
     script:
     def filename = image_file.name
     """
-    #!/bin/bash
-    set -e
+    #!/usr/bin/env bash
+    set -euo pipefail
 
-    # Activate micromamba environment
+    echo "============================================"
+    echo "Extracting metadata from: ${filename}"
+    echo "============================================"
+
+    # Initialize micromamba
+    export MAMBA_ROOT_PREFIX=/opt/conda
     eval "\$(micromamba shell hook --shell bash)"
+
+    echo "Activating microscopy_env..."
     micromamba activate microscopy_env
 
-    # Run Python script
-    python3 << 'EOF'
+    echo "Python version:"
+    python3 --version
+
+    echo "Checking tifffile installation:"
+    python3 -c "import tifffile; print(f'tifffile version: {tifffile.__version__}')"
+
+    echo ""
+    echo "Running metadata extraction..."
+
+    # Create Python script as separate file for better debugging
+    cat > extract_metadata.py << 'PYTHON_SCRIPT'
 import sys
 import json
 import traceback
+
+print("Starting metadata extraction...", file=sys.stderr)
 
 try:
     import tifffile
     import numpy as np
     from pathlib import Path
 
+    print("Imports successful", file=sys.stderr)
+
     filename = '${filename}'
+    print(f"Processing file: {filename}", file=sys.stderr)
+
+    if not Path(filename).exists():
+        print(f"ERROR: File not found: {filename}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"File exists, size: {Path(filename).stat().st_size} bytes", file=sys.stderr)
 
     # Open TIFF without loading data
+    print("Opening TIFF file...", file=sys.stderr)
     with tifffile.TiffFile(filename) as tif:
         metadata = {}
 
         # Get number of pages (Z slices) WITHOUT loading data
         n_pages = len(tif.pages)
+        print(f"Number of pages: {n_pages}", file=sys.stderr)
 
         # Get image dimensions from first page
         first_page = tif.pages[0]
         height = first_page.shape[0]
         width = first_page.shape[1]
+        print(f"Image dimensions: {height} x {width}", file=sys.stderr)
 
         # ImageJ metadata
         if tif.imagej_metadata:
+            print("Found ImageJ metadata", file=sys.stderr)
             metadata['imagej'] = {
                 'spacing': tif.imagej_metadata.get('spacing', 1.0),
                 'unit': tif.imagej_metadata.get('unit', 'micron'),
@@ -183,6 +216,7 @@ try:
                 'slices': tif.imagej_metadata.get('slices', n_pages),
             }
         else:
+            print("No ImageJ metadata, using defaults", file=sys.stderr)
             metadata['imagej'] = {
                 'spacing': 1.0,
                 'unit': 'micron',
@@ -220,6 +254,7 @@ try:
             metadata['software'] = tags['Software'].value
 
     # Save metadata
+    print("Saving metadata to JSON...", file=sys.stderr)
     with open('shared_metadata.json', 'w') as f:
         json.dump(metadata, f, indent=2)
 
@@ -227,11 +262,25 @@ try:
     print(f"Image shape: {metadata['shape']['dimensions']} (ZYX)")
     print(json.dumps(metadata, indent=2))
 
+    print("SUCCESS: Metadata extraction completed", file=sys.stderr)
+
 except Exception as e:
     print(f"ERROR: {type(e).__name__}: {str(e)}", file=sys.stderr)
     traceback.print_exc(file=sys.stderr)
     sys.exit(1)
-EOF
+PYTHON_SCRIPT
+
+    # Run the Python script
+    python3 extract_metadata.py
+
+    # Verify output was created
+    if [ ! -f "shared_metadata.json" ]; then
+        echo "ERROR: shared_metadata.json was not created"
+        exit 1
+    fi
+
+    echo ""
+    echo "Metadata extraction completed successfully"
     """
 }
 
@@ -723,7 +772,7 @@ segment_logs = list(Path('.').glob('*_segment.log'))
 
 # Generate summary
 summary = {
-    'pipeline_version': '1.0.0-corrected',
+    'pipeline_version': '1.0.0-fixed',
     'execution_date': datetime.now().isoformat(),
     'input_channel': ${params.channel},
     'configuration': config,
