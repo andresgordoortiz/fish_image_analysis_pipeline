@@ -7,10 +7,10 @@ From: mambaorg/micromamba:1.5.10
 %post
     # Set non-interactive mode
     export DEBIAN_FRONTEND=noninteractive
-    
+
     # --- Stage 1: Build TrackMate from Source ---
     echo "Building TrackMate from source..."
-    
+
     # Install Maven and build dependencies
     apt-get update
     apt-get install -y --no-install-recommends \
@@ -25,37 +25,40 @@ From: mambaorg/micromamba:1.5.10
         libxtst6 \
         libxi6 \
         libxext6
-    
+
     # Build TrackMate
     mkdir -p /build
     cd /build
-    wget https://github.com/trackmate-sc/TrackMate/archive/refs/tags/TrackMate-7.13.0.tar.gz
-    tar -xzf TrackMate-7.13.0.tar.gz
-    cd TrackMate-TrackMate-7.13.0
+    wget https://github.com/trackmate-sc/TrackMate/archive/refs/tags/TrackMate-7.12.0.tar.gz
+    tar -xzf TrackMate-7.12.0.tar.gz
+    cd TrackMate-TrackMate-7.12.0
     mvn clean package -DskipTests
-    
-    # Save the built JAR for later
+
+    # Save the built JAR for later (only the main jar, not tests or sources)
     mkdir -p /tmp/trackmate
-    cp target/TrackMate_-*.jar /tmp/trackmate/
-    
+    # Copy only the main JAR (exclude -tests.jar and -sources.jar)
+    find target -name "TrackMate-7.12.0.jar" -type f -exec cp {} /tmp/trackmate/ \;
+    # Verify what we copied
+    ls -la /tmp/trackmate/
+
     # Clean up build dependencies to save space
     cd /
     rm -rf /build
-    
+
     # --- Stage 2: Final Image Setup ---
     echo "Setting up final image..."
-    
+
     # Setup working directory
     mkdir -p /app
     cd /app
-    
+
     # Setup conda environment
     export MAMBA_ROOT_PREFIX=/opt/conda
     export MAMBA_EXE=/bin/micromamba
-    
+
     # Create conda environment
     micromamba create -f /app/microscopy_env.yml -y
-    
+
     # Download and setup FIJI
     echo "Installing FIJI..."
     wget --progress=dot:giga -O fiji.zip \
@@ -65,13 +68,15 @@ From: mambaorg/micromamba:1.5.10
     mv /opt/Fiji* /opt/fiji
     chmod +x /opt/fiji/fiji-linux-x64
     ln -s /opt/fiji/fiji-linux-x64 /usr/local/bin/fiji
-    
+
     # Install the custom TrackMate build
     echo "Installing custom TrackMate..."
-    rm -f /opt/fiji/plugins/TrackMate_-*.jar /opt/fiji/jars/TrackMate_-*.jar
-    cp /tmp/trackmate/TrackMate_-*.jar /opt/fiji/plugins/
+    # Remove any existing TrackMate jars
+    rm -f /opt/fiji/plugins/TrackMate*.jar /opt/fiji/jars/TrackMate*.jar
+    # Copy the main JAR (not the sources or tests jar)
+    cp /tmp/trackmate/TrackMate-7.12.0.jar /opt/fiji/plugins/
     rm -rf /tmp/trackmate
-    
+
     # Clean up
     apt-get clean
     rm -rf /var/lib/apt/lists/*
@@ -80,11 +85,11 @@ From: mambaorg/micromamba:1.5.10
     # Set FIJI environment variables
     export FIJI_ROOT=/opt/fiji
     export PATH="${FIJI_ROOT}:${PATH}"
-    
+
     # Set up micromamba environment
     export ENV_NAME=microscopy_env
     export MAMBA_ROOT_PREFIX=/opt/conda
-    
+
     # Activate the conda environment
     eval "$(micromamba shell hook --shell bash)"
     micromamba activate ${ENV_NAME}
@@ -95,13 +100,13 @@ From: mambaorg/micromamba:1.5.10
 %labels
     Author YourName
     Version 1.0
-    Description Microscopy container with FIJI and custom TrackMate build
+    Description Microscopy container with FIJI and custom TrackMate 7.12.0 build
 
 %help
     This container includes:
-    - FIJI with custom TrackMate 7.13.0 build
+    - FIJI with custom TrackMate 7.12.0 build
     - Micromamba environment with microscopy tools
-    
+
     To use this container:
         singularity shell microscopy_container.sif
         singularity exec microscopy_container.sif fiji
