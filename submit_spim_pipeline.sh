@@ -90,6 +90,17 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
+
+CACHE_DIR="$OUTPUT_DIR/singularity_images"
+mkdir -p "$CACHE_DIR"
+
+# Tell Nextflow where to store the final .sif files
+export NXF_SINGULARITY_CACHEDIR="$CACHE_DIR"
+
+# Tell Singularity where to cache the temporary docker layers during conversion
+export SINGULARITY_CACHEDIR="$CACHE_DIR/cache"
+export SINGULARITY_TMPDIR="$CACHE_DIR/tmp"
+mkdir -p "$SINGULARITY_CACHEDIR" "$SINGULARITY_TMPDIR"
 # ============================================================================
 # SETUP ENVIRONMENT
 # ============================================================================
