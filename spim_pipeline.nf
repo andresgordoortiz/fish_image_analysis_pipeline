@@ -24,7 +24,7 @@ params.input_dir = null
 params.output_dir = null
 params.config_json = null
 params.channel = 1
-params.container = "docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-76b799b"
+params.container = 'docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ed0bf47'
 params.help = false
 
 // Show help message
@@ -50,7 +50,7 @@ if (params.help) {
     Optional Arguments:
         --channel          Channel number to process (default: 1)
         --container        Singularity/Docker container image
-                          (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-76b799b)
+                          (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ed0bf47)
         --help            Show this help message
 
     Output Structure:
