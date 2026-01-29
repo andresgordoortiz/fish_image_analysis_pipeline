@@ -1,0 +1,122 @@
+name: Build Microscopy Container (Singularity)
+on:
+  push:
+    branches:
+      - main  # Adjust this if you use 'master'
+    paths:
+      - '.github/workflows/build_singularity.yml'
+      - 'microscopy.def'
+      - 'microscopy_env.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build_singularity.yml'
+      - 'microscopy.def'
+      - 'microscopy_env.yml'
+
+env:
+  SINGULARITY_VERSION: 3.11.4
+  IMAGE_NAME: microscopy_container.sif
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Free up disk space on GitHub runners
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Install Apptainer/Singularity
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libseccomp-dev \
+            pkg-config \
+            uidmap \
+            squashfs-tools \
+            fakeroot \
+            cryptsetup \
+            dh-apparmor \
+            wget
+
+          # Install Go
+          export GO_VERSION=1.21.0
+          wget -q https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz
+          sudo tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz
+          export PATH=/usr/local/go/bin:$PATH
+
+          # Install Apptainer
+          export APPTAINER_VERSION=1.3.1
+          wget -q https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer-${APPTAINER_VERSION}.tar.gz
+          tar -xzf apptainer-${APPTAINER_VERSION}.tar.gz
+          cd apptainer-${APPTAINER_VERSION}
+          ./mconfig
+          make -C builddir
+          sudo make -C builddir install
+
+      - name: Build Singularity Image
+        run: |
+          # Build the SIF file
+          sudo apptainer build ${{ env.IMAGE_NAME }} microscopy.def
+
+          # Make it readable by the current user
+          sudo chown $USER:$USER ${{ env.IMAGE_NAME }}
+
+          # Show image info
+          apptainer inspect ${{ env.IMAGE_NAME }}
+
+      - name: Generate image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "tag=pr-${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          else
+            SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+            echo "tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Rename SIF with tag
+        run: |
+          TAG=${{ steps.tag.outputs.tag }}
+          mv ${{ env.IMAGE_NAME }} microscopy_container_${TAG}.sif
+          # Also create a 'latest' copy for the main branch
+          if [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            cp microscopy_container_${TAG}.sif microscopy_container_latest.sif
+          fi
+
+      - name: Upload SIF as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: singularity-image-${{ steps.tag.outputs.tag }}
+          path: microscopy_container_*.sif
+          retention-days: 90
+
+      # Optional: Create a release and upload the SIF file
+      - name: Create Release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: build-${{ steps.tag.outputs.tag }}
+          name: Microscopy Container Build ${{ steps.tag.outputs.tag }}
+          files: |
+            microscopy_container_*.sif
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
