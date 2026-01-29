@@ -13,7 +13,7 @@
  *
  * All parameters are loaded from a JSON configuration file for reproducibility.
  *
- * FIX: Proper JSON handling in Python heredocs to avoid boolean parsing errors
+ * FIX: Proper JSON handling + preprocessing script staging
  */
 
 nextflow.enable.dsl=2
@@ -26,6 +26,7 @@ params.input_dir = null
 params.output_dir = null
 params.config_json = null
 params.channel = 1
+params.preprocessing_script = './spim_pipeline_fixed.py'  // Default preprocessing script
 params.container = 'docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1'
 params.help = false
 
@@ -50,10 +51,12 @@ if (params.help) {
         --config_json       JSON file with processing parameters
 
     Optional Arguments:
-        --channel          Channel number to process (default: 1)
-        --container        Singularity/Docker container image
-                          (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1)
-        --help            Show this help message
+        --channel               Channel number to process (default: 1)
+        --preprocessing_script  Path to preprocessing Python script
+                               (default: ./spim_pipeline_fixed.py)
+        --container             Singularity/Docker container image
+                               (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1)
+        --help                 Show this help message
 
     Output Structure:
         output_dir/
@@ -66,10 +69,11 @@ if (params.help) {
 
     Example:
         nextflow run spim_pipeline_fixed.nf \\
-            --input_dir /data/raw_images \\
-            --output_dir /data/processed \\
-            --config_json config.json \\
-            --channel 1
+            --input_dir ./data \\
+            --output_dir ./output \\
+            --config_json config_medaka.json \\
+            --channel 2 \\
+            --preprocessing_script ./spim_pipeline_fixed.py
 
     ============================================================================
     """.stripIndent()
@@ -81,6 +85,12 @@ if (!params.input_dir || !params.output_dir || !params.config_json) {
     log.error "ERROR: Missing required parameters!"
     log.error "Required: --input_dir, --output_dir, --config_json"
     log.error "Run with --help for usage information"
+    exit 1
+}
+
+// Validate preprocessing script exists
+if (!file(params.preprocessing_script).exists()) {
+    log.error "ERROR: Preprocessing script not found: ${params.preprocessing_script}"
     exit 1
 }
 
@@ -107,6 +117,7 @@ Input directory    : ${params.input_dir}
 Output directory   : ${params.output_dir}
 Configuration      : ${params.config_json}
 Channel to process : ${params.channel}
+Preprocessing script: ${params.preprocessing_script}
 Container          : ${params.container}
 
 Pipeline steps:
@@ -307,6 +318,7 @@ process PREPROCESS_DECONVOLVE {
     input:
     tuple val(timepoint), path(image_file)
     path metadata_json
+    path preproc_script
     val preprocess_config
 
     output:
@@ -318,6 +330,7 @@ process PREPROCESS_DECONVOLVE {
     def t_formatted = String.format('%04d', timepoint)
     def filename = image_file.name
     def config_json_str = groovy.json.JsonOutput.toJson(cfg).replace("'", "\\'")
+    def script_name = preproc_script.name
     """
     #!/bin/bash
     set -euo pipefail
@@ -329,7 +342,16 @@ process PREPROCESS_DECONVOLVE {
     echo "============================================"
     echo "Preprocessing timepoint: ${timepoint}"
     echo "File: ${filename}"
+    echo "Preprocessing script: ${script_name}"
     echo "============================================"
+
+    # Verify script is present
+    if [ ! -f "${script_name}" ]; then
+        echo "ERROR: Preprocessing script not found: ${script_name}"
+        echo "Contents of work directory:"
+        ls -lh
+        exit 1
+    fi
 
     # Run preprocessing with all parameters from config
     python3 << 'PYTHON_EOF'
@@ -347,7 +369,7 @@ config = json.loads('${config_json_str}')
 
 # Build command for preprocessing script
 cmd = [
-    'python', 'spim_pipeline_fixed.py',
+    'python3', '${script_name}',
     '--input_file', '${filename}',
     '--outdir', '.',
     '--psf_path', config['psf_path'],
@@ -404,7 +426,9 @@ PYTHON_EOF
         echo "Renamed output to: t${t_formatted}_processed.tif"
     else
         echo "ERROR: No processed output found"
-        ls -lh
+        echo "Looking for pattern: *_\${SCALING_STR}*.tif"
+        echo "Directory contents:"
+        ls -lh *.tif 2>/dev/null || echo "No .tif files found"
         exit 1
     fi
 
@@ -598,6 +622,8 @@ PRESERVE_MASK_META
 
     else
         echo "ERROR: Cellpose output not found"
+        echo "Expected file matching pattern: *_cp_masks.tif"
+        echo "Directory contents:"
         ls -lh
         exit 1
     fi
@@ -965,6 +991,9 @@ workflow {
         log.info "Found timepoint ${timepoint}: ${file.name}"
     }
 
+    // Create channel for preprocessing script (shared across all process instances)
+    preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+
     // 1. Extract metadata from FIRST timepoint only (all have same metadata)
     first_timepoint = input_channel.first()
     EXTRACT_METADATA(first_timepoint)
@@ -976,6 +1005,7 @@ workflow {
     PREPROCESS_DECONVOLVE(
         input_channel,
         shared_metadata,
+        preproc_script_ch.collect(),  // Collect to make it available to all process instances
         config.preprocessing
     )
 
