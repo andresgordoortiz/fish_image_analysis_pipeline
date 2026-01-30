@@ -6,26 +6,27 @@
     "date_created": "2026-01-28",
     "experiment": "Medaka - low resolution"
   },
-
+  "voxel_size": {
+    "description": "Voxel size configuration - auto-detect or manual override",
+    "auto_detect": true,
+    "comment_auto": "Set to true to extract from image metadata, false to use manual values below",
+    "x_um": 0.347,
+    "y_um": 0.347,
+    "z_um": 2.0,
+    "comment_manual": "Manual voxel sizes in micrometers (only used if auto_detect = false)",
+    "comment_usage": "When auto_detect=false, these values override any metadata in the images"
+  },
   "preprocessing": {
     "description": "Preprocessing and deconvolution parameters optimized for medaka heart",
-
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
-
     "image_scaling": 0.5,
     "comment_scaling": "50% downsampling for faster processing while maintaining quality",
-
-    "xy_pixel": 0.0,
-    "z_pixel": 0.0,
-    "comment_pixel_size": "0.0 = auto-detect from metadata (recommended)",
-
     "deconvolution": {
       "niter": 6,
       "niterz": 6,
       "padding": 32,
       "comment": "6 iterations balanced for speed vs quality. Increase for better results."
     },
-
     "normalization": {
       "min_v": 0,
       "max_v": 65535,
@@ -33,19 +34,16 @@
       "percentile_high": 99.99,
       "comment": "Remove bottom 40% (background) and top 0.01% (outliers)"
     },
-
     "background_subtraction": {
       "resolution_px0": 10,
       "resolution_pz0": 10,
       "noise_lvl": 2,
       "comment": "10 micron resolution for background estimation"
     },
-
     "postprocessing": {
       "sigma": 1.0,
       "comment": "Light Gaussian smoothing to reduce noise"
     },
-
     "correction_flags": {
       "no_clahe": false,
       "no_z_correction": false,
@@ -53,34 +51,25 @@
       "comment": "All corrections enabled for optimal image quality"
     }
   },
-
   "segmentation": {
     "description": "Cellpose segmentation optimized for medaka cardiomyocytes",
-
     "model": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Thomas/cellpose/models/cpsam_Gui_tracking_20250801",
     "comment_model": "Custom Cellpose model trained on medaka cells",
-
     "diameter": 30,
-
     "flow_threshold": 0.8,
     "comment_flow": "0.8 = balanced sensitivity. Increase to 1.0-1.5 to reduce over-segmentation",
-
     "cellprob_threshold": 0.0,
     "comment_cellprob": "0.0 = neutral. Increase to reduce false positives, decrease to catch faint cells",
-
     "use_gpu": true,
     "do_3d": true,
     "comment_3d": "3D segmentation required for volumetric data",
-
     "save_tif": true,
     "save_flows": false,
     "save_npy": false,
     "comment_outputs": "Only save TIF masks (required for 3D). Flows and NPY increase storage dramatically.",
-
     "image_scaling": 0.5,
     "comment_image_scaling": "Must match preprocessing scaling for correct voxel sizes"
   },
-
   "system": {
     "description": "Container image only - resource allocation is in nextflow.config",
     "container_image": "docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-8720eea",

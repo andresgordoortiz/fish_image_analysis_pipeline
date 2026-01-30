@@ -2,7 +2,7 @@
 
 /*
  * ============================================================================
- * SPIM 4D Image Processing Pipeline - FIXED VERSION
+ * SPIM 4D Image Processing Pipeline - FIXED VERSION WITH VOXEL SIZE CONFIG
  * ============================================================================
  *
  * This pipeline processes 4D SPIM images through:
@@ -13,7 +13,7 @@
  *
  * All parameters are loaded from a JSON configuration file for reproducibility.
  *
- * FIX: Proper JSON handling + preprocessing script staging
+ * NEW: Flexible voxel size configuration - auto-detect or manual override
  */
 
 nextflow.enable.dsl=2
@@ -57,6 +57,11 @@ if (params.help) {
         --container             Singularity/Docker container image
                                (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1)
         --help                 Show this help message
+
+    Voxel Size Configuration (in config.json):
+        voxel_size.auto_detect: true  - Auto-detect from image metadata (default)
+                                false - Use manual values specified in config
+        voxel_size.x_um, y_um, z_um   - Manual voxel sizes (used if auto_detect=false)
 
     Output Structure:
         output_dir/
@@ -105,9 +110,19 @@ def loadConfig(json_path) {
 
 config = loadConfig(params.config_json)
 
+// Validate voxel_size configuration
+if (!config.containsKey('voxel_size')) {
+    log.warn "WARNING: No 'voxel_size' section in config - defaulting to auto-detect"
+    config.voxel_size = [auto_detect: true]
+}
+
 // ============================================================================
 // WORKFLOW HEADER
 // ============================================================================
+
+def voxel_info = config.voxel_size.auto_detect ?
+    "Auto-detect from image metadata" :
+    "Manual: ${config.voxel_size.x_um} x ${config.voxel_size.y_um} x ${config.voxel_size.z_um} µm"
 
 log.info """
 ============================================================================
@@ -117,21 +132,23 @@ Input directory    : ${params.input_dir}
 Output directory   : ${params.output_dir}
 Configuration      : ${params.config_json}
 Channel to process : ${params.channel}
+Voxel size mode    : ${voxel_info}
 Preprocessing script: ${params.preprocessing_script}
 Container          : ${params.container}
 
 Pipeline steps:
   1. Parse and sort timepoint files
-  2. Preprocessing & Deconvolution per timepoint
-  3. Cellpose Segmentation per timepoint
-  4. Merge into 4D hyperstack with preserved metadata
+  2. Extract/Configure metadata with voxel sizes
+  3. Preprocessing & Deconvolution per timepoint
+  4. Cellpose Segmentation per timepoint
+  5. Merge into 4D hyperstack with preserved metadata
 
 Started at: ${new Date()}
 ============================================================================
 """.stripIndent()
 
 // ============================================================================
-// PROCESS: Extract and Preserve Metadata (only from first timepoint)
+// PROCESS: Extract and Configure Metadata
 // ============================================================================
 
 process EXTRACT_METADATA {
@@ -154,12 +171,17 @@ process EXTRACT_METADATA {
 
     script:
     def filename = image_file.name
+    def auto_detect = config.voxel_size.auto_detect
+    def manual_x = config.voxel_size.get('x_um', 0.325)
+    def manual_y = config.voxel_size.get('y_um', 0.325)
+    def manual_z = config.voxel_size.get('z_um', 1.0)
     """
     #!/usr/bin/env bash
     set -euo pipefail
 
     echo "============================================"
-    echo "Extracting metadata from: ${filename}"
+    echo "Extracting/Configuring metadata from: ${filename}"
+    echo "Voxel size mode: ${auto_detect ? 'AUTO-DETECT' : 'MANUAL'}"
     echo "============================================"
 
     # Initialize micromamba
@@ -176,15 +198,15 @@ process EXTRACT_METADATA {
     python3 -c "import tifffile; print(f'tifffile version: {tifffile.__version__}')"
 
     echo ""
-    echo "Running metadata extraction..."
+    echo "Running metadata extraction/configuration..."
 
-    # Create Python script as separate file for better debugging
+    # Create Python script for metadata handling
     cat > extract_metadata.py << 'PYTHON_SCRIPT'
 import sys
 import json
 import traceback
 
-print("Starting metadata extraction...", file=sys.stderr)
+print("Starting metadata extraction/configuration...", file=sys.stderr)
 
 try:
     import tifffile
@@ -194,7 +216,13 @@ try:
     print("Imports successful", file=sys.stderr)
 
     filename = '${filename}'
+    auto_detect = ${auto_detect}
+    manual_x = ${manual_x}
+    manual_y = ${manual_y}
+    manual_z = ${manual_z}
+
     print(f"Processing file: {filename}", file=sys.stderr)
+    print(f"Auto-detect mode: {auto_detect}", file=sys.stderr)
 
     if not Path(filename).exists():
         print(f"ERROR: File not found: {filename}", file=sys.stderr)
@@ -217,39 +245,68 @@ try:
         width = first_page.shape[1]
         print(f"Image dimensions: {height} x {width}", file=sys.stderr)
 
-        # ImageJ metadata
-        if tif.imagej_metadata:
-            print("Found ImageJ metadata", file=sys.stderr)
-            metadata['imagej'] = {
-                'spacing': tif.imagej_metadata.get('spacing', 1.0),
-                'unit': tif.imagej_metadata.get('unit', 'micron'),
-                'axes': tif.imagej_metadata.get('axes', 'ZYX'),
-                'slices': tif.imagej_metadata.get('slices', n_pages),
-            }
-        else:
-            print("No ImageJ metadata, using defaults", file=sys.stderr)
-            metadata['imagej'] = {
-                'spacing': 1.0,
-                'unit': 'micron',
-                'axes': 'ZYX',
-                'slices': n_pages,
-            }
+        # Determine voxel sizes based on auto_detect setting
+        if auto_detect:
+            print("Using AUTO-DETECT mode for voxel sizes", file=sys.stderr)
 
-        # TIFF tags from first page
-        tags = first_page.tags
+            # ImageJ metadata for Z spacing
+            if tif.imagej_metadata:
+                print("Found ImageJ metadata", file=sys.stderr)
+                z_spacing = tif.imagej_metadata.get('spacing', 1.0)
+                unit = tif.imagej_metadata.get('unit', 'micron')
+                axes = tif.imagej_metadata.get('axes', 'ZYX')
+                slices = tif.imagej_metadata.get('slices', n_pages)
+            else:
+                print("No ImageJ metadata, using defaults", file=sys.stderr)
+                z_spacing = 1.0
+                unit = 'micron'
+                axes = 'ZYX'
+                slices = n_pages
 
-        # Extract resolution
-        if 'XResolution' in tags:
-            x_num, x_denom = tags['XResolution'].value
-            metadata['x_resolution_um'] = x_denom / x_num if x_num != 0 else 1.0
-        else:
-            metadata['x_resolution_um'] = 1.0
+            # TIFF tags for XY resolution
+            tags = first_page.tags
+            if 'XResolution' in tags:
+                x_num, x_denom = tags['XResolution'].value
+                x_resolution_um = x_denom / x_num if x_num != 0 else 1.0
+            else:
+                x_resolution_um = 1.0
+                print("Warning: No XResolution tag found, using 1.0 µm", file=sys.stderr)
 
-        if 'YResolution' in tags:
-            y_num, y_denom = tags['YResolution'].value
-            metadata['y_resolution_um'] = y_denom / y_num if y_num != 0 else 1.0
+            if 'YResolution' in tags:
+                y_num, y_denom = tags['YResolution'].value
+                y_resolution_um = y_denom / y_num if y_num != 0 else 1.0
+            else:
+                y_resolution_um = 1.0
+                print("Warning: No YResolution tag found, using 1.0 µm", file=sys.stderr)
+
+            metadata['voxel_size_source'] = 'auto_detected'
+
         else:
-            metadata['y_resolution_um'] = 1.0
+            print("Using MANUAL mode for voxel sizes", file=sys.stderr)
+            print(f"  X: {manual_x} µm", file=sys.stderr)
+            print(f"  Y: {manual_y} µm", file=sys.stderr)
+            print(f"  Z: {manual_z} µm", file=sys.stderr)
+
+            x_resolution_um = manual_x
+            y_resolution_um = manual_y
+            z_spacing = manual_z
+            unit = 'um'
+            axes = 'ZYX'
+            slices = n_pages
+
+            metadata['voxel_size_source'] = 'manual_override'
+
+        # Store voxel sizes
+        metadata['x_resolution_um'] = x_resolution_um
+        metadata['y_resolution_um'] = y_resolution_um
+
+        # ImageJ-compatible metadata
+        metadata['imagej'] = {
+            'spacing': z_spacing,
+            'unit': unit,
+            'axes': axes,
+            'slices': slices,
+        }
 
         # Image dimensions - from page info, not loading data
         metadata['shape'] = {
@@ -261,6 +318,7 @@ try:
         metadata['dtype'] = str(first_page.dtype)
 
         # Software info
+        tags = first_page.tags
         if 'Software' in tags:
             metadata['software'] = tags['Software'].value
 
@@ -269,11 +327,14 @@ try:
     with open('shared_metadata.json', 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"Metadata saved to: shared_metadata.json")
-    print(f"Image shape: {metadata['shape']['dimensions']} (ZYX)")
+    print(f"\\nMetadata Configuration:")
+    print(f"  Source: {metadata['voxel_size_source']}")
+    print(f"  Image shape: {metadata['shape']['dimensions']} (ZYX)")
+    print(f"  Voxel size: {x_resolution_um:.4f} x {y_resolution_um:.4f} x {z_spacing:.4f} µm")
+    print("\\nFull metadata:")
     print(json.dumps(metadata, indent=2))
 
-    print("SUCCESS: Metadata extraction completed", file=sys.stderr)
+    print("\\nSUCCESS: Metadata extraction/configuration completed", file=sys.stderr)
 
 except Exception as e:
     print(f"ERROR: {type(e).__name__}: {str(e)}", file=sys.stderr)
@@ -291,7 +352,7 @@ PYTHON_SCRIPT
     fi
 
     echo ""
-    echo "Metadata extraction completed successfully"
+    echo "Metadata extraction/configuration completed successfully"
     """
 }
 
@@ -449,6 +510,10 @@ x_res = metadata['x_resolution_um'] / ${cfg.image_scaling}
 y_res = metadata['y_resolution_um'] / ${cfg.image_scaling}
 z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
 
+print(f"Voxel sizes after preprocessing scaling:")
+print(f"  Original: {metadata['x_resolution_um']:.4f} x {metadata['y_resolution_um']:.4f} x {z_spacing:.4f} µm")
+print(f"  Scaled (×{${cfg.image_scaling}}): {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
+
 # Re-save with preserved metadata
 tifffile.imwrite(
     't${t_formatted}_processed.tif',
@@ -463,10 +528,7 @@ tifffile.imwrite(
     }
 )
 
-print(f"Metadata restored for timepoint ${timepoint}:")
-print(f"  X resolution: {x_res:.4f} um")
-print(f"  Y resolution: {y_res:.4f} um")
-print(f"  Z spacing: {z_spacing:.4f} um")
+print(f"Metadata restored for timepoint ${timepoint}")
 RESTORE_META
 
     echo "Preprocessing completed for timepoint ${timepoint}"
@@ -730,6 +792,11 @@ x_res = ref_metadata['x_resolution_um'] / scaling
 y_res = ref_metadata['y_resolution_um'] / scaling
 z_spacing = ref_metadata['imagej']['spacing'] if 'imagej' in ref_metadata else 1.0
 
+print(f"\\nVoxel size configuration:")
+print(f"  Source: {ref_metadata.get('voxel_size_source', 'unknown')}")
+print(f"  Original: {ref_metadata['x_resolution_um']:.4f} x {ref_metadata['y_resolution_um']:.4f} x {z_spacing:.4f} µm")
+print(f"  Final (after ×{scaling} scaling): {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
+
 # Create comprehensive metadata
 hyperstack_metadata = {
     'shape': {
@@ -743,7 +810,8 @@ hyperstack_metadata = {
         'x_um': x_res,
         'y_um': y_res,
         'z_um': z_spacing,
-        'unit': 'um'
+        'unit': 'um',
+        'source': ref_metadata.get('voxel_size_source', 'unknown')
     },
     'dtype': str(img_4d.dtype),
     'n_timepoints': img_4d.shape[0],
@@ -782,7 +850,8 @@ print("\\n" + "="*60)
 print("4D Hyperstack created successfully!")
 print("="*60)
 print(f"Shape: {img_4d.shape} (TZYX)")
-print(f"Voxel size: {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} um")
+print(f"Voxel size: {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
+print(f"Voxel size source: {ref_metadata.get('voxel_size_source', 'unknown')}")
 print(f"Timepoints: {img_4d.shape[0]}")
 print(f"Z slices per timepoint: {img_4d.shape[1]}")
 print("="*60)
@@ -840,9 +909,13 @@ segment_logs = list(Path('.').glob('*_segment.log'))
 
 # Generate summary
 summary = {
-    'pipeline_version': '1.0.0-fixed',
+    'pipeline_version': '1.0.0-voxel-config',
     'execution_date': datetime.now().isoformat(),
     'input_channel': ${params.channel},
+    'voxel_size_configuration': {
+        'mode': hyperstack_meta['voxel_size'].get('source', 'unknown'),
+        'final_voxel_size_um': hyperstack_meta['voxel_size']
+    },
     'configuration': config,
     'results': {
         'n_timepoints_processed': len(preprocess_logs),
@@ -855,6 +928,15 @@ summary = {
 # Save summary JSON
 with open('pipeline_summary.json', 'w') as f:
     json.dump(summary, f, indent=2)
+
+# Determine voxel size badge
+voxel_source = hyperstack_meta['voxel_size'].get('source', 'unknown')
+if voxel_source == 'auto_detected':
+    voxel_badge = '<span style="background-color: #27ae60; color: white; padding: 5px 10px; border-radius: 3px;">AUTO-DETECTED</span>'
+elif voxel_source == 'manual_override':
+    voxel_badge = '<span style="background-color: #e67e22; color: white; padding: 5px 10px; border-radius: 3px;">MANUAL OVERRIDE</span>'
+else:
+    voxel_badge = '<span style="background-color: #95a5a6; color: white; padding: 5px 10px; border-radius: 3px;">UNKNOWN</span>'
 
 # Generate HTML report
 html = f'''
@@ -878,6 +960,7 @@ html = f'''
         .metric {{ background-color: #ecf0f1; padding: 15px; margin: 10px 0; border-radius: 5px; }}
         .metric-value {{ font-size: 24px; font-weight: bold; color: #2c3e50; }}
         .metric-label {{ font-size: 14px; color: #7f8c8d; }}
+        .highlight-box {{ background-color: #fff3cd; border-left: 4px solid #f39c12; padding: 15px; margin: 20px 0; border-radius: 5px; }}
     </style>
 </head>
 <body>
@@ -887,6 +970,12 @@ html = f'''
         <div class="metric">
             <div class="metric-value">{hyperstack_meta['n_timepoints']} Timepoints</div>
             <div class="metric-label">Successfully processed and merged into 4D hyperstack</div>
+        </div>
+
+        <div class="highlight-box">
+            <h3 style="margin-top: 0;">📏 Voxel Size Configuration</h3>
+            <p><strong>Mode:</strong> {voxel_badge}</p>
+            <p><strong>Final voxel size:</strong> {hyperstack_meta['voxel_size']['x_um']:.4f} × {hyperstack_meta['voxel_size']['y_um']:.4f} × {hyperstack_meta['voxel_size']['z_um']:.4f} µm</p>
         </div>
 
         <h2>📊 Execution Summary</h2>
@@ -907,6 +996,7 @@ html = f'''
             <tr><td>Z (Slices)</td><td>{hyperstack_meta['shape']['Z']}</td></tr>
             <tr><td>Y (Height)</td><td>{hyperstack_meta['shape']['Y']}</td></tr>
             <tr><td>X (Width)</td><td>{hyperstack_meta['shape']['X']}</td></tr>
+            <tr><td>Voxel Size Source</td><td>{voxel_badge}</td></tr>
             <tr><td>X Resolution</td><td>{hyperstack_meta['voxel_size']['x_um']:.4f} µm</td></tr>
             <tr><td>Y Resolution</td><td>{hyperstack_meta['voxel_size']['y_um']:.4f} µm</td></tr>
             <tr><td>Z Spacing</td><td>{hyperstack_meta['voxel_size']['z_um']:.4f} µm</td></tr>
@@ -915,6 +1005,10 @@ html = f'''
         </table>
 
         <h2>⚙️ Processing Configuration</h2>
+
+        <h3>Voxel Size Settings</h3>
+        <pre>{json.dumps(config.get('voxel_size', {{'auto_detect': True}}), indent=2)}</pre>
+
         <h3>Preprocessing</h3>
         <pre>{json.dumps(config['preprocessing'], indent=2)}</pre>
 
@@ -924,7 +1018,7 @@ html = f'''
         <h2>📋 Pipeline Steps</h2>
         <ol>
             <li><strong>File Parsing</strong> - Extracted timepoints from filename pattern (t####_Channel #.tif)</li>
-            <li><strong>Metadata Extraction</strong> - Preserved original image metadata including voxel sizes</li>
+            <li><strong>Metadata Extraction/Configuration</strong> - {'Auto-detected' if voxel_source == 'auto_detected' else 'Manual override of'} voxel sizes from image metadata</li>
             <li><strong>Preprocessing & Deconvolution</strong> - Applied corrections and deconvolution per timepoint</li>
             <li><strong>Cellpose Segmentation</strong> - 3D cell segmentation per timepoint</li>
             <li><strong>Hyperstack Merging</strong> - Combined all timepoints into single 4D TIFF with preserved metadata</li>
@@ -936,7 +1030,7 @@ html = f'''
             <tr><td>01_preprocessed/</td><td>Preprocessed and deconvolved images per timepoint</td></tr>
             <tr><td>02_segmented/</td><td>Cellpose segmentation masks per timepoint</td></tr>
             <tr><td>03_hyperstack/</td><td><strong>4D_hyperstack.tif</strong> - Final merged 4D image</td></tr>
-            <tr><td>metadata/</td><td>JSON metadata files per timepoint</td></tr>
+            <tr><td>metadata/</td><td>JSON metadata files with voxel size information</td></tr>
             <tr><td>logs/</td><td>Processing logs for debugging</td></tr>
             <tr><td>reports/</td><td>This QC report</td></tr>
         </table>
@@ -994,7 +1088,7 @@ workflow {
     // Create channel for preprocessing script (shared across all process instances)
     preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
 
-    // 1. Extract metadata from FIRST timepoint only (all have same metadata)
+    // 1. Extract/Configure metadata from FIRST timepoint only (all have same metadata)
     first_timepoint = input_channel.first()
     EXTRACT_METADATA(first_timepoint)
 
@@ -1043,6 +1137,8 @@ workflow {
 // ============================================================================
 
 workflow.onComplete {
+    def voxel_mode = config.voxel_size?.auto_detect ? "Auto-detected" : "Manual override"
+
     log.info """
     ============================================================================
     Pipeline completed!
@@ -1050,6 +1146,7 @@ workflow.onComplete {
     Status       : ${workflow.success ? 'SUCCESS ✓' : 'FAILED ✗'}
     Duration     : ${workflow.duration}
     Channel      : ${params.channel}
+    Voxel mode   : ${voxel_mode}
     Output dir   : ${params.output_dir}
 
     Results:
