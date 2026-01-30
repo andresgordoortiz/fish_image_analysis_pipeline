@@ -56,8 +56,8 @@ env | grep -E 'TOWER|NXF' | grep -v TOKEN
 # ============================================================================
 # USER CONFIGURATION
 # ============================================================================
-INPUT_DIR="./data"
-OUTPUT_DIR="./spim_pipeline_output"
+INPUT_DIR="/groups/pinheiro/user/guilherme.ventura/2025/processed/M45/2025-05-28/concatenated_v2/stack_concatenation_v2/"
+OUTPUT_DIR="./spim_pipeline/2025-05-28/concatenated_v2/stack_concatenation_v2/"
 CONFIG_JSON="./config_medaka.json"
 CHANNEL=2
 PROFILE="standard"

@@ -1,6 +1,6 @@
 {
   "pipeline_info": {
-    "version": "1.0.0-with-roi",
+    "version": "1.0.0",
     "description": "SPIM Pipeline Configuration for Medaka Imaging with Optional ROI Cropping",
     "author": "Andres Gordo / Guilherme Ventura",
     "date_created": "2026-01-30",
@@ -88,7 +88,6 @@
   "system": {
     "description": "Container images - resource allocation is in nextflow.config",
     "container_image": "docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-8720eea",
-    "fiji_container_image": "docker://fiji/fiji:20220415",
-    "comment": "Fiji container used only if ROI cropping is enabled"
-  }
+    "fiji_container_image": "docker://fiji/fiji:20220415"
+    }
 }
