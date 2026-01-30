@@ -1,10 +1,18 @@
 {
   "pipeline_info": {
-    "version": "1.0.0",
-    "description": "SPIM Pipeline Configuration for Medaka Imaging",
+    "version": "1.0.0-with-roi",
+    "description": "SPIM Pipeline Configuration for Medaka Imaging with Optional ROI Cropping",
     "author": "Andres Gordo / Guilherme Ventura",
-    "date_created": "2026-01-28",
-    "experiment": "Medaka - low resolution"
+    "date_created": "2026-01-30",
+    "experiment": "Medaka - low resolution with ROI cropping"
+  },
+  "roi_cropping": {
+    "description": "Optional ROI-based cropping using Fiji/ImageJ",
+    "enabled": true,
+    "comment_enabled": "Set to true to enable ROI cropping of all timepoints",
+    "roi_path": "./medaka_spim_crop.roi",
+    "comment_roi_path": "Path to ImageJ.roi file created from one timepoint's raw image",
+    "comment_note": "ROI cropping reduces XY dimensions but preserves voxel spacing. Applied to ALL timepoints before preprocessing."
   },
   "voxel_size": {
     "description": "Voxel size configuration - auto-detect or manual override",
@@ -14,18 +22,20 @@
     "y_um": 0.347,
     "z_um": 2.0,
     "comment_manual": "Manual voxel sizes in micrometers (only used if auto_detect = false)",
-    "comment_usage": "When auto_detect=false, these values override any metadata in the images"
+    "comment_usage": "When auto_detect=false, these values override any metadata in the images",
+    "comment_roi_note": "ROI cropping does NOT change voxel sizes - only image dimensions"
   },
   "preprocessing": {
     "description": "Preprocessing and deconvolution parameters optimized for medaka",
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
     "image_scaling": 0.5,
     "comment_scaling": "50% downsampling for faster processing while maintaining quality",
+    "comment_roi_interaction": "If ROI cropping is enabled, scaling is applied AFTER cropping",
     "deconvolution": {
       "niter": 6,
       "niterz": 6,
       "padding": 32,
-      "comment": "6 iterations of deconvolution. According to Andres, more iterations can introduce artifacts, and the niterz should be the same as the niter in xy"
+      "comment": "6 iterations of deconvolution. According to Andres, more iterations can introduce artifacts"
     },
     "normalization": {
       "min_v": 0,
@@ -54,25 +64,26 @@
   "segmentation": {
     "description": "Cellpose segmentation optimized for medaka",
     "model": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Thomas/cellpose/models/cpsam_Gui_tracking_20250801",
-    "comment_model": "Custom Cellpose model trained on medaka cells. For pre-trained models check the Cellpose documentation.",
+    "comment_model": "Custom Cellpose model trained on medaka cells",
     "diameter": 30,
     "flow_threshold": 0.8,
-    "comment_flow": "0.8 = balanced sensitivity. Increase to 1.0-1.5 to reduce over-segmentation",
+    "comment_flow": "0.8 = balanced sensitivity. Increase to reduce over-segmentation",
     "cellprob_threshold": 0.0,
-    "comment_cellprob": "0.0 = neutral. Increase to reduce false positives, decrease to catch faint cells",
+    "comment_cellprob": "0.0 = neutral. Increase to reduce false positives",
     "use_gpu": true,
     "do_3d": true,
     "comment_3d": "3D segmentation required for volumetric data",
     "save_tif": true,
     "save_flows": false,
     "save_npy": false,
-    "comment_outputs": "Only save TIF masks (required for 3D). Flows and NPY increase storage dramatically.",
+    "comment_outputs": "Only save TIF masks to reduce storage",
     "image_scaling": 0.5,
     "comment_image_scaling": "Must match preprocessing scaling for correct voxel sizes"
   },
   "system": {
-    "description": "Container image only - resource allocation is in nextflow.config",
+    "description": "Container images - resource allocation is in nextflow.config",
     "container_image": "docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-8720eea",
-    "comment": "Resource allocation (CPU, memory, time, GPU) is defined in nextflow.config, not here"
+    "fiji_container_image": "docker://fiji/fiji:20220415",
+    "comment": "Fiji container used only if ROI cropping is enabled"
   }
 }

@@ -30,9 +30,6 @@ module load java/21
 # ============================================================================
 export TOWER_ACCESS_TOKEN="eyJ0aWQiOiAxMzM2Nn0uZWRlMTAxYmIzZGE4ZDNjMzJjM2M1MmZkZThhNjBhZGI2M2EyNjE4Mg=="
 
-# Optional: Specify Tower workspace (if you have multiple workspaces)
-# export TOWER_WORKSPACE_ID="your_workspace_id"
-
 # ============================================================================
 # NEXTFLOW JVM SETTINGS
 # ============================================================================
@@ -52,9 +49,6 @@ fi
 export SLURM_CONF=${SLURM_CONF:-/etc/slurm/slurm.conf}
 export SLURM_EXPORT_ENV=ALL
 
-# DO NOT set NXF_EXECUTOR - let Nextflow config handle this
-# DO NOT set NXF_CLUSTER_SEED - this can interfere with Tower
-
 # Debug output
 echo "Environment variables for Tower:"
 env | grep -E 'TOWER|NXF' | grep -v TOKEN
@@ -69,6 +63,7 @@ CHANNEL=2
 PROFILE="standard"
 RESUME="-resume"
 PIPELINE_SCRIPT="./spim_pipeline.nf"
+NEXTFLOW_CONFIG="./nextflow.config"
 
 # ============================================================================
 # VALIDATION
@@ -90,7 +85,9 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
-
+# ============================================================================
+# CONTAINER CACHE SETUP
+# ============================================================================
 CACHE_DIR="$OUTPUT_DIR/singularity_images"
 mkdir -p "$CACHE_DIR"
 
@@ -101,6 +98,7 @@ export NXF_SINGULARITY_CACHEDIR="$CACHE_DIR"
 export SINGULARITY_CACHEDIR="$CACHE_DIR/cache"
 export SINGULARITY_TMPDIR="$CACHE_DIR/tmp"
 mkdir -p "$SINGULARITY_CACHEDIR" "$SINGULARITY_TMPDIR"
+
 # ============================================================================
 # SETUP ENVIRONMENT
 # ============================================================================
@@ -114,12 +112,13 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$OUTPUT_DIR/pipeline_submission_${TIMESTAMP}.log"
 
 echo "============================================================================"
-echo "SPIM Pipeline Submission with Tower"
+echo "SPIM Pipeline Submission with Tower and Optional ROI Cropping"
 echo "============================================================================"
 echo "Timestamp       : $TIMESTAMP"
 echo "Input directory : $INPUT_DIR"
 echo "Output directory: $OUTPUT_DIR"
 echo "Configuration   : $CONFIG_JSON"
+echo "Nextflow config : $NEXTFLOW_CONFIG"
 echo "Profile         : $PROFILE"
 echo "Resume          : ${RESUME:-false}"
 echo "Log file        : $LOG_FILE"
@@ -140,7 +139,7 @@ nextflow run "$PIPELINE_SCRIPT" \
     --config_json "$CONFIG_JSON" \
     --channel "$CHANNEL" \
     -profile "$PROFILE" \
-    -c "./nextflow.config" \
+    -c "$NEXTFLOW_CONFIG" \
     $RESUME \
     -with-report "$OUTPUT_DIR/reports/nextflow_report_${TIMESTAMP}.html" \
     -with-timeline "$OUTPUT_DIR/reports/nextflow_timeline_${TIMESTAMP}.html" \

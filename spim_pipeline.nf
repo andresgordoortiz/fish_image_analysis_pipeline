@@ -2,10 +2,11 @@
 
 /*
  * ============================================================================
- * SPIM 4D Image Processing Pipeline - FIXED VERSION WITH VOXEL SIZE CONFIG
+ * SPIM 4D Image Processing Pipeline - WITH OPTIONAL ROI CROPPING
  * ============================================================================
  *
  * This pipeline processes 4D SPIM images through:
+ * 0. OPTIONAL: ROI-based cropping using Fiji (if roi_path provided in config)
  * 1. File parsing with timepoint extraction (t0051_Channel 1.tif format)
  * 2. Preprocessing and deconvolution per timepoint
  * 3. Cellpose segmentation per timepoint
@@ -13,6 +14,7 @@
  *
  * All parameters are loaded from a JSON configuration file for reproducibility.
  *
+ * NEW: Optional ROI cropping with Fiji
  * NEW: Flexible voxel size configuration - auto-detect or manual override
  * FIX: Robust file finding that handles spaces in filenames and scaling mismatches
  */
@@ -27,19 +29,20 @@ params.input_dir = null
 params.output_dir = null
 params.config_json = null
 params.channel = 1
-params.preprocessing_script = './spim_pipeline_fixed.py'  // Default preprocessing script
+params.preprocessing_script = './spim_pipeline_fixed.py'
 params.container = 'docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1'
+params.fiji_container = 'docker://fiji/fiji:20220415'
 params.help = false
 
 // Show help message
 if (params.help) {
     log.info """
     ============================================================================
-    SPIM 4D Image Processing Pipeline
+    SPIM 4D Image Processing Pipeline with Optional ROI Cropping
     ============================================================================
 
     Usage:
-        nextflow run spim_pipeline_fixed.nf \\
+        nextflow run spim_pipeline_with_roi.nf \\
             --input_dir <path> \\
             --output_dir <path> \\
             --config_json <path> \\
@@ -57,7 +60,17 @@ if (params.help) {
                                (default: ./spim_pipeline_fixed.py)
         --container             Singularity/Docker container image
                                (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1)
+        --fiji_container        Fiji container for ROI cropping
+                               (default: docker://fiji/fiji:20220415)
         --help                 Show this help message
+
+    ROI Cropping (in config.json):
+        roi_cropping.enabled: true/false - Enable ROI cropping step
+        roi_cropping.roi_path: "/path/to/file.roi" - Path to ImageJ ROI file
+
+        NOTE: ROI should be created from one timepoint's raw image. It will be
+        applied to ALL timepoints. Cropping preserves voxel spacing but reduces
+        image dimensions.
 
     Voxel Size Configuration (in config.json):
         voxel_size.auto_detect: true  - Auto-detect from image metadata (default)
@@ -66,6 +79,7 @@ if (params.help) {
 
     Output Structure:
         output_dir/
+        ├── 00_cropped/          - ROI-cropped images (if enabled)
         ├── 01_preprocessed/     - Preprocessed & deconvolved images per timepoint
         ├── 02_segmented/        - Cellpose segmentation masks per timepoint
         ├── 03_hyperstack/       - Final 4D merged hyperstack with metadata
@@ -73,13 +87,12 @@ if (params.help) {
         ├── logs/                - Processing logs
         └── reports/             - QC reports
 
-    Example:
-        nextflow run spim_pipeline_fixed.nf \\
+    Example with ROI cropping:
+        nextflow run spim_pipeline_with_roi.nf \\
             --input_dir ./data \\
             --output_dir ./output \\
-            --config_json config_medaka.json \\
-            --channel 2 \\
-            --preprocessing_script ./spim_pipeline_fixed.py
+            --config_json config_with_roi.json \\
+            --channel 2
 
     ============================================================================
     """.stripIndent()
@@ -117,6 +130,23 @@ if (!config.containsKey('voxel_size')) {
     config.voxel_size = [auto_detect: true]
 }
 
+// Validate ROI cropping configuration
+if (!config.containsKey('roi_cropping')) {
+    config.roi_cropping = [enabled: false]
+}
+
+// Validate ROI file exists if cropping is enabled
+if (config.roi_cropping.enabled) {
+    if (!config.roi_cropping.containsKey('roi_path')) {
+        log.error "ERROR: ROI cropping enabled but no 'roi_path' specified in config"
+        exit 1
+    }
+    if (!file(config.roi_cropping.roi_path).exists()) {
+        log.error "ERROR: ROI file not found: ${config.roi_cropping.roi_path}"
+        exit 1
+    }
+}
+
 // ============================================================================
 // WORKFLOW HEADER
 // ============================================================================
@@ -125,19 +155,26 @@ def voxel_info = config.voxel_size.auto_detect ?
     "Auto-detect from image metadata" :
     "Manual: ${config.voxel_size.x_um} x ${config.voxel_size.y_um} x ${config.voxel_size.z_um} µm"
 
+def roi_info = config.roi_cropping.enabled ?
+    "ENABLED - using ${config.roi_cropping.roi_path}" :
+    "DISABLED"
+
 log.info """
 ============================================================================
-SPIM 4D Image Processing Pipeline - FIXED
+SPIM 4D Image Processing Pipeline - WITH ROI CROPPING
 ============================================================================
 Input directory    : ${params.input_dir}
 Output directory   : ${params.output_dir}
 Configuration      : ${params.config_json}
 Channel to process : ${params.channel}
+ROI Cropping       : ${roi_info}
 Voxel size mode    : ${voxel_info}
 Preprocessing script: ${params.preprocessing_script}
 Container          : ${params.container}
+Fiji Container     : ${params.fiji_container}
 
 Pipeline steps:
+  ${config.roi_cropping.enabled ? '0. ROI-based cropping with Fiji (all timepoints)' : ''}
   1. Parse and sort timepoint files
   2. Extract/Configure metadata with voxel sizes
   3. Preprocessing & Deconvolution per timepoint
@@ -147,6 +184,105 @@ Pipeline steps:
 Started at: ${new Date()}
 ============================================================================
 """.stripIndent()
+
+// ============================================================================
+// PROCESS: ROI-based Cropping with Fiji (OPTIONAL)
+// ============================================================================
+
+process CROP_WITH_ROI {
+    tag "t${String.format('%04d', timepoint)}"
+
+    maxRetries 1
+    errorStrategy 'terminate'
+
+    publishDir "${params.output_dir}/00_cropped",
+        mode: 'copy',
+        pattern: "*_cropped.tif"
+
+    publishDir "${params.output_dir}/logs/cropping",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.fiji_container
+
+    input:
+    tuple val(timepoint), path(image_file)
+    path roi_file
+
+    output:
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_cropped.tif"), emit: cropped
+    path "t${String.format('%04d', timepoint)}_crop.log", emit: log
+
+    script:
+    def t_formatted = String.format('%04d', timepoint)
+    def filename = image_file.name
+    def roi_filename = roi_file.name
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "============================================" | tee t${t_formatted}_crop.log
+    echo "ROI Cropping timepoint: ${timepoint}" | tee -a t${t_formatted}_crop.log
+    echo "Input file: ${filename}" | tee -a t${t_formatted}_crop.log
+    echo "ROI file: ${roi_filename}" | tee -a t${t_formatted}_crop.log
+    echo "============================================" | tee -a t${t_formatted}_crop.log
+    echo "" | tee -a t${t_formatted}_crop.log
+
+    # Create ImageJ macro for cropping
+    cat > crop_macro.ijm << 'MACRO_EOF'
+// Open the image
+open("${filename}");
+originalTitle = getTitle();
+
+// Load and apply ROI
+roiManager("Open", "${roi_filename}");
+roiManager("Select", 0);
+
+// Get ROI bounds for logging
+Roi.getBounds(rx, ry, rwidth, rheight);
+print("ROI bounds: x=" + rx + ", y=" + ry + ", width=" + rwidth + ", height=" + rheight);
+
+// Crop all slices (3D stack)
+run("Crop");
+
+// Save cropped image
+saveAs("Tiff", "t${t_formatted}_cropped.tif");
+
+// Log final dimensions
+getDimensions(width, height, channels, slices, frames);
+print("Cropped dimensions: " + width + "x" + height + "x" + slices + " (WxHxZ)");
+
+// Close
+close();
+print("Cropping completed successfully");
+MACRO_EOF
+
+    # Run Fiji in headless mode
+    echo "Running Fiji in headless mode..." | tee -a t${t_formatted}_crop.log
+
+    # Fiji headless execution
+    ImageJ-linux64 --ij2 --headless --console --run crop_macro.ijm >> t${t_formatted}_crop.log 2>&1
+
+    EXIT_CODE=\$?
+
+    if [ \$EXIT_CODE -ne 0 ]; then
+        echo "ERROR: Fiji cropping failed with exit code \$EXIT_CODE" | tee -a t${t_formatted}_crop.log
+        exit \$EXIT_CODE
+    fi
+
+    # Verify output exists
+    if [ ! -f "t${t_formatted}_cropped.tif" ]; then
+        echo "ERROR: Cropped output file not created" | tee -a t${t_formatted}_crop.log
+        echo "Directory contents:" | tee -a t${t_formatted}_crop.log
+        ls -lh | tee -a t${t_formatted}_crop.log
+        exit 1
+    fi
+
+    echo "" | tee -a t${t_formatted}_crop.log
+    echo "ROI cropping completed successfully for timepoint ${timepoint}" | tee -a t${t_formatted}_crop.log
+    echo "Output: t${t_formatted}_cropped.tif" | tee -a t${t_formatted}_crop.log
+    """
+}
 
 // ============================================================================
 // PROCESS: Extract and Configure Metadata
@@ -164,6 +300,7 @@ process EXTRACT_METADATA {
 
     input:
     tuple val(timepoint), path(image_file)
+    val was_cropped
 
     output:
     path "shared_metadata.json", emit: metadata
@@ -176,14 +313,15 @@ process EXTRACT_METADATA {
     def manual_x = config.voxel_size.get('x_um', 0.325)
     def manual_y = config.voxel_size.get('y_um', 0.325)
     def manual_z = config.voxel_size.get('z_um', 1.0)
-    // Convert boolean to Python format (True/False instead of true/false)
     def auto_detect_py = auto_detect ? 'True' : 'False'
+    def was_cropped_py = was_cropped ? 'True' : 'False'
     """
     #!/usr/bin/env bash
     set -euo pipefail
 
     echo "============================================"
     echo "Extracting/Configuring metadata from: ${filename}"
+    echo "Image was ROI-cropped: ${was_cropped}"
     echo "Voxel size mode: ${auto_detect ? 'AUTO-DETECT' : 'MANUAL'}"
     echo "============================================"
 
@@ -220,12 +358,14 @@ try:
 
     filename = '${filename}'
     auto_detect = ${auto_detect_py}
+    was_cropped = ${was_cropped_py}
     manual_x = ${manual_x}
     manual_y = ${manual_y}
     manual_z = ${manual_z}
 
     print(f"Processing file: {filename}", file=sys.stderr)
     print(f"Auto-detect mode: {auto_detect}", file=sys.stderr)
+    print(f"Was ROI-cropped: {was_cropped}", file=sys.stderr)
 
     if not Path(filename).exists():
         print(f"ERROR: File not found: {filename}", file=sys.stderr)
@@ -299,6 +439,13 @@ try:
 
             metadata['voxel_size_source'] = 'manual_override'
 
+        # IMPORTANT: ROI cropping does NOT change voxel spacing
+        # It only changes the number of pixels in X and Y dimensions
+        # The physical size of each pixel remains the same
+        metadata['was_roi_cropped'] = was_cropped
+        if was_cropped:
+            print("NOTE: Image was ROI-cropped. Voxel spacing unchanged, but XY dimensions reduced.", file=sys.stderr)
+
         # Store voxel sizes
         metadata['x_resolution_um'] = x_resolution_um
         metadata['y_resolution_um'] = y_resolution_um
@@ -332,6 +479,7 @@ try:
 
     print(f"\\nMetadata Configuration:")
     print(f"  Source: {metadata['voxel_size_source']}")
+    print(f"  ROI cropped: {was_cropped}")
     print(f"  Image shape: {metadata['shape']['dimensions']} (ZYX)")
     print(f"  Voxel size: {x_resolution_um:.4f} x {y_resolution_um:.4f} x {z_spacing:.4f} µm")
     print("\\nFull metadata:")
@@ -432,6 +580,7 @@ with open('${metadata_json}', 'r') as f:
 config = json.loads('${config_json_str}')
 
 # Get voxel sizes from metadata (these are already configured - auto-detected or manual)
+# NOTE: ROI cropping does not change voxel sizes, only image dimensions
 xy_pixel = metadata['x_resolution_um']  # Use configured X resolution
 z_pixel = metadata['imagej']['spacing']  # Use configured Z spacing
 
@@ -439,6 +588,8 @@ print(f"Using voxel sizes from metadata:")
 print(f"  XY pixel size: {xy_pixel:.4f} µm")
 print(f"  Z pixel size: {z_pixel:.4f} µm")
 print(f"  Source: {metadata.get('voxel_size_source', 'unknown')}")
+if metadata.get('was_roi_cropped', False):
+    print(f"  Note: Image was ROI-cropped (voxel size unchanged)")
 print("")
 
 # Build command for preprocessing script
@@ -494,7 +645,6 @@ if result.returncode != 0:
 PYTHON_EOF
 
     # Find and rename output to standard format with ROBUST pattern matching
-    # The preprocessing script may use different naming conventions (e.g., _50 for 0.5 scaling)
     echo ""
     echo "Finding processed output file..."
     echo "Expected scaling: ${cfg.image_scaling}"
@@ -505,7 +655,7 @@ PYTHON_EOF
     # Try multiple patterns to find the output
     ORIGINAL_OUTPUT=""
 
-    # Pattern 1: Standard scaling string (e.g., 0.5 -> 05 -> *_05*.tif)
+    # Pattern 1: Standard scaling string
     if [ -z "\$ORIGINAL_OUTPUT" ]; then
         SCALING_STR=\$(echo "${cfg.image_scaling}" | sed 's/\\.//g')
         echo "Trying pattern 1: *_\${SCALING_STR}*.tif"
@@ -513,7 +663,7 @@ PYTHON_EOF
         [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
     fi
 
-    # Pattern 2: Percentage string (e.g., 0.5 -> 50 -> *_50*.tif)
+    # Pattern 2: Percentage string
     if [ -z "\$ORIGINAL_OUTPUT" ]; then
         SCALING_PCT=\$(python3 -c "print(int(${cfg.image_scaling} * 100))")
         echo "Trying pattern 2: *_\${SCALING_PCT}*.tif"
@@ -521,14 +671,14 @@ PYTHON_EOF
         [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
     fi
 
-    # Pattern 3: Any new .tif file (excluding the input)
+    # Pattern 3: Any new .tif file
     if [ -z "\$ORIGINAL_OUTPUT" ]; then
         echo "Trying pattern 3: any new .tif file (not input)"
         ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" -newer "${script_name}" 2>/dev/null | head -1)
         [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
     fi
 
-    # Pattern 4: Any .tif file that's not the input (last resort)
+    # Pattern 4: Any .tif file that's not the input
     if [ -z "\$ORIGINAL_OUTPUT" ]; then
         echo "Trying pattern 4: any .tif file (not input)"
         ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" 2>/dev/null | head -1)
@@ -562,6 +712,7 @@ with open('${metadata_json}', 'r') as f:
 img = tifffile.imread('t${t_formatted}_processed.tif')
 
 # Recalculate voxel sizes after scaling
+# NOTE: ROI cropping doesn't affect voxel size, only preprocessing scaling does
 x_res = metadata['x_resolution_um'] / ${cfg.image_scaling}
 y_res = metadata['y_resolution_um'] / ${cfg.image_scaling}
 z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
@@ -569,6 +720,8 @@ z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
 print(f"Voxel sizes after preprocessing scaling:")
 print(f"  Original: {metadata['x_resolution_um']:.4f} x {metadata['y_resolution_um']:.4f} x {z_spacing:.4f} µm")
 print(f"  Scaled (×{${cfg.image_scaling}}): {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
+if metadata.get('was_roi_cropped', False):
+    print(f"  (Image was ROI-cropped before preprocessing)")
 
 # Re-save with preserved metadata
 tifffile.imwrite(
@@ -580,7 +733,8 @@ tifffile.imwrite(
         'spacing': z_spacing,
         'unit': 'um',
         'axes': 'ZYX',
-        'TimePoint': ${timepoint}
+        'TimePoint': ${timepoint},
+        'WasROICropped': metadata.get('was_roi_cropped', False)
     }
 )
 
@@ -733,7 +887,8 @@ tifffile.imwrite(
         'unit': 'um',
         'axes': 'ZYX',
         'TimePoint': ${timepoint},
-        'LabelImage': True
+        'LabelImage': True,
+        'WasROICropped': metadata.get('was_roi_cropped', False)
     }
 )
 print(f"Metadata preserved in segmentation mask for timepoint ${timepoint}")
@@ -844,6 +999,7 @@ img_4d = np.stack(timepoint_arrays, axis=0)
 print(f"\\nMerged 4D shape: {img_4d.shape} (TZYX)")
 
 # Calculate metadata (accounting for preprocessing scaling)
+# NOTE: ROI cropping does not change voxel size
 scaling = config['segmentation']['image_scaling']
 x_res = ref_metadata['x_resolution_um'] / scaling
 y_res = ref_metadata['y_resolution_um'] / scaling
@@ -851,6 +1007,7 @@ z_spacing = ref_metadata['imagej']['spacing'] if 'imagej' in ref_metadata else 1
 
 print(f"\\nVoxel size configuration:")
 print(f"  Source: {ref_metadata.get('voxel_size_source', 'unknown')}")
+print(f"  Was ROI cropped: {ref_metadata.get('was_roi_cropped', False)}")
 print(f"  Original: {ref_metadata['x_resolution_um']:.4f} x {ref_metadata['y_resolution_um']:.4f} x {z_spacing:.4f} µm")
 print(f"  Final (after ×{scaling} scaling): {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
 
@@ -873,7 +1030,9 @@ hyperstack_metadata = {
     'dtype': str(img_4d.dtype),
     'n_timepoints': img_4d.shape[0],
     'is_label_image': True,
+    'was_roi_cropped': ref_metadata.get('was_roi_cropped', False),
     'processing': {
+        'roi_cropping_enabled': ref_metadata.get('was_roi_cropped', False),
         'preprocessing_scaling': config['preprocessing']['image_scaling'],
         'segmentation_scaling': scaling,
         'cellpose_diameter': config['segmentation']['diameter'],
@@ -899,7 +1058,8 @@ tifffile.imwrite(
         'axes': 'TZYX',
         'frames': img_4d.shape[0],
         'slices': img_4d.shape[1],
-        'LabelImage': True
+        'LabelImage': True,
+        'WasROICropped': ref_metadata.get('was_roi_cropped', False)
     }
 )
 
@@ -909,6 +1069,7 @@ print("="*60)
 print(f"Shape: {img_4d.shape} (TZYX)")
 print(f"Voxel size: {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
 print(f"Voxel size source: {ref_metadata.get('voxel_size_source', 'unknown')}")
+print(f"ROI cropped: {ref_metadata.get('was_roi_cropped', False)}")
 print(f"Timepoints: {img_4d.shape[0]}")
 print(f"Z slices per timepoint: {img_4d.shape[1]}")
 print("="*60)
@@ -961,14 +1122,19 @@ with open('${config_json}', 'r') as f:
     config = json.load(f)
 
 # Collect all log files
+crop_logs = list(Path('.').glob('*_crop.log'))
 preprocess_logs = list(Path('.').glob('*_preprocess.log'))
 segment_logs = list(Path('.').glob('*_segment.log'))
 
 # Generate summary
 summary = {
-    'pipeline_version': '1.0.0-voxel-config-v2',
+    'pipeline_version': '1.0.0-with-roi-cropping',
     'execution_date': datetime.now().isoformat(),
     'input_channel': ${params.channel},
+    'roi_cropping': {
+        'enabled': hyperstack_meta.get('was_roi_cropped', False),
+        'n_timepoints_cropped': len(crop_logs) if crop_logs else 0
+    },
     'voxel_size_configuration': {
         'mode': hyperstack_meta['voxel_size'].get('source', 'unknown'),
         'final_voxel_size_um': hyperstack_meta['voxel_size']
@@ -994,6 +1160,10 @@ elif voxel_source == 'manual_override':
     voxel_badge = '<span style="background-color: #e67e22; color: white; padding: 5px 10px; border-radius: 3px;">MANUAL OVERRIDE</span>'
 else:
     voxel_badge = '<span style="background-color: #95a5a6; color: white; padding: 5px 10px; border-radius: 3px;">UNKNOWN</span>'
+
+# ROI cropping badge
+roi_cropped = hyperstack_meta.get('was_roi_cropped', False)
+roi_badge = '<span style="background-color: #3498db; color: white; padding: 5px 10px; border-radius: 3px;">YES</span>' if roi_cropped else '<span style="background-color: #95a5a6; color: white; padding: 5px 10px; border-radius: 3px;">NO</span>'
 
 # Generate HTML report
 html = f'''
@@ -1030,6 +1200,13 @@ html = f'''
         </div>
 
         <div class="highlight-box">
+            <h3 style="margin-top: 0;">✂️ ROI Cropping</h3>
+            <p><strong>Enabled:</strong> {roi_badge}</p>
+            {f'<p><strong>Timepoints cropped:</strong> {len(crop_logs)}</p>' if roi_cropped else ''}
+            <p><em>Note: ROI cropping reduces image dimensions but preserves voxel spacing</em></p>
+        </div>
+
+        <div class="highlight-box">
             <h3 style="margin-top: 0;">📏 Voxel Size Configuration</h3>
             <p><strong>Mode:</strong> {voxel_badge}</p>
             <p><strong>Final voxel size:</strong> {hyperstack_meta['voxel_size']['x_um']:.4f} × {hyperstack_meta['voxel_size']['y_um']:.4f} × {hyperstack_meta['voxel_size']['z_um']:.4f} µm</p>
@@ -1041,6 +1218,7 @@ html = f'''
             <tr><td>Pipeline Version</td><td>{summary['pipeline_version']}</td></tr>
             <tr><td>Execution Date</td><td>{summary['execution_date']}</td></tr>
             <tr><td>Input Channel</td><td class="info">{summary['input_channel']}</td></tr>
+            <tr><td>ROI Cropping Enabled</td><td>{roi_badge}</td></tr>
             <tr><td>Timepoints Preprocessed</td><td class="success">{summary['results']['n_timepoints_processed']}</td></tr>
             <tr><td>Timepoints Segmented</td><td class="success">{summary['results']['n_timepoints_segmented']}</td></tr>
         </table>
@@ -1053,6 +1231,7 @@ html = f'''
             <tr><td>Z (Slices)</td><td>{hyperstack_meta['shape']['Z']}</td></tr>
             <tr><td>Y (Height)</td><td>{hyperstack_meta['shape']['Y']}</td></tr>
             <tr><td>X (Width)</td><td>{hyperstack_meta['shape']['X']}</td></tr>
+            <tr><td>ROI Cropped</td><td>{roi_badge}</td></tr>
             <tr><td>Voxel Size Source</td><td>{voxel_badge}</td></tr>
             <tr><td>X Resolution</td><td>{hyperstack_meta['voxel_size']['x_um']:.4f} µm</td></tr>
             <tr><td>Y Resolution</td><td>{hyperstack_meta['voxel_size']['y_um']:.4f} µm</td></tr>
@@ -1062,6 +1241,9 @@ html = f'''
         </table>
 
         <h2>⚙️ Processing Configuration</h2>
+
+        {'<h3>ROI Cropping</h3>' if config.get('roi_cropping', {}).get('enabled', False) else ''}
+        {f'<pre>{json.dumps(config.get("roi_cropping", {{}}), indent=2)}</pre>' if config.get('roi_cropping', {}).get('enabled', False) else ''}
 
         <h3>Voxel Size Settings</h3>
         <pre>{json.dumps(config.get('voxel_size', {{'auto_detect': True}}), indent=2)}</pre>
@@ -1075,6 +1257,7 @@ html = f'''
         <h2>📋 Pipeline Steps</h2>
         <ol>
             <li><strong>File Parsing</strong> - Extracted timepoints from filename pattern (t####_Channel #.tif)</li>
+            {f'<li><strong>ROI Cropping</strong> - Applied ROI from {config.get("roi_cropping", {}).get("roi_path", "N/A")} to all timepoints</li>' if roi_cropped else ''}
             <li><strong>Metadata Extraction/Configuration</strong> - {'Auto-detected' if voxel_source == 'auto_detected' else 'Manual override of'} voxel sizes from image metadata</li>
             <li><strong>Preprocessing & Deconvolution</strong> - Applied corrections and deconvolution per timepoint</li>
             <li><strong>Cellpose Segmentation</strong> - 3D cell segmentation per timepoint</li>
@@ -1084,6 +1267,7 @@ html = f'''
         <h2>📂 Output Files</h2>
         <table>
             <tr><th>Directory</th><th>Contents</th></tr>
+            {f'<tr><td>00_cropped/</td><td>ROI-cropped images per timepoint</td></tr>' if roi_cropped else ''}
             <tr><td>01_preprocessed/</td><td>Preprocessed and deconvolved images per timepoint</td></tr>
             <tr><td>02_segmented/</td><td>Cellpose segmentation masks per timepoint</td></tr>
             <tr><td>03_hyperstack/</td><td><strong>4D_hyperstack.tif</strong> - Final merged 4D image</td></tr>
@@ -1118,15 +1302,12 @@ EOF
 
 workflow {
     // Parse input files with pattern: t####_Channel #.tif
-    // Extract timepoint number and filter by channel
-
     input_pattern = "${params.input_dir}/t*_Channel ${params.channel}.tif"
 
     input_channel = Channel
         .fromPath(input_pattern)
         .ifEmpty { error "No files found matching pattern: ${input_pattern}" }
         .map { file ->
-            // Extract timepoint number from filename
             def matcher = (file.name =~ /t(\d+)_Channel/)
             if (matcher.find()) {
                 def timepoint = matcher.group(1).toInteger()
@@ -1142,21 +1323,43 @@ workflow {
         log.info "Found timepoint ${timepoint}: ${file.name}"
     }
 
-    // Create channel for preprocessing script (shared across all process instances)
+    // Create channel for preprocessing script
     preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
 
-    // 1. Extract/Configure metadata from FIRST timepoint only (all have same metadata)
-    first_timepoint = input_channel.first()
-    EXTRACT_METADATA(first_timepoint)
+    // OPTIONAL: ROI Cropping Step
+    if (config.roi_cropping.enabled) {
+        log.info "ROI cropping enabled - using ${config.roi_cropping.roi_path}"
+
+        // Create channel for ROI file
+        roi_file_ch = Channel.fromPath(config.roi_cropping.roi_path, checkIfExists: true)
+
+        // Apply ROI cropping to all timepoints
+        CROP_WITH_ROI(
+            input_channel,
+            roi_file_ch.collect()
+        )
+
+        // Use cropped images as input for rest of pipeline
+        processing_input = CROP_WITH_ROI.out.cropped
+        was_cropped = true
+    } else {
+        log.info "ROI cropping disabled - using original images"
+        processing_input = input_channel
+        was_cropped = false
+    }
+
+    // 1. Extract/Configure metadata from FIRST timepoint
+    first_timepoint = processing_input.first()
+    EXTRACT_METADATA(first_timepoint, was_cropped)
 
     // Share the same metadata with all timepoints
     shared_metadata = EXTRACT_METADATA.out.metadata
 
     // 2. Preprocess and deconvolve each timepoint
     PREPROCESS_DECONVOLVE(
-        input_channel,
+        processing_input,
         shared_metadata,
-        preproc_script_ch.collect(),  // Collect to make it available to all process instances
+        preproc_script_ch.collect(),
         config.preprocessing
     )
 
@@ -1178,7 +1381,14 @@ workflow {
     )
 
     // 5. Generate QC report
-    all_logs = PREPROCESS_DECONVOLVE.out.log
+    all_logs = Channel.empty()
+
+    if (config.roi_cropping.enabled) {
+        all_logs = all_logs.mix(CROP_WITH_ROI.out.log)
+    }
+
+    all_logs = all_logs
+        .mix(PREPROCESS_DECONVOLVE.out.log)
         .mix(CELLPOSE_SEGMENT.out.log)
         .collect()
 
@@ -1195,6 +1405,7 @@ workflow {
 
 workflow.onComplete {
     def voxel_mode = config.voxel_size?.auto_detect ? "Auto-detected" : "Manual override"
+    def roi_status = config.roi_cropping?.enabled ? "ENABLED" : "DISABLED"
 
     log.info """
     ============================================================================
@@ -1203,10 +1414,12 @@ workflow.onComplete {
     Status       : ${workflow.success ? 'SUCCESS ✓' : 'FAILED ✗'}
     Duration     : ${workflow.duration}
     Channel      : ${params.channel}
+    ROI cropping : ${roi_status}
     Voxel mode   : ${voxel_mode}
     Output dir   : ${params.output_dir}
 
     Results:
+      ${config.roi_cropping?.enabled ? "- Cropped images     : ${params.output_dir}/00_cropped/" : ""}
       - Preprocessed images : ${params.output_dir}/01_preprocessed/
       - Segmented masks     : ${params.output_dir}/02_segmented/
       - 4D Hyperstack       : ${params.output_dir}/03_hyperstack/4D_hyperstack.tif
