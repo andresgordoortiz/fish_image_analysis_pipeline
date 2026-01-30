@@ -1574,8 +1574,6 @@ process GENERATE_QC_REPORT {
     path "pipeline_report.html"
     path "pipeline_summary.json"
 
-    container params.container
-
     script:
     """
     #!/bin/bash
