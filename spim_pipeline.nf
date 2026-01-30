@@ -515,7 +515,7 @@ PYTHON_EOF
 
     # Pattern 2: Percentage string (e.g., 0.5 -> 50 -> *_50*.tif)
     if [ -z "\$ORIGINAL_OUTPUT" ]; then
-        SCALING_PCT=\$(echo "${cfg.image_scaling} * 100" | bc | cut -d. -f1)
+        SCALING_PCT=\$(python3 -c "print(int(${cfg.image_scaling} * 100))")
         echo "Trying pattern 2: *_\${SCALING_PCT}*.tif"
         ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*_\${SCALING_PCT}*.tif" -not -name "${filename}" 2>/dev/null | head -1)
         [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
