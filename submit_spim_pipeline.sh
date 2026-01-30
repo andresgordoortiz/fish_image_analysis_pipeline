@@ -67,7 +67,7 @@ OUTPUT_DIR="./spim_pipeline_output"
 CONFIG_JSON="./config_medaka.json"
 CHANNEL=2
 PROFILE="standard"
-RESUME=""
+RESUME="-resume"
 PIPELINE_SCRIPT="./spim_pipeline.nf"
 
 # ============================================================================
