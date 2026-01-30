@@ -203,7 +203,7 @@ process CROP_WITH_ROI {
         mode: 'copy',
         pattern: "*.log"
 
-    container params.fiji_container
+    container params.container  // Use main container, not Fiji!
 
     input:
     tuple val(timepoint), path(image_file)
@@ -221,95 +221,239 @@ process CROP_WITH_ROI {
     #!/bin/bash
     set -euo pipefail
 
-    echo "============================================" | tee t${t_formatted}_crop.log
-    echo "ROI Cropping timepoint: ${timepoint}" | tee -a t${t_formatted}_crop.log
-    echo "Input file: ${filename}" | tee -a t${t_formatted}_crop.log
-    echo "ROI file: ${roi_filename}" | tee -a t${t_formatted}_crop.log
-    echo "============================================" | tee -a t${t_formatted}_crop.log
-    echo "" | tee -a t${t_formatted}_crop.log
+    # Redirect all output to log
+    exec > >(tee t${t_formatted}_crop.log) 2>&1
 
-    # Create ImageJ macro for cropping
-    cat > crop_macro.ijm << 'MACRO_EOF'
-// Open the image
-open("${filename}");
-originalTitle = getTitle();
+    echo "============================================"
+    echo "Python-based ROI Cropping"
+    echo "Timepoint: ${timepoint}"
+    echo "Input: ${filename}"
+    echo "ROI: ${roi_filename}"
+    echo "============================================"
+    echo ""
 
-// Load and apply ROI
-roiManager("Open", "${roi_filename}");
-roiManager("Select", 0);
+    # Activate environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
 
-// Get ROI bounds for logging
-Roi.getBounds(rx, ry, rwidth, rheight);
-print("ROI bounds: x=" + rx + ", y=" + ry + ", width=" + rwidth + ", height=" + rheight);
+    echo "Python version:"
+    python3 --version
+    echo ""
 
-// Crop all slices (3D stack)
-run("Crop");
+    # Install read-roi if not present (runtime installation)
+    echo "Checking/installing read-roi..."
+    python3 -c "import read_roi" 2>/dev/null || {
+        echo "Installing read-roi..."
+        pip install read-roi --break-system-packages
+    }
+    echo "✓ read-roi available"
+    echo ""
 
-// Save cropped image
-saveAs("Tiff", "t${t_formatted}_cropped.tif");
+    # Run Python cropping script
+    python3 << 'PYTHON_CROP_SCRIPT'
+import sys
+import tifffile
+import numpy as np
+from read_roi import read_roi_file
+from pathlib import Path
 
-// Log final dimensions
-getDimensions(width, height, channels, slices, frames);
-print("Cropped dimensions: " + width + "x" + height + "x" + slices + " (WxHxZ)");
+print("="*60)
+print("Starting ROI-based cropping...")
+print("="*60)
 
-// Close
-close();
-print("Cropping completed successfully");
+try:
+    # File paths
+    input_file = '${filename}'
+    roi_file = '${roi_filename}'
+    output_file = 't${t_formatted}_cropped.tif'
 
-// Exit
-eval("script", "System.exit(0);");
-MACRO_EOF
+    print(f"Input: {input_file}")
+    print(f"ROI: {roi_file}")
+    print(f"Output: {output_file}")
+    print("")
 
-    # Run Fiji in headless mode
-    echo "Running Fiji in headless mode..." | tee -a t${t_formatted}_crop.log
-    echo "Working directory: \$(pwd)" | tee -a t${t_formatted}_crop.log
-    echo "Files present:" | tee -a t${t_formatted}_crop.log
-    ls -lh | tee -a t${t_formatted}_crop.log
-    echo "" | tee -a t${t_formatted}_crop.log
+    # Check files exist
+    if not Path(input_file).exists():
+        print(f"ERROR: Input file not found: {input_file}")
+        sys.exit(1)
 
-    # Find ImageJ executable
-    if [ -f "/opt/fiji/Fiji.app/ImageJ-linux64" ]; then
-        IMAGEJ_EXE="/opt/fiji/Fiji.app/ImageJ-linux64"
-    elif [ -f "/usr/local/fiji/Fiji.app/ImageJ-linux64" ]; then
-        IMAGEJ_EXE="/usr/local/fiji/Fiji.app/ImageJ-linux64"
-    elif command -v ImageJ-linux64 &> /dev/null; then
-        IMAGEJ_EXE="ImageJ-linux64"
-    else
-        echo "ERROR: ImageJ executable not found" | tee -a t${t_formatted}_crop.log
-        echo "Searching for Fiji..." | tee -a t${t_formatted}_crop.log
-        find / -name "ImageJ-linux64" 2>/dev/null | head -5 | tee -a t${t_formatted}_crop.log
-        exit 1
-    fi
+    if not Path(roi_file).exists():
+        print(f"ERROR: ROI file not found: {roi_file}")
+        sys.exit(1)
 
-    echo "Using ImageJ: \$IMAGEJ_EXE" | tee -a t${t_formatted}_crop.log
-    echo "" | tee -a t${t_formatted}_crop.log
+    # Load ROI
+    print("Loading ROI file...")
+    roi_data = read_roi_file(roi_file)
 
-    # Fiji headless execution with proper options
-    \$IMAGEJ_EXE --ij2 --headless --console --run crop_macro.ijm >> t${t_formatted}_crop.log 2>&1 || {
-        EXIT_CODE=\$?
-        echo "" | tee -a t${t_formatted}_crop.log
-        echo "WARNING: ImageJ exited with code \$EXIT_CODE" | tee -a t${t_formatted}_crop.log
-        echo "This may be normal if the macro completed successfully" | tee -a t${t_formatted}_crop.log
+    if not roi_data:
+        print("ERROR: No ROI data found in file")
+        sys.exit(1)
+
+    # Get first ROI (ImageJ ROI files can contain multiple ROIs)
+    roi_name = list(roi_data.keys())[0]
+    roi = roi_data[roi_name]
+
+    print(f"ROI name: {roi_name}")
+    print(f"ROI type: {roi.get('type', 'unknown')}")
+
+    # Extract bounds
+    # ImageJ ROI format uses 'left', 'top', 'width', 'height'
+    x = int(roi['left'])
+    y = int(roi['top'])
+    width = int(roi['width'])
+    height = int(roi['height'])
+
+    print(f"ROI bounds:")
+    print(f"  X: {x}")
+    print(f"  Y: {y}")
+    print(f"  Width: {width}")
+    print(f"  Height: {height}")
+    print("")
+
+    # Load image
+    print("Loading image...")
+    img = tifffile.imread(input_file)
+    print(f"Original image shape: {img.shape}")
+    print(f"Original image dtype: {img.dtype}")
+
+    # Determine format
+    if img.ndim == 3:
+        axes = 'ZYX'
+        nz, ny, nx = img.shape
+    elif img.ndim == 2:
+        axes = 'YX'
+        ny, nx = img.shape
+        nz = 1
+    else:
+        print(f"ERROR: Unexpected image dimensions: {img.ndim}")
+        sys.exit(1)
+
+    print(f"Image axes: {axes}")
+    print("")
+
+    # Validate ROI bounds
+    if x < 0 or y < 0:
+        print(f"ERROR: ROI has negative coordinates: x={x}, y={y}")
+        sys.exit(1)
+
+    if x + width > nx:
+        print(f"ERROR: ROI extends beyond image width: {x + width} > {nx}")
+        sys.exit(1)
+
+    if y + height > ny:
+        print(f"ERROR: ROI extends beyond image height: {y + height} > {ny}")
+        sys.exit(1)
+
+    print("✓ ROI bounds valid")
+    print("")
+
+    # Crop image
+    print("Cropping image...")
+    if img.ndim == 3:
+        # 3D stack: crop in XY, keep all Z
+        cropped = img[:, y:y+height, x:x+width]
+    else:
+        # 2D image
+        cropped = img[y:y+height, x:x+width]
+
+    print(f"Cropped shape: {cropped.shape}")
+    print(f"Size reduction: {img.size / cropped.size:.2f}x")
+    print("")
+
+    # Get metadata from original image
+    print("Preserving metadata...")
+    with tifffile.TiffFile(input_file) as tif:
+        # Get resolution tags if present
+        metadata = {}
+        if tif.pages:
+            page = tif.pages[0]
+            tags = page.tags
+
+            if 'XResolution' in tags:
+                metadata['resolution_x'] = tags['XResolution'].value
+            if 'YResolution' in tags:
+                metadata['resolution_y'] = tags['YResolution'].value
+
+            # ImageJ metadata
+            if tif.imagej_metadata:
+                imagej_meta = tif.imagej_metadata.copy()
+                # Update dimensions but keep spacing
+                if 'slices' in imagej_meta:
+                    imagej_meta['slices'] = cropped.shape[0] if cropped.ndim == 3 else 1
+                metadata['imagej'] = imagej_meta
+
+    # Save cropped image with metadata
+    print(f"Saving to: {output_file}")
+
+    save_kwargs = {
+        'data': cropped,
+        'photometric': 'minisblack'
     }
 
-    # Verify output exists (this is the real test)
-    if [ ! -f "t${t_formatted}_cropped.tif" ]; then
-        echo "" | tee -a t${t_formatted}_crop.log
-        echo "ERROR: Cropped output file not created" | tee -a t${t_formatted}_crop.log
-        echo "Directory contents after macro execution:" | tee -a t${t_formatted}_crop.log
-        ls -lha | tee -a t${t_formatted}_crop.log
-        echo "" | tee -a t${t_formatted}_crop.log
-        echo "Macro contents:" | tee -a t${t_formatted}_crop.log
-        cat crop_macro.ijm | tee -a t${t_formatted}_crop.log
+    # Add resolution if we have it
+    if 'resolution_x' in metadata and 'resolution_y' in metadata:
+        x_res = metadata['resolution_x']
+        y_res = metadata['resolution_y']
+        save_kwargs['resolution'] = (x_res[0]/x_res[1], y_res[0]/y_res[1])
+        save_kwargs['metadata'] = {'unit': 'um'}
+        print(f"✓ Preserving XY resolution: {save_kwargs['resolution']}")
+
+    # Add ImageJ metadata if we have it
+    if 'imagej' in metadata:
+        save_kwargs['imagej'] = True
+        save_kwargs['metadata'] = metadata['imagej']
+        print(f"✓ Preserving ImageJ metadata")
+
+    tifffile.imwrite(output_file, **save_kwargs)
+
+    # Verify output
+    if not Path(output_file).exists():
+        print(f"ERROR: Output file was not created")
+        sys.exit(1)
+
+    output_size = Path(output_file).stat().st_size / (1024**2)  # MB
+    print(f"✓ Output file created: {output_size:.2f} MB")
+    print("")
+
+    print("="*60)
+    print("✓ ROI cropping completed successfully!")
+    print("="*60)
+    print(f"Original: {img.shape}")
+    print(f"Cropped:  {cropped.shape}")
+    print(f"ROI: [{x}:{x+width}, {y}:{y+height}]")
+
+except Exception as e:
+    print("")
+    print("="*60)
+    print(f"ERROR: {type(e).__name__}: {str(e)}")
+    print("="*60)
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+PYTHON_CROP_SCRIPT
+
+    # Check exit status
+    if [ \$? -ne 0 ]; then
+        echo ""
+        echo "ERROR: Python cropping script failed"
         exit 1
     fi
 
-    echo "" | tee -a t${t_formatted}_crop.log
-    echo "✓ ROI cropping completed successfully for timepoint ${timepoint}" | tee -a t${t_formatted}_crop.log
-    echo "✓ Output: t${t_formatted}_cropped.tif" | tee -a t${t_formatted}_crop.log
+    # Final verification
+    if [ ! -f "t${t_formatted}_cropped.tif" ]; then
+        echo ""
+        echo "ERROR: Output file not created despite script success"
+        echo "Directory contents:"
+        ls -lha
+        exit 1
+    fi
 
-    # Show output file size
-    echo "✓ File size: \$(du -h t${t_formatted}_cropped.tif | cut -f1)" | tee -a t${t_formatted}_crop.log
+    echo ""
+    echo "✓ Cropping completed for timepoint ${timepoint}"
+    echo "✓ Output: t${t_formatted}_cropped.tif"
+    FILE_SIZE=\$(du -h t${t_formatted}_cropped.tif | cut -f1)
+    echo "✓ File size: \$FILE_SIZE"
     """
 }
 
