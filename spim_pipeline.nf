@@ -1264,7 +1264,8 @@ process GENERATE_QC_REPORT {
     input:
     path all_logs
     path hyperstack_metadata
-    path config_json
+    val config_json
+
 
     output:
     path "pipeline_report.html"
