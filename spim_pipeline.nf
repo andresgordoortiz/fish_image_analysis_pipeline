@@ -1104,65 +1104,6 @@ process MERGE_TO_HYPERSTACK {
 
     container params.container
 
-    memory {
-        def out_format = (config?.output?.format ?: 'tiff').toString().toLowerCase()
-        def safety_full = 1.7
-        def safety_single = 1.3
-        try {
-            def metaFile = new File(metadata_json.toString())
-            def meta = new groovy.json.JsonSlurper().parse(metaFile)
-            
-            // Improved metadata parsing
-            def dims = null
-            if (meta.containsKey('shape')) {
-                if (meta.shape instanceof Map && meta.shape.containsKey('dimensions')) {
-                    dims = meta.shape.dimensions
-                } else if (meta.shape instanceof List) {
-                    dims = meta.shape
-                }
-            }
-            
-            // Fallback to ImageJ metadata
-            if (!dims && meta.containsKey('imagej')) {
-                def z = meta.imagej.get('slices', 1)
-                def y = meta.get('height', 512)
-                def x = meta.get('width', 512)
-                dims = [z, y, x]
-            }
-            
-            // Last resort fallback
-            if (!dims) {
-                dims = [1, 512, 512]
-            }
-            
-            def z = (dims[0] as long)
-            def y = (dims[1] as long)
-            def x = (dims[2] as long)
-
-            def dtype = (meta.dtype ?: meta.get('dtype') ?: 'uint16').toString().toLowerCase()
-            def bytesPerVoxel = 2
-            if (dtype.contains('uint8') || dtype.contains('int8')) bytesPerVoxel = 1
-            else if (dtype.contains('uint16') || dtype.contains('int16')) bytesPerVoxel = 2
-            else if (dtype.contains('uint32') || dtype.contains('int32') || dtype.contains('float32')) bytesPerVoxel = 4
-            else if (dtype.contains('uint64') || dtype.contains('int64') || dtype.contains('float64')) bytesPerVoxel = 8
-
-            def n_timepoints = (segmented_files instanceof Collection) ? segmented_files.size() : 1
-            def bytes_per_timepoint = z * y * x * bytesPerVoxel
-
-            if (out_format in ['tiff','imagej','hyperstack']) {
-                def total_bytes = bytes_per_timepoint * n_timepoints * safety_full
-                def gb = Math.max(1, Math.ceil(total_bytes / (1024.0**3)))
-                return "${gb} GB"
-            } else {
-                def total_bytes = bytes_per_timepoint * safety_single
-                def gb = Math.max(1, Math.ceil(total_bytes / (1024.0**3)))
-                return "${gb} GB"
-            }
-        } catch (any) {
-            return "16 GB"
-        }
-    }
-
     script:
     def config_json_str = groovy.json.JsonOutput.toJson(config).replace("'", "\\'")
     """
