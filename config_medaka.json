@@ -8,7 +8,7 @@
   },
   "voxel_size": {
     "description": "Voxel size configuration - auto-detect or manual override",
-    "auto_detect": true,
+    "auto_detect": false,
     "comment_auto": "Set to true to extract from image metadata, false to use manual values below",
     "x_um": 0.347,
     "y_um": 0.347,
