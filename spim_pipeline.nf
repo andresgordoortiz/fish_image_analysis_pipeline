@@ -1099,6 +1099,8 @@ process MERGE_TO_HYPERSTACK {
     output:
     path "4D_hyperstack.tif", emit: hyperstack
     path "4D_hyperstack_metadata.json", emit: metadata
+    path "4D_hyperstack.h5", emit: h5 optional: true
+    path "4D_hyperstack.xml", emit: xml optional: true
 
     container params.container
 
@@ -1106,11 +1108,47 @@ process MERGE_TO_HYPERSTACK {
     def config_json_str = groovy.json.JsonOutput.toJson(config).replace("'", "\\'")
     """
     #!/bin/bash
-    set -e
+    set -euo pipefail
 
     # Activate micromamba environment
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
+
+    echo "Checking gzip/HDF5 support and h5py availability..."
+
+    # Try to ensure h5py + gzip available, best-effort
+    python3 - <<'PYCHK'
+import sys, subprocess, tempfile, os
+
+def gzip_test():
+    try:
+        import h5py, numpy as np
+        tf = tempfile.mktemp(suffix='.h5')
+        import numpy as _np
+        with h5py.File(tf, 'w') as f:
+            f.create_dataset('d', data=_np.zeros((8,)), compression='gzip')
+        os.remove(tf)
+        print("GZIP_OK")
+        return True
+    except Exception as e:
+        print("GZIP_FAIL", e)
+        return False
+
+if not gzip_test():
+    print("Attempting to install h5py via micromamba...")
+    try:
+        subprocess.check_call(['micromamba', 'install', '-y', '-n', 'microscopy_env', 'h5py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print("micromamba install failed:", e)
+        print("Trying pip install h5py...")
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'h5py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e2:
+            print("pip install failed:", e2)
+            print("Proceeding, but gzip compression may be unavailable.")
+    # re-check
+    gzip_test()
+PYCHK
 
     python3 << 'EOF'
 import tifffile
@@ -1118,137 +1156,225 @@ import numpy as np
 import json
 from pathlib import Path
 import re
+import h5py
+import os
+import sys
 
 print("="*60)
 print("Merging all timepoints into 4D hyperstack")
 print("="*60)
 
-# Get all segmented files and sort by timepoint number
+# Gather segmented files
 seg_files = sorted(Path('.').glob('t*_segmented.tif'))
 
 if not seg_files:
     raise ValueError("No segmented files found!")
 
-print(f"Found {len(seg_files)} timepoint files")
+print(f"Found {len(seg_files)} segmented timepoint files")
 
-# Extract timepoint numbers and sort
+# Extract numeric timepoints and sort
 timepoint_data = []
 for f in seg_files:
-    match = re.search(r't(\\d+)_segmented\\.tif', f.name)
-    if match:
-        t = int(match.group(1))
-        timepoint_data.append((t, f))
+    m = re.search(r't(\\d+)_segmented\\.tif', f.name)
+    if m:
+        timepoint_data.append((int(m.group(1)), f))
     else:
-        print(f"Warning: Could not extract timepoint from {f.name}")
+        print(f"Warning: could not parse timepoint from {f.name}")
 
 timepoint_data.sort(key=lambda x: x[0])
 
-# Load reference metadata
+# Load reference metadata and config
 with open('${metadata_json}', 'r') as f:
     ref_metadata = json.load(f)
 
-# Load config
 config = json.loads('${config_json_str}')
 
-# Load all timepoints
+# Load all timepoints (expect 3D ZYX arrays)
 timepoint_arrays = []
 for t, f in timepoint_data:
     img = tifffile.imread(str(f))
-    print(f"  Loaded t{t:04d}: shape={img.shape}, dtype={img.dtype}")
-
-    # Ensure 3D (ZYX)
+    print(f"  Loaded t{t:04d}: {f.name} shape={img.shape} dtype={img.dtype}")
     if img.ndim != 3:
-        raise ValueError(f"Expected 3D image for t{t:04d}, got {img.ndim}D")
-
+        raise ValueError(f"Expected 3D ZYX image for t{t:04d}, got ndim={img.ndim}")
     timepoint_arrays.append(img)
 
-# Verify all timepoints have same shape
-shapes = [arr.shape for arr in timepoint_arrays]
+# Ensure consistent shape
+shapes = [a.shape for a in timepoint_arrays]
 if len(set(shapes)) > 1:
     raise ValueError(f"Inconsistent shapes across timepoints: {set(shapes)}")
 
-# Stack into 4D array (TZYX)
+# Stack to 4D (T,Z,Y,X)
 img_4d = np.stack(timepoint_arrays, axis=0)
-print(f"\\nMerged 4D shape: {img_4d.shape} (TZYX)")
+print(f"Merged 4D shape: {img_4d.shape} (TZYX)")
 
-# Calculate metadata (accounting for preprocessing scaling)
-# NOTE: ROI cropping does not change voxel size
+# Compute voxel sizes accounting for segmentation scaling
 scaling = config['segmentation']['image_scaling']
 x_res = ref_metadata['x_resolution_um'] / scaling
 y_res = ref_metadata['y_resolution_um'] / scaling
 z_spacing = ref_metadata['imagej']['spacing'] if 'imagej' in ref_metadata else 1.0
 
-print(f"\\nVoxel size configuration:")
-print(f"  Source: {ref_metadata.get('voxel_size_source', 'unknown')}")
-print(f"  Was ROI cropped: {ref_metadata.get('was_roi_cropped', False)}")
-print(f"  Original: {ref_metadata['x_resolution_um']:.4f} x {ref_metadata['y_resolution_um']:.4f} x {z_spacing:.4f} µm")
-print(f"  Final (after ×{scaling} scaling): {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
+# Prepare output config with defaults
+output_cfg = config.get('output', {})
+out_format = output_cfg.get('format', 'tiff').lower()
+correct_y_cfg = output_cfg.get('correct_y', False)  # can be true/false/"auto"
+print(f"Output format requested: {out_format}; correct_y={correct_y_cfg}")
 
-# Create comprehensive metadata
+# Auto-detection heuristic for Y orientation (very conservative)
+def detect_orientation_need_flip(first_file: Path) -> bool:
+    try:
+        with tifffile.TiffFile(str(first_file)) as tf:
+            page = tf.pages[0]
+            tags = page.tags
+            # TIFF Orientation tag (274) might hint at rotation/mirroring
+            if 'Orientation' in tags:
+                orient_val = tags['Orientation'].value
+                print(f"Found TIFF Orientation tag: {orient_val}")
+                # TIFF orientation values: 1 = top-left (normal). Values 3,4,6,7,8 sometimes indicate rotations/mirrors.
+                # Heuristic: if Orientation implies vertical flip (4 or 3) treat as needing Y flip.
+                if orient_val in (3, 4, 7, 8):
+                    print("Heuristic: orientation suggests Y inversion; will flip Y.")
+                    return True
+            # Check ImageJ metadata for clues
+            if tf.imagej_metadata:
+                ij = tf.imagej_metadata
+                if 'axes' in ij:
+                    axes = ij.get('axes')
+                    print(f"ImageJ axes metadata: {axes}")
+                    # No straightforward flip signal from axes; skip
+                # Some image producers include origin/orientation hints in ImageDescription
+                if 'Info' in tf.pages[0].tags:
+                    info = tf.pages[0].tags['Info'].value
+                    if 'origin' in info.lower() or 'orientation' in info.lower():
+                        print("Found possible orientation info in Info tag; defaulting to no flip unless explicit.")
+            return False
+    except Exception as e:
+        print("Orientation auto-detect failed:", e)
+        return False
+
+need_flip = False
+if isinstance(correct_y_cfg, str) and correct_y_cfg.lower() == 'auto':
+    print("Running orientation auto-detection (heuristic)...")
+    need_flip = detect_orientation_need_flip(timepoint_data[0][1])
+elif bool(correct_y_cfg) is True:
+    need_flip = True
+else:
+    need_flip = False
+
+if need_flip:
+    print("Applying Y-axis flip to entire 4D dataset (flip axis=2)...")
+    img_4d = np.flip(img_4d, axis=2)
+    print("Y-axis flip applied")
+
+# Build hyperstack metadata
 hyperstack_metadata = {
-    'shape': {
-        'axes': 'TZYX',
-        'T': img_4d.shape[0],
-        'Z': img_4d.shape[1],
-        'Y': img_4d.shape[2],
-        'X': img_4d.shape[3]
-    },
-    'voxel_size': {
-        'x_um': x_res,
-        'y_um': y_res,
-        'z_um': z_spacing,
-        'unit': 'um',
-        'source': ref_metadata.get('voxel_size_source', 'unknown')
-    },
+    'shape': {'axes':'TZYX', 'T': img_4d.shape[0], 'Z': img_4d.shape[1], 'Y': img_4d.shape[2], 'X': img_4d.shape[3]},
+    'voxel_size': {'x_um': x_res, 'y_um': y_res, 'z_um': z_spacing, 'unit': 'um', 'source': ref_metadata.get('voxel_size_source','unknown')},
     'dtype': str(img_4d.dtype),
     'n_timepoints': img_4d.shape[0],
     'is_label_image': True,
     'was_roi_cropped': ref_metadata.get('was_roi_cropped', False),
     'processing': {
-        'roi_cropping_enabled': ref_metadata.get('was_roi_cropped', False),
         'preprocessing_scaling': config['preprocessing']['image_scaling'],
         'segmentation_scaling': scaling,
-        'cellpose_diameter': config['segmentation']['diameter'],
-        'cellpose_model': config['segmentation']['model']
+        'cellpose_model': config['segmentation']['model'],
+        'output_format': out_format,
+        'y_correction_applied': need_flip
     },
     'original_metadata': ref_metadata
 }
 
-# Save metadata JSON
-with open('4D_hyperstack_metadata.json', 'w') as f:
+with open('4D_hyperstack_metadata.json','w') as f:
     json.dump(hyperstack_metadata, f, indent=2)
 
-# Save 4D TIFF with full ImageJ metadata
-print("\\nSaving 4D hyperstack...")
-tifffile.imwrite(
-    '4D_hyperstack.tif',
-    img_4d.astype(np.uint16),
-    imagej=True,
-    resolution=(1.0/x_res, 1.0/y_res),
-    metadata={
-        'spacing': z_spacing,
-        'unit': 'um',
-        'axes': 'TZYX',
-        'frames': img_4d.shape[0],
-        'slices': img_4d.shape[1],
-        'LabelImage': True,
-        'WasROICropped': ref_metadata.get('was_roi_cropped', False)
-    }
-)
+# Export depending on format
+if out_format in ('tiff','imagej','hyperstack'):
+    print("Saving ImageJ/TIFF hyperstack: 4D_hyperstack.tif")
+    tifffile.imwrite('4D_hyperstack.tif', img_4d.astype(np.uint16), imagej=True,
+                     resolution=(1.0/x_res, 1.0/y_res),
+                     metadata={'spacing': z_spacing, 'unit':'um', 'axes':'TZYX',
+                               'frames': img_4d.shape[0], 'slices': img_4d.shape[1],
+                               'LabelImage': True, 'WasROICropped': ref_metadata.get('was_roi_cropped', False)})
+    print("✓ 4D_hyperstack.tif written")
 
-print("\\n" + "="*60)
-print("4D Hyperstack created successfully!")
-print("="*60)
-print(f"Shape: {img_4d.shape} (TZYX)")
-print(f"Voxel size: {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
-print(f"Voxel size source: {ref_metadata.get('voxel_size_source', 'unknown')}")
-print(f"ROI cropped: {ref_metadata.get('was_roi_cropped', False)}")
-print(f"Timepoints: {img_4d.shape[0]}")
-print(f"Z slices per timepoint: {img_4d.shape[1]}")
-print("="*60)
+elif out_format in ('bdv','bigdataviewer','hdf5'):
+    print("Saving BDV-like HDF5 + XML (single-resolution)...")
+    h5_fname = '4D_hyperstack.h5'
+    xml_fname = '4D_hyperstack.xml'
+    dataset_base = output_cfg.get('bdv_dataset_name', '/t0000/s0/0/c0').lstrip('/')
+    data_shape = img_4d.shape  # (T,Z,Y,X)
+
+    # Determine whether gzip supported
+    gzip_ok = True
+    try:
+        # quick test: check if gzip compression is allowed
+        import tempfile, numpy as _np
+        ftmp = tempfile.mktemp(suffix='.h5')
+        with h5py.File(ftmp,'w') as fh:
+            fh.create_dataset('d', data=_np.zeros((2,)), compression='gzip')
+        os.remove(ftmp)
+        print("h5py gzip support: OK")
+    except Exception as e:
+        gzip_ok = False
+        print("h5py gzip support: NOT AVAILABLE:", e)
+
+    # Choose compression if available
+    compression = 'gzip' if gzip_ok else None
+    compression_opts = 4 if gzip_ok else None
+
+    # Heuristics for chunking
+    chunk_t = 1
+    chunk_z = min(8, data_shape[1])
+    chunk_y = min(64, data_shape[2])
+    chunk_x = min(64, data_shape[3])
+    chunks = (chunk_t, chunk_z, chunk_y, chunk_x)
+
+    print(f"Creating HDF5 file {h5_fname} dataset /{dataset_base} shape={data_shape} chunks={chunks} compression={compression}")
+    with h5py.File(h5_fname, 'w') as h5:
+        if compression:
+            dset = h5.create_dataset(dataset_base, shape=data_shape, dtype=np.uint16,
+                                     chunks=chunks, compression=compression, compression_opts=compression_opts)
+        else:
+            dset = h5.create_dataset(dataset_base, shape=data_shape, dtype=np.uint16, chunks=chunks)
+        dset[:] = img_4d.astype(np.uint16)
+        # store voxel metadata
+        dset.attrs['unit'] = 'um'
+        dset.attrs['x_voxel_um'] = x_res
+        dset.attrs['y_voxel_um'] = y_res
+        dset.attrs['z_voxel_um'] = z_spacing
+
+    # Write a minimal BDV-like XML pointing to the HDF5 dataset
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<ImageLoader format="bdv.hdf5">
+  <hdf5 type="bdv.hdf5">
+    <dataFile path="{h5_fname}"/>
+    <setup numberOfSetups="1">
+      <setup id="0" name="c0"/>
+    </setup>
+    <timepoints type="range">
+      <first>0</first>
+      <last>{data_shape[0]-1}</last>
+    </timepoints>
+    <viewRegistrations/>
+    <volumes>
+      <volume timepoint="0" setup="0">
+        <dataSetView>/{dataset_base}</dataSetView>
+      </volume>
+    </volumes>
+  </hdf5>
+</ImageLoader>
+'''
+    with open(xml_fname, 'w') as xf:
+        xf.write(xml)
+
+    print("✓ 4D_hyperstack.h5 and 4D_hyperstack.xml written")
+else:
+    raise ValueError(f"Unsupported output.format: {out_format}")
+
+print("\\n4D Hyperstack creation finished successfully")
 EOF
     """
 }
+
 
 // ============================================================================
 // PROCESS: Generate QC Report

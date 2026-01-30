@@ -80,6 +80,11 @@
     "image_scaling": 0.5,
     "comment_image_scaling": "Must match preprocessing scaling for correct voxel sizes"
   },
+  "output": {
+  "format": "bdv",
+  "correct_y": "false",
+  "bdv_dataset_name": "/t0000/s0/0/c0"
+},
   "system": {
     "description": "Container images - resource allocation is in nextflow.config",
     "container_image": "docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-8720eea",
