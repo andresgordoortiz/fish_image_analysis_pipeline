@@ -14,6 +14,7 @@
  * All parameters are loaded from a JSON configuration file for reproducibility.
  *
  * NEW: Flexible voxel size configuration - auto-detect or manual override
+ * FIX: Robust file finding that handles spaces in filenames and scaling mismatches
  */
 
 nextflow.enable.dsl=2
@@ -492,18 +493,59 @@ if result.returncode != 0:
     sys.exit(result.returncode)
 PYTHON_EOF
 
-    # Find and rename output to standard format
-    SCALING_STR=\$(echo "${cfg.image_scaling}" | sed 's/\\.//g')
-    ORIGINAL_OUTPUT=\$(ls *_\${SCALING_STR}*.tif 2>/dev/null | head -1)
+    # Find and rename output to standard format with ROBUST pattern matching
+    # The preprocessing script may use different naming conventions (e.g., _50 for 0.5 scaling)
+    echo ""
+    echo "Finding processed output file..."
+    echo "Expected scaling: ${cfg.image_scaling}"
+    echo "All TIF files in directory:"
+    ls -lh *.tif 2>/dev/null || echo "No .tif files found"
+    echo ""
+
+    # Try multiple patterns to find the output
+    ORIGINAL_OUTPUT=""
+
+    # Pattern 1: Standard scaling string (e.g., 0.5 -> 05 -> *_05*.tif)
+    if [ -z "\$ORIGINAL_OUTPUT" ]; then
+        SCALING_STR=\$(echo "${cfg.image_scaling}" | sed 's/\\.//g')
+        echo "Trying pattern 1: *_\${SCALING_STR}*.tif"
+        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*_\${SCALING_STR}*.tif" -not -name "${filename}" 2>/dev/null | head -1)
+        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
+    fi
+
+    # Pattern 2: Percentage string (e.g., 0.5 -> 50 -> *_50*.tif)
+    if [ -z "\$ORIGINAL_OUTPUT" ]; then
+        SCALING_PCT=\$(echo "${cfg.image_scaling} * 100" | bc | cut -d. -f1)
+        echo "Trying pattern 2: *_\${SCALING_PCT}*.tif"
+        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*_\${SCALING_PCT}*.tif" -not -name "${filename}" 2>/dev/null | head -1)
+        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
+    fi
+
+    # Pattern 3: Any new .tif file (excluding the input)
+    if [ -z "\$ORIGINAL_OUTPUT" ]; then
+        echo "Trying pattern 3: any new .tif file (not input)"
+        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" -newer "${script_name}" 2>/dev/null | head -1)
+        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
+    fi
+
+    # Pattern 4: Any .tif file that's not the input (last resort)
+    if [ -z "\$ORIGINAL_OUTPUT" ]; then
+        echo "Trying pattern 4: any .tif file (not input)"
+        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" 2>/dev/null | head -1)
+        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
+    fi
 
     if [ -n "\$ORIGINAL_OUTPUT" ]; then
+        echo ""
+        echo "SUCCESS: Found processed file: \$ORIGINAL_OUTPUT"
+        echo "Renaming to: t${t_formatted}_processed.tif"
         mv "\$ORIGINAL_OUTPUT" "t${t_formatted}_processed.tif"
-        echo "Renamed output to: t${t_formatted}_processed.tif"
+        echo "✓ File renamed successfully"
     else
-        echo "ERROR: No processed output found"
-        echo "Looking for pattern: *_\${SCALING_STR}*.tif"
+        echo ""
+        echo "ERROR: No processed output found after trying all patterns"
         echo "Directory contents:"
-        ls -lh *.tif 2>/dev/null || echo "No .tif files found"
+        ls -lha
         exit 1
     fi
 
@@ -652,9 +694,10 @@ if result.returncode != 0:
 PYTHON_EOF
 
     # Find and rename Cellpose output
-    CELLPOSE_OUTPUT=\$(ls *_cp_masks.tif 2>/dev/null | head -1)
+    CELLPOSE_OUTPUT=\$(find . -maxdepth 1 -name "*_cp_masks.tif" 2>/dev/null | head -1)
 
-    if [ -f "\$CELLPOSE_OUTPUT" ]; then
+    if [ -n "\$CELLPOSE_OUTPUT" ]; then
+        echo "Found Cellpose output: \$CELLPOSE_OUTPUT"
         mv "\$CELLPOSE_OUTPUT" "t${t_formatted}_segmented.tif"
         echo "Renamed: \$CELLPOSE_OUTPUT -> t${t_formatted}_segmented.tif"
 
@@ -923,7 +966,7 @@ segment_logs = list(Path('.').glob('*_segment.log'))
 
 # Generate summary
 summary = {
-    'pipeline_version': '1.0.0-voxel-config',
+    'pipeline_version': '1.0.0-voxel-config-v2',
     'execution_date': datetime.now().isoformat(),
     'input_channel': ${params.channel},
     'voxel_size_configuration': {
