@@ -17,6 +17,7 @@
  * NEW: Optional ROI cropping with Fiji
  * NEW: Flexible voxel size configuration - auto-detect or manual override
  * FIX: Robust file finding that handles spaces in filenames and scaling mismatches
+ * FIX: External Python script for merge process to avoid Nextflow parsing issues
  */
 
 nextflow.enable.dsl=2
@@ -30,6 +31,7 @@ params.output_dir = null
 params.config_json = null
 params.channel = 1
 params.preprocessing_script = './spim_pipeline_fixed.py'
+params.merge_script = './merge_hyperstack.py'
 params.container = 'docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1'
 params.fiji_container = 'docker://fiji/fiji:20220415'
 params.help = false
@@ -58,6 +60,8 @@ if (params.help) {
         --channel               Channel number to process (default: 1)
         --preprocessing_script  Path to preprocessing Python script
                                (default: ./spim_pipeline_fixed.py)
+        --merge_script         Path to merge Python script
+                               (default: ./merge_hyperstack.py)
         --container             Singularity/Docker container image
                                (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1)
         --fiji_container        Fiji container for ROI cropping
@@ -110,6 +114,12 @@ if (!params.input_dir || !params.output_dir || !params.config_json) {
 // Validate preprocessing script exists
 if (!file(params.preprocessing_script).exists()) {
     log.error "ERROR: Preprocessing script not found: ${params.preprocessing_script}"
+    exit 1
+}
+
+// Validate merge script exists
+if (!file(params.merge_script).exists()) {
+    log.error "ERROR: Merge script not found: ${params.merge_script}"
     exit 1
 }
 
@@ -170,6 +180,7 @@ Channel to process : ${params.channel}
 ROI Cropping       : ${roi_info}
 Voxel size mode    : ${voxel_info}
 Preprocessing script: ${params.preprocessing_script}
+Merge script       : ${params.merge_script}
 Container          : ${params.container}
 Fiji Container     : ${params.fiji_container}
 
@@ -1095,9 +1106,10 @@ process MERGE_TO_HYPERSTACK {
     input:
     path segmented_files
     path metadata_json
+    path merge_script
 
     output:
-    path "4D_hyperstack.tif", emit: hyperstack
+    path "4D_hyperstack.tif", emit: hyperstack, optional: true
     path "4D_hyperstack_metadata.json", emit: metadata
     path "4D_hyperstack.h5", emit: h5, optional: true
     path "4D_hyperstack.xml", emit: xml, optional: true
@@ -1106,6 +1118,7 @@ process MERGE_TO_HYPERSTACK {
 
     script:
     def config_json_str = groovy.json.JsonOutput.toJson(config).replace("'", "\\'")
+    def merge_script_name = merge_script.name
     """
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1115,443 +1128,76 @@ process MERGE_TO_HYPERSTACK {
     micromamba activate microscopy_env
 
     echo "=== MERGE_TO_HYPERSTACK: Starting ==="
-    micromamba list
+    echo "Python version:"
+    python3 --version
+    echo ""
+    
+    # Verify merge script is present
+    if [ ! -f "${merge_script_name}" ]; then
+        echo "ERROR: Merge script not found: ${merge_script_name}"
+        echo "Contents of work directory:"
+        ls -lh
+        exit 1
+    fi
+    
+    echo "Merge script: ${merge_script_name}"
+    echo ""
 
     # Ensure required packages
-    python3 - <<'PYTHON_CHECK'
-import sys, subprocess
-reqs = ['tifffile','numpy']
-missing = []
-for r in reqs:
-    try:
-        __import__(r)
-    except Exception:
-        missing.append(r)
-if missing:
-    print("Missing packages:", missing, file=sys.stderr)
-    try:
-        subprocess.check_call(['micromamba','install','-y','-n','microscopy_env'] + missing)
-        print("micromamba installed:", missing, file=sys.stderr)
-    except Exception as e:
-        print("micromamba failed to install required packages:", missing, file=sys.stderr)
-        raise SystemExit(2)
-print("Basic python packages available")
-PYTHON_CHECK
-
-    # Main merge script
-    python3 << 'PYTHON_MERGE'
-import json
-import os
-import sys
-from pathlib import Path
-import tifffile
-import numpy as np
-
-print("="*80)
-print("MERGE_TO_HYPERSTACK - Corrected Version")
-print("="*80)
-
-# Discover segmented files
-seg_files = sorted(Path('.').glob('t*_segmented.tif'))
-if not seg_files:
-    raise RuntimeError("No segmented files found (expected t*_segmented.tif)")
-
-print(f"\\nFound {len(seg_files)} segmented files")
-print(f"  First: {seg_files[0].name}")
-print(f"  Last:  {seg_files[-1].name}")
-
-# Load shared metadata
-print("\\nLoading metadata...")
-with open('${metadata_json}', 'r') as fm:
-    meta = json.load(fm)
-
-print(f"Metadata source: {meta.get('voxel_size_source', 'unknown')}")
-print(f"ROI cropped: {meta.get('was_roi_cropped', False)}")
-
-# Load pipeline config
-config = json.loads('${config_json_str}')
-out_cfg = config.get('output', {})
-out_format = out_cfg.get('format', 'tiff').lower()
-correct_y_cfg = out_cfg.get('correct_y', False)
-
-# FIX #1: Get scaling from correct config section
-preprocessing_cfg = config.get('preprocessing', {})
-scaling = preprocessing_cfg.get('image_scaling', 1.0)
-print(f"Preprocessing scaling factor: {scaling}")
-
-# FIX #2: Read ACTUAL dimensions from first segmented file
-# (Don't rely on pre-preprocessing metadata)
-print("\\nReading actual dimensions from first segmented file...")
-with tifffile.TiffFile(str(seg_files[0])) as tf:
-    Z = len(tf.pages)
-    Y, X = tf.pages[0].shape
-    dtype = tf.pages[0].dtype
-    
-    # Try to get voxel sizes from file if present
-    try:
-        page = tf.pages[0]
-        tags = page.tags
-        file_has_resolution = 'XResolution' in tags and 'YResolution' in tags
-    except:
-        file_has_resolution = False
-
-print(f"Actual dimensions: Z={Z}, Y={Y}, X={X}")
-print(f"Data type: {dtype}")
-
-# Validate all files have same dimensions
-print("\\nValidating dimension consistency across all timepoints...")
-for idx, p in enumerate(seg_files):
-    arr = tifffile.imread(str(p))
-    if arr.shape != (Z, Y, X):
-        raise RuntimeError(
-            f"Dimension mismatch in {p.name} (timepoint {idx}):\\n"
-            f"  Expected: (Z,Y,X) = ({Z}, {Y}, {X})\\n"
-            f"  Got:      (Z,Y,X) = {arr.shape}\\n"
-            f"  This suggests inconsistent processing between timepoints.\\n"
-            f"  Check preprocessing and segmentation logs."
-        )
-    # Validate file is readable
-    if arr.size == 0:
-        raise RuntimeError(f"Empty array read from {p.name}")
-
-print(f"✓ All {len(seg_files)} timepoints have consistent dimensions")
-
-T = len(seg_files)
-
-# FIX #3: Calculate final voxel sizes correctly
-# Apply preprocessing scaling to original metadata values
-print("\\nCalculating final voxel sizes...")
-original_x = meta.get('x_resolution_um', 1.0)
-original_y = meta.get('y_resolution_um', 1.0)
-original_z = meta.get('imagej', {}).get('spacing', 1.0)
-
-# Scaling was applied during preprocessing, so final voxel size = original / scaling
-final_x_res = original_x / scaling
-final_y_res = original_y / scaling
-final_z_spacing = original_z  # Z spacing not affected by XY scaling
-
-print(f"Original voxel size: {original_x:.4f} × {original_y:.4f} × {original_z:.4f} µm")
-print(f"Scaling factor: {scaling}")
-print(f"Final voxel size: {final_x_res:.4f} × {final_y_res:.4f} × {final_z_spacing:.4f} µm")
-
-# Y-flip detection
-def detect_flip_needed(first_path):
-    """Auto-detect if Y-axis flip is needed based on TIFF orientation tag."""
-    try:
-        with tifffile.TiffFile(str(first_path)) as tf:
-            page = tf.pages[0]
-            tags = page.tags
-            if 'Orientation' in tags:
-                val = tags['Orientation'].value
-                print(f"  TIFF Orientation tag: {val}")
-                # Orientations 3,4,7,8 indicate flipped images
-                return val in (3, 4, 7, 8)
-    except Exception as e:
-        print(f"  Orientation auto-detect error: {e}")
-    return False
-
-need_flip = False
-if isinstance(correct_y_cfg, str) and correct_y_cfg.lower() == 'auto':
-    print("\\nAuto-detecting Y-axis flip...")
-    need_flip = detect_flip_needed(seg_files[0])
-elif bool(correct_y_cfg):
-    need_flip = True
-    print("\\nY-axis flip: ENABLED (manual)")
-else:
-    print("\\nY-axis flip: DISABLED")
-
-print(f"Y-flip will be applied: {need_flip}")
-
-# ============================================================================
-# TIFF OUTPUT PATH
-# ============================================================================
-if out_format in ('tiff', 'imagej', 'hyperstack'):
-    print("\\n" + "="*80)
-    print("Writing TIFF hyperstack")
-    print("="*80)
-    
-    print(f"\\nLoading {T} timepoints into memory...")
-    all_arrs = []
-    for idx, p in enumerate(seg_files):
-        if (idx + 1) % 10 == 0 or idx == 0 or idx == len(seg_files) - 1:
-            print(f"  Loading timepoint {idx + 1}/{T}: {p.name}")
-        
-        arr = tifffile.imread(str(p))
-        
-        # Apply Y-flip if needed (axis 1 is Y in ZYX)
-        if need_flip:
-            arr = np.flip(arr, axis=1)
-        
-        all_arrs.append(arr.astype(np.uint16))
-    
-    # Stack into 4D array: (T, Z, Y, X)
-    print(f"\\nStacking into 4D array...")
-    img4d = np.stack(all_arrs, axis=0)
-    print(f"Final 4D shape: {img4d.shape} (T, Z, Y, X)")
-    print(f"Data type: {img4d.dtype}")
-    print(f"Memory size: {img4d.nbytes / (1024**3):.2f} GB")
-    
-    # Prepare metadata
-    hyper_meta = {
-        'shape': {
-            'axes': 'TZYX',
-            'T': int(img4d.shape[0]),
-            'Z': int(img4d.shape[1]),
-            'Y': int(img4d.shape[2]),
-            'X': int(img4d.shape[3])
-        },
-        'voxel_size': {
-            'x_um': float(final_x_res),
-            'y_um': float(final_y_res),
-            'z_um': float(final_z_spacing),
-            'unit': 'um'
-        },
-        'dtype': str(img4d.dtype),
-        'n_timepoints': int(img4d.shape[0]),
-        'y_correction_applied': bool(need_flip),
-        'processing': {
-            'output_format': 'tiff',
-            'preprocessing_scaling': float(scaling),
-            'roi_cropped': bool(meta.get('was_roi_cropped', False))
-        }
+    echo "Checking required packages..."
+    python3 -c "import tifffile, numpy" 2>/dev/null || {
+        echo "Installing required packages..."
+        micromamba install -y -n microscopy_env tifffile numpy
     }
-    
-    # Save metadata JSON
-    with open('4D_hyperstack_metadata.json', 'w') as fh:
-        json.dump(hyper_meta, fh, indent=2)
-    print("\\n✓ Metadata JSON saved")
-    
-    # Write TIFF with ImageJ metadata
-    print("\\nWriting 4D_hyperstack.tif...")
-    tifffile.imwrite(
-        '4D_hyperstack.tif',
-        img4d.astype(np.uint16),
-        imagej=True,
-        resolution=(1.0/final_x_res, 1.0/final_y_res),
-        metadata={
-            'spacing': final_z_spacing,
-            'unit': 'um',
-            'axes': 'TZYX',
-            'frames': img4d.shape[0],
-            'slices': img4d.shape[1],
-            'LabelImage': True,
-            'YFlipApplied': need_flip
-        }
-    )
-    
-    output_size = Path('4D_hyperstack.tif').stat().st_size / (1024**3)
-    print(f"✓ 4D_hyperstack.tif written ({output_size:.2f} GB)")
+    echo "✓ Required packages available"
+    echo ""
 
-# ============================================================================
-# BDV/HDF5 OUTPUT PATH
-# ============================================================================
-elif out_format in ('bdv', 'bigdataviewer', 'hdf5'):
-    print("\\n" + "="*80)
-    print("Writing BDV HDF5 + XML (streaming mode)")
-    print("="*80)
-    
-    # Ensure h5py is available
-    try:
-        import h5py
-    except ImportError:
-        print("\\nh5py not found, installing via micromamba...")
-        rc = os.system('micromamba install -y -n microscopy_env h5py >/dev/null 2>&1')
-        if rc != 0:
-            raise RuntimeError("Failed to install h5py")
-        import h5py
-    
-    h5_fname = '4D_hyperstack.h5'
-    xml_fname = '4D_hyperstack.xml'
-    dataset_base = out_cfg.get('bdv_dataset_name', 't{t}/s00/0/cells').lstrip('/')
-    
-    data_shape = (T, Z, Y, X)
-    chunk_t = 1
-    chunk_z = min(8, Z)
-    chunk_y = min(64, Y)
-    chunk_x = min(64, X)
-    chunks = (chunk_t, chunk_z, chunk_y, chunk_x)
-    
-    print(f"\\nHDF5 configuration:")
-    print(f"  File: {h5_fname}")
-    print(f"  Dataset: /{dataset_base}")
-    print(f"  Shape: {data_shape} (T, Z, Y, X)")
-    print(f"  Chunks: {chunks}")
-    
-    # Test compression support
-    gzip_ok = True
-    try:
-        tmp = 'tmp_test.h5'
-        with h5py.File(tmp, 'w') as fh:
-            fh.create_dataset('d', data=np.zeros((2,), dtype=np.uint16), compression='gzip')
-        os.remove(tmp)
-    except Exception as e:
-        gzip_ok = False
-        print(f"  Compression: disabled ({e})")
-    else:
-        print("  Compression: gzip (level 4)")
-    
-    comp = 'gzip' if gzip_ok else None
-    comp_opts = 4 if gzip_ok else None
-    
-    # Create HDF5 file
-    if os.path.exists(h5_fname):
-        os.remove(h5_fname)
-    
-    print(f"\\nCreating HDF5 file and streaming timepoints...")
-    with h5py.File(h5_fname, 'w') as h5f:
-        # Create dataset with appropriate structure
-        # BDV expects separate datasets per timepoint, but we can use single dataset
-        if comp:
-            dset = h5f.create_dataset(
-                dataset_base.format(t=0),  # Use format for first timepoint
-                shape=data_shape,
-                dtype=np.uint16,
-                chunks=chunks,
-                compression=comp,
-                compression_opts=comp_opts
-            )
-        else:
-            dset = h5f.create_dataset(
-                dataset_base.format(t=0),
-                shape=data_shape,
-                dtype=np.uint16,
-                chunks=chunks
-            )
-        
-        # FIX #5: Store corrected voxel sizes as attributes
-        dset.attrs['element_size_um'] = [final_z_spacing, final_y_res, final_x_res]
-        dset.attrs['unit'] = 'um'
-        
-        # Stream write each timepoint
-        for t_idx, p in enumerate(seg_files):
-            if (t_idx + 1) % 10 == 0 or t_idx == 0 or t_idx == len(seg_files) - 1:
-                print(f"  Writing timepoint {t_idx + 1}/{T}: {p.name}")
-            
-            arr = tifffile.imread(str(p)).astype(np.uint16)
-            
-            # Validate dimensions
-            if arr.shape != (Z, Y, X):
-                raise RuntimeError(
-                    f"Dimension mismatch in {p.name}:\\n"
-                    f"  Expected: ({Z}, {Y}, {X})\\n"
-                    f"  Got: {arr.shape}"
-                )
-            
-            # Apply Y-flip if needed
-            if need_flip:
-                arr = np.flip(arr, axis=1)
-            
-            dset[t_idx, :, :, :] = arr
-            h5f.flush()
-    
-    print(f"\\n✓ HDF5 file written")
-    
-    # FIX #8: Generate complete BDV XML for all timepoints
-    print(f"\\nGenerating BDV XML...")
-    
-    # BDV uses Z,Y,X ordering for voxel sizes
-    voxel_size_xml = f"{final_z_spacing} {final_y_res} {final_x_res}"
-    
-    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<SpimData version="0.2">
-  <BasePath type="relative">.</BasePath>
-  <SequenceDescription>
-    <ImageLoader format="bdv.hdf5">
-      <hdf5 type="relative">{h5_fname}</hdf5>
-    </ImageLoader>
-    <ViewSetups>
-      <ViewSetup>
-        <id>0</id>
-        <name>channel 0</name>
-        <size>{X} {Y} {Z}</size>
-        <voxelSize>
-          <unit>um</unit>
-          <size>{voxel_size_xml}</size>
-        </voxelSize>
-        <attributes>
-          <channel>0</channel>
-        </attributes>
-      </ViewSetup>
-      <Attributes name="channel">
-        <Channel>
-          <id>0</id>
-          <name>0</name>
-        </Channel>
-      </Attributes>
-    </ViewSetups>
-    <Timepoints type="range">
-      <first>0</first>
-      <last>{T-1}</last>
-    </Timepoints>
-  </SequenceDescription>
-  <ViewRegistrations>
-'''
-    
-    # Add registration for each timepoint
-    for t in range(T):
-        xml += f'''    <ViewRegistration timepoint="{t}" setup="0">
-      <ViewTransform type="affine">
-        <affine>1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0</affine>
-      </ViewTransform>
-    </ViewRegistration>
-'''
-    
-    xml += '''  </ViewRegistrations>
-</SpimData>
-'''
-    
-    with open(xml_fname, 'w') as xf:
-        xf.write(xml)
-    
-    print(f"✓ BDV XML written with {T} timepoints")
-    
-    # FIX #6: Save consistent metadata JSON
-    hyper_meta = {
-        'shape': {
-            'axes': 'TZYX',
-            'T': int(T),
-            'Z': int(Z),
-            'Y': int(Y),
-            'X': int(X)
-        },
-        'voxel_size': {
-            'x_um': float(final_x_res),
-            'y_um': float(final_y_res),
-            'z_um': float(final_z_spacing),
-            'unit': 'um'
-        },
-        'dtype': 'uint16',
-        'n_timepoints': int(T),
-        'y_correction_applied': bool(need_flip),
-        'processing': {
-            'output_format': 'bdv',
-            'bdv_dataset': dataset_base,
-            'preprocessing_scaling': float(scaling),
-            'roi_cropped': bool(meta.get('was_roi_cropped', False))
-        }
-    }
-    
-    with open('4D_hyperstack_metadata.json', 'w') as fh:
-        json.dump(hyper_meta, fh, indent=2)
-    
-    print("✓ Metadata JSON saved")
+    # Create temporary config file
+    echo "Creating temporary config file..."
+    cat > config_temp.json << 'CONFIG_EOF'
+${config_json_str}
+CONFIG_EOF
 
-else:
-    raise RuntimeError(f"Unsupported output.format: {out_format}")
+    # Run merge script
+    echo "Running merge script..."
+    python3 "${merge_script_name}" "${metadata_json}" config_temp.json
 
-print("\\n" + "="*80)
-print("MERGE_TO_HYPERSTACK: SUCCESS")
-print("="*80)
-print(f"Format: {out_format}")
-print(f"Timepoints: {T}")
-print(f"Dimensions: {Z} × {Y} × {X} (Z × Y × X)")
-print(f"Voxel size: {final_x_res:.4f} × {final_y_res:.4f} × {final_z_spacing:.4f} µm")
-print(f"Y-flip applied: {need_flip}")
-print("="*80)
-PYTHON_MERGE
+    # Check exit status
+    if [ \$? -ne 0 ]; then
+        echo ""
+        echo "ERROR: Merge script failed"
+        exit 1
+    fi
+
+    # Verify output files
+    echo ""
+    echo "Verifying output files..."
+    
+    if [ ! -f "4D_hyperstack_metadata.json" ]; then
+        echo "ERROR: Metadata file not created"
+        exit 1
+    fi
+    echo "✓ Metadata file created"
+    
+    # Check for TIFF or HDF5 output based on config
+    if [ -f "4D_hyperstack.tif" ]; then
+        FILE_SIZE=\$(du -h 4D_hyperstack.tif | cut -f1)
+        echo "✓ TIFF hyperstack created (size: \$FILE_SIZE)"
+    elif [ -f "4D_hyperstack.h5" ]; then
+        FILE_SIZE=\$(du -h 4D_hyperstack.h5 | cut -f1)
+        echo "✓ HDF5 file created (size: \$FILE_SIZE)"
+        if [ -f "4D_hyperstack.xml" ]; then
+            echo "✓ BDV XML file created"
+        fi
+    else
+        echo "ERROR: No output file created (expected 4D_hyperstack.tif or 4D_hyperstack.h5)"
+        exit 1
+    fi
+    
+    echo ""
+    echo "✓ MERGE_TO_HYPERSTACK completed successfully"
     """
 }
-
 
 // ============================================================================
 // PROCESS: Generate QC Report
@@ -1800,6 +1446,9 @@ workflow {
 
     // Create channel for preprocessing script
     preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+    
+    // Create channel for merge script
+    merge_script_ch = Channel.fromPath(params.merge_script, checkIfExists: true)
 
     // OPTIONAL: ROI Cropping Step
     if (config.roi_cropping.enabled) {
@@ -1852,7 +1501,8 @@ workflow {
 
     MERGE_TO_HYPERSTACK(
         all_segmented,
-        shared_metadata
+        shared_metadata,
+        merge_script_ch.collect()
     )
 
     // 5. Generate QC report
