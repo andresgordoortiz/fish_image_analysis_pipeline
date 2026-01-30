@@ -17,7 +17,7 @@
     "comment_usage": "When auto_detect=false, these values override any metadata in the images"
   },
   "preprocessing": {
-    "description": "Preprocessing and deconvolution parameters optimized for medaka heart",
+    "description": "Preprocessing and deconvolution parameters optimized for medaka",
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
     "image_scaling": 0.5,
     "comment_scaling": "50% downsampling for faster processing while maintaining quality",
@@ -25,7 +25,7 @@
       "niter": 6,
       "niterz": 6,
       "padding": 32,
-      "comment": "6 iterations balanced for speed vs quality. Increase for better results."
+      "comment": "6 iterations of deconvolution. According to Andres, more iterations can introduce artifacts, and the niterz should be the same as the niter in xy"
     },
     "normalization": {
       "min_v": 0,
@@ -52,9 +52,9 @@
     }
   },
   "segmentation": {
-    "description": "Cellpose segmentation optimized for medaka cardiomyocytes",
+    "description": "Cellpose segmentation optimized for medaka",
     "model": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Thomas/cellpose/models/cpsam_Gui_tracking_20250801",
-    "comment_model": "Custom Cellpose model trained on medaka cells",
+    "comment_model": "Custom Cellpose model trained on medaka cells. For pre-trained models check the Cellpose documentation.",
     "diameter": 30,
     "flow_threshold": 0.8,
     "comment_flow": "0.8 = balanced sensitivity. Increase to 1.0-1.5 to reduce over-segmentation",
