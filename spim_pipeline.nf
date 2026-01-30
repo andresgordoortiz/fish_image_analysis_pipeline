@@ -175,6 +175,8 @@ process EXTRACT_METADATA {
     def manual_x = config.voxel_size.get('x_um', 0.325)
     def manual_y = config.voxel_size.get('y_um', 0.325)
     def manual_z = config.voxel_size.get('z_um', 1.0)
+    // Convert boolean to Python format (True/False instead of true/false)
+    def auto_detect_py = auto_detect ? 'True' : 'False'
     """
     #!/usr/bin/env bash
     set -euo pipefail
@@ -216,7 +218,7 @@ try:
     print("Imports successful", file=sys.stderr)
 
     filename = '${filename}'
-    auto_detect = ${auto_detect}
+    auto_detect = ${auto_detect_py}
     manual_x = ${manual_x}
     manual_y = ${manual_y}
     manual_z = ${manual_z}
