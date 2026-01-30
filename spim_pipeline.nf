@@ -1214,20 +1214,17 @@ print(f"Found {len(seg_files)} segmented files (first: {seg_files[0].name})")
 with open('${metadata_json}', 'r') as fm:
     meta = json.load(fm)
 
-# Determine per-timepoint dims (Z,Y,X) and dtype (fallback to reading first file)
-dims = None
-if isinstance(meta.get('shape'), dict) and meta['shape'].get('dimensions'):
-    dims = meta['shape']['dimensions']
-elif meta.get('dimensions'):
-    dims = meta['dimensions']
-else:
-    # fallback read first file header (without loading full data)
-    with tifffile.TiffFile(str(seg_files[0])) as tf:
-        z = len(tf.pages)
-        y, x = tf.pages[0].shape
-        dims = [z, y, x]
-
+# ALWAYS read actual dimensions from first segmented file
+# (metadata contains pre-preprocessing dimensions, but we need post-preprocessing)
+print("Reading actual dimensions from first segmented file...")
+with tifffile.TiffFile(str(seg_files[0])) as tf:
+    Z = len(tf.pages)
+    Y, X = tf.pages[0].shape
+    print(f"Actual segmented file dimensions: Z={Z}, Y={Y}, X={X}")
+ 
 Z, Y, X = int(dims[0]), int(dims[1]), int(dims[2])
+dims = [Z, Y, X]
+
 dtype_str = str(meta.get('dtype', 'uint16')).lower()
 
 bytes_per_voxel = 2
@@ -1368,8 +1365,12 @@ elif out_format in ('bdv','bigdataviewer','hdf5'):
             print(f"Loading timepoint {t_idx}: {p.name}")
             arr = tifffile.imread(str(p)).astype(np.uint16)
             if arr.shape != (Z, Y, X):
-                raise RuntimeError(f"Timepoint {p.name} shape {arr.shape} != expected (Z,Y,X)=({Z},{Y},{X})")
-            if need_flip:
+                raise RuntimeError(
+                    f"Dimension mismatch in {p.name}:\\n"
+                    f"  Expected: (Z,Y,X) = ({Z},{Y},{X})\\n"
+                    f"  Got:      (Z,Y,X) = {arr.shape}\\n"
+                    f"  This suggests inconsistent processing between timepoints."
+                )            if need_flip:
                 arr = np.flip(arr, axis=1)
             dset[t_idx, :, :, :] = arr
             h5f.flush()
