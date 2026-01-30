@@ -255,32 +255,61 @@ print("Cropped dimensions: " + width + "x" + height + "x" + slices + " (WxHxZ)")
 // Close
 close();
 print("Cropping completed successfully");
+
+// Exit
+eval("script", "System.exit(0);");
 MACRO_EOF
 
     # Run Fiji in headless mode
     echo "Running Fiji in headless mode..." | tee -a t${t_formatted}_crop.log
+    echo "Working directory: \$(pwd)" | tee -a t${t_formatted}_crop.log
+    echo "Files present:" | tee -a t${t_formatted}_crop.log
+    ls -lh | tee -a t${t_formatted}_crop.log
+    echo "" | tee -a t${t_formatted}_crop.log
 
-    # Fiji headless execution
-    ImageJ-linux64 --ij2 --headless --console --run crop_macro.ijm >> t${t_formatted}_crop.log 2>&1
-
-    EXIT_CODE=\$?
-
-    if [ \$EXIT_CODE -ne 0 ]; then
-        echo "ERROR: Fiji cropping failed with exit code \$EXIT_CODE" | tee -a t${t_formatted}_crop.log
-        exit \$EXIT_CODE
+    # Find ImageJ executable
+    if [ -f "/opt/fiji/Fiji.app/ImageJ-linux64" ]; then
+        IMAGEJ_EXE="/opt/fiji/Fiji.app/ImageJ-linux64"
+    elif [ -f "/usr/local/fiji/Fiji.app/ImageJ-linux64" ]; then
+        IMAGEJ_EXE="/usr/local/fiji/Fiji.app/ImageJ-linux64"
+    elif command -v ImageJ-linux64 &> /dev/null; then
+        IMAGEJ_EXE="ImageJ-linux64"
+    else
+        echo "ERROR: ImageJ executable not found" | tee -a t${t_formatted}_crop.log
+        echo "Searching for Fiji..." | tee -a t${t_formatted}_crop.log
+        find / -name "ImageJ-linux64" 2>/dev/null | head -5 | tee -a t${t_formatted}_crop.log
+        exit 1
     fi
 
-    # Verify output exists
+    echo "Using ImageJ: \$IMAGEJ_EXE" | tee -a t${t_formatted}_crop.log
+    echo "" | tee -a t${t_formatted}_crop.log
+
+    # Fiji headless execution with proper options
+    \$IMAGEJ_EXE --ij2 --headless --console --run crop_macro.ijm >> t${t_formatted}_crop.log 2>&1 || {
+        EXIT_CODE=\$?
+        echo "" | tee -a t${t_formatted}_crop.log
+        echo "WARNING: ImageJ exited with code \$EXIT_CODE" | tee -a t${t_formatted}_crop.log
+        echo "This may be normal if the macro completed successfully" | tee -a t${t_formatted}_crop.log
+    }
+
+    # Verify output exists (this is the real test)
     if [ ! -f "t${t_formatted}_cropped.tif" ]; then
+        echo "" | tee -a t${t_formatted}_crop.log
         echo "ERROR: Cropped output file not created" | tee -a t${t_formatted}_crop.log
-        echo "Directory contents:" | tee -a t${t_formatted}_crop.log
-        ls -lh | tee -a t${t_formatted}_crop.log
+        echo "Directory contents after macro execution:" | tee -a t${t_formatted}_crop.log
+        ls -lha | tee -a t${t_formatted}_crop.log
+        echo "" | tee -a t${t_formatted}_crop.log
+        echo "Macro contents:" | tee -a t${t_formatted}_crop.log
+        cat crop_macro.ijm | tee -a t${t_formatted}_crop.log
         exit 1
     fi
 
     echo "" | tee -a t${t_formatted}_crop.log
-    echo "ROI cropping completed successfully for timepoint ${timepoint}" | tee -a t${t_formatted}_crop.log
-    echo "Output: t${t_formatted}_cropped.tif" | tee -a t${t_formatted}_crop.log
+    echo "✓ ROI cropping completed successfully for timepoint ${timepoint}" | tee -a t${t_formatted}_crop.log
+    echo "✓ Output: t${t_formatted}_cropped.tif" | tee -a t${t_formatted}_crop.log
+
+    # Show output file size
+    echo "✓ File size: \$(du -h t${t_formatted}_cropped.tif | cut -f1)" | tee -a t${t_formatted}_crop.log
     """
 }
 
