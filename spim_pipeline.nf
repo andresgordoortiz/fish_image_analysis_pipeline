@@ -1094,7 +1094,7 @@ process MERGE_TO_HYPERSTACK {
 
     // Input: collected list of segmented files and the shared metadata JSON
     input:
-    val all_segmented_files
+    path segmented_files
     path metadata_json
 
     output:
@@ -1141,7 +1141,7 @@ process MERGE_TO_HYPERSTACK {
             else if (dtype.contains('uint32') || dtype.contains('int32') || dtype.contains('float32')) bytesPerVoxel = 4
             else if (dtype.contains('uint64') || dtype.contains('int64') || dtype.contains('float64')) bytesPerVoxel = 8
 
-            def n_timepoints = (all_segmented_files instanceof Collection) ? all_segmented_files.size() : 1
+            def n_timepoints = (segmented_files instanceof Collection) ? segmented_files.size() : 1
             def bytes_per_timepoint = z * y * x * bytesPerVoxel
 
             if (out_format in ['tiff','imagej','hyperstack']) {
