@@ -430,6 +430,16 @@ with open('${metadata_json}', 'r') as f:
 # Load config - parse from JSON string to handle booleans correctly
 config = json.loads('${config_json_str}')
 
+# Get voxel sizes from metadata (these are already configured - auto-detected or manual)
+xy_pixel = metadata['x_resolution_um']  # Use configured X resolution
+z_pixel = metadata['imagej']['spacing']  # Use configured Z spacing
+
+print(f"Using voxel sizes from metadata:")
+print(f"  XY pixel size: {xy_pixel:.4f} µm")
+print(f"  Z pixel size: {z_pixel:.4f} µm")
+print(f"  Source: {metadata.get('voxel_size_source', 'unknown')}")
+print("")
+
 # Build command for preprocessing script
 cmd = [
     'python3', '${script_name}',
@@ -437,6 +447,8 @@ cmd = [
     '--outdir', '.',
     '--psf_path', config['psf_path'],
     '--image_scaling', str(config['image_scaling']),
+    '--xy_pixel', str(xy_pixel),  # Pass configured XY voxel size
+    '--z_pixel', str(z_pixel),    # Pass configured Z voxel size
     '--niter', str(config['deconvolution']['niter']),
     '--niterz', str(config['deconvolution']['niterz']),
     '--percentile_low', str(config['normalization']['percentile_low']),
