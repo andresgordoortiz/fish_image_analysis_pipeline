@@ -1234,8 +1234,7 @@ process GENERATE_QC_REPORT {
     input:
     path all_logs
     path hyperstack_metadata
-    path config_file  // Changed from: val config_json
-
+    path config_file
 
     output:
     path "pipeline_report.html"
@@ -1261,7 +1260,7 @@ with open('${hyperstack_metadata}', 'r') as f:
     hyperstack_meta = json.load(f)
 
 # Load config
-with open('${config_filename}', 'r') as f:  # Changed from: './config_medaka.json'
+with open('${config_filename}', 'r') as f:
     config = json.load(f)
 
 # Collect all log files
@@ -1308,9 +1307,29 @@ else:
 roi_cropped = hyperstack_meta.get('was_roi_cropped', False)
 roi_badge = '<span style="background-color: #3498db; color: white; padding: 5px 10px; border-radius: 3px;">YES</span>' if roi_cropped else '<span style="background-color: #95a5a6; color: white; padding: 5px 10px; border-radius: 3px;">NO</span>'
 
+# Prepare config sections for HTML (avoiding dict literals in f-strings)
+roi_cropping_section = ''
+if config.get('roi_cropping', {}).get('enabled', False):
+    roi_cropping_json = json.dumps(config.get('roi_cropping', {}), indent=2)
+    roi_cropping_section = f'<h3>ROI Cropping</h3>\\n<pre>{roi_cropping_json}</pre>'
+
+voxel_size_default = {'auto_detect': True}
+voxel_size_json = json.dumps(config.get('voxel_size', voxel_size_default), indent=2)
+
+preprocessing_json = json.dumps(config['preprocessing'], indent=2)
+segmentation_json = json.dumps(config['segmentation'], indent=2)
+
+roi_step = ''
+if roi_cropped:
+    roi_path = config.get('roi_cropping', {}).get('roi_path', 'N/A')
+    roi_step = f'<li><strong>ROI Cropping</strong> - Applied ROI from {roi_path} to all timepoints</li>'
+
+roi_output_row = ''
+if roi_cropped:
+    roi_output_row = '<tr><td>00_cropped/</td><td>ROI-cropped images per timepoint</td></tr>'
+
 # Generate HTML report
-html = f'''
-<!DOCTYPE html>
+html = f'''<!DOCTYPE html>
 <html>
 <head>
     <title>SPIM Pipeline Report</title>
@@ -1385,22 +1404,21 @@ html = f'''
 
         <h2>⚙️ Processing Configuration</h2>
 
-        {'<h3>ROI Cropping</h3>' if config.get('roi_cropping', {}).get('enabled', False) else ''}
-        {f'<pre>{json.dumps(config.get("roi_cropping", {{}}), indent=2)}</pre>' if config.get('roi_cropping', {}).get('enabled', False) else ''}
+        {roi_cropping_section}
 
         <h3>Voxel Size Settings</h3>
-        <pre>{json.dumps(config.get('voxel_size', {{'auto_detect': True}}), indent=2)}</pre>
+        <pre>{voxel_size_json}</pre>
 
         <h3>Preprocessing</h3>
-        <pre>{json.dumps(config['preprocessing'], indent=2)}</pre>
+        <pre>{preprocessing_json}</pre>
 
         <h3>Segmentation (Cellpose)</h3>
-        <pre>{json.dumps(config['segmentation'], indent=2)}</pre>
+        <pre>{segmentation_json}</pre>
 
         <h2>📋 Pipeline Steps</h2>
         <ol>
             <li><strong>File Parsing</strong> - Extracted timepoints from filename pattern (t####_Channel #.tif)</li>
-            {f'<li><strong>ROI Cropping</strong> - Applied ROI from {config.get("roi_cropping", {}).get("roi_path", "N/A")} to all timepoints</li>' if roi_cropped else ''}
+            {roi_step}
             <li><strong>Metadata Extraction/Configuration</strong> - {'Auto-detected' if voxel_source == 'auto_detected' else 'Manual override of'} voxel sizes from image metadata</li>
             <li><strong>Preprocessing & Deconvolution</strong> - Applied corrections and deconvolution per timepoint</li>
             <li><strong>Cellpose Segmentation</strong> - 3D cell segmentation per timepoint</li>
@@ -1410,7 +1428,7 @@ html = f'''
         <h2>📂 Output Files</h2>
         <table>
             <tr><th>Directory</th><th>Contents</th></tr>
-            {f'<tr><td>00_cropped/</td><td>ROI-cropped images per timepoint</td></tr>' if roi_cropped else ''}
+            {roi_output_row}
             <tr><td>01_preprocessed/</td><td>Preprocessed and deconvolved images per timepoint</td></tr>
             <tr><td>02_segmented/</td><td>Cellpose segmentation masks per timepoint</td></tr>
             <tr><td>03_hyperstack/</td><td><strong>4D_hyperstack.tif</strong> - Final merged 4D image</td></tr>
