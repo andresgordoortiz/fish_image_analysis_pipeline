@@ -81,8 +81,12 @@
     "comment_image_scaling": "Must match preprocessing scaling for correct voxel sizes"
   },
   "output": {
+    "description": "Output format configuration",
     "format": "bdv",
-    "bdv_dataset_name": "s00/t{t:05d}/s0/cells"
+    "comment_format": "Options: 'tiff' (ImageJ hyperstack) or 'bdv' (BigDataViewer HDF5+XML)",
+    "correct_y": false,
+    "comment_correct_y": "Y-axis flip. Options: false (no flip), true (force flip), 'auto' (detect from TIFF orientation tag)",
+    "comment_bdv_structure": "BDV format uses standard structure: /s00/t{timepoint:05d}/s0/cells"
   },
   "system": {
     "description": "Container images - resource allocation is in nextflow.config",
