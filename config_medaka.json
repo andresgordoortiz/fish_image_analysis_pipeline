@@ -1,6 +1,6 @@
 {
   "pipeline_info": {
-    "version": "1.0.0-with-roi",
+    "version": "1.0.0",
     "description": "SPIM Pipeline Configuration for Medaka Imaging with Optional ROI Cropping",
     "author": "Andres Gordo / Guilherme Ventura",
     "date_created": "2026-01-30",
