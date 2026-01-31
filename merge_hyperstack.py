@@ -2,6 +2,8 @@
 """
 Merge segmented timepoints into 4D hyperstack (TIFF or BDV/HDF5 format).
 Refactored to use pybdv for correct XML/HDF5 generation.
+
+FIXED: Corrected write_xml_metadata call to use proper pybdv API
 """
 
 import json
@@ -75,6 +77,9 @@ def write_bdv_hdf5(
     """
     Write timepoints using pybdv.
     This generates the multi-resolution pyramid and proper XML automatically.
+    
+    FIXED: Corrected write_xml_metadata call - it doesn't accept 'timepoints' parameter.
+           The XML is generated based on what's in the HDF5 file.
     """
     print("\n" + "=" * 60)
     print("Writing BDV HDF5 + XML (via pybdv)")
@@ -128,8 +133,14 @@ def write_bdv_hdf5(
     # ---------------------------------------------------------
     print("\nGenerating XML...")
 
+    # FIXED: write_xml_metadata signature from pybdv documentation:
+    # write_xml_metadata(xml_path, h5_path, unit='', resolution=(1, 1, 1), setup_id=0, 
+    #                    setup_name=None, affine=None, attributes={'channel': {'id': None}})
+    #
+    # It does NOT accept a 'timepoints' parameter - it reads timepoints from the HDF5 file
+    
     # pybdv expects resolution in (Z, Y, X) order matching the numpy array
-    resolution = [final_z_spacing, final_y_res, final_x_res]
+    resolution = (final_z_spacing, final_y_res, final_x_res)
 
     write_xml_metadata(
         xml_path,
@@ -137,7 +148,7 @@ def write_bdv_hdf5(
         unit="um",
         resolution=resolution,
         setup_id=setup_id,
-        timepoints=list(range(T)),
+        # Removed 'timepoints' parameter - not accepted by the function
     )
 
     # ---------------------------------------------------------
@@ -147,6 +158,7 @@ def write_bdv_hdf5(
         "file": h5_path,
         "xml": xml_path,
         "setup_id": setup_id,
+        "n_timepoints": T,
         "pybdv_used": True,
         "downscale_mode": "nearest",
     }
@@ -213,6 +225,7 @@ def main():
 
     # 4. Create Metadata Dict
     hyperstack_meta = {
+        "n_timepoints": len(seg_files),
         "shape": {"T": len(seg_files), "Z": Z, "Y": Y, "X": X},
         "voxel_size": {"x_um": vox_x, "y_um": vox_y, "z_um": vox_z},
         "dtype": "uint16",
