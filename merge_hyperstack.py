@@ -135,19 +135,19 @@ def write_bdv_hdf5(
         os.remove(h5_fname)
 
     print(f"\nCreating HDF5 file with {T} timepoint datasets...")
-    
+
     dataset_paths = []
-    
+
     with h5py.File(h5_fname, "w") as h5f:
         for t_idx, p in enumerate(seg_files):
-            pattern = dataset_pattern.lstrip('/')
+            pattern = dataset_pattern.lstrip("/")
             dset_name = pattern.format(t=t_idx)
-            
-            if not dset_name.startswith('/'):
-                dset_name = '/' + dset_name
-            
+
+            if not dset_name.startswith("/"):
+                dset_name = "/" + dset_name
+
             dataset_paths.append(dset_name)
-            
+
             if (t_idx + 1) % 10 == 0 or t_idx == 0 or t_idx == len(seg_files) - 1:
                 print(f"  Timepoint {t_idx + 1}/{T}: {p.name} -> {dset_name}")
 
@@ -181,28 +181,42 @@ def write_bdv_hdf5(
                 )
 
             if t_idx == 0:
-                dset.attrs["element_size_um"] = [final_z_spacing, final_y_res, final_x_res]
+                dset.attrs["element_size_um"] = [
+                    final_z_spacing,
+                    final_y_res,
+                    final_x_res,
+                ]
                 dset.attrs["unit"] = "um"
 
-        # Add subdivision metadata to setup/timepoint groups (required for BDV multi-resolution format)
-        print("Adding BDV subdivision metadata to HDF5 groups...")
-        for t_idx in range(T):
-            pattern = dataset_pattern.lstrip('/')
-            dset_name = pattern.format(t=t_idx)
-            
-            # Get the setup/timepoint path
-            # For pattern "s00/t00000/s0/cells", we want "/s00/t00000"
-            parts = dset_name.split('/')
-            if len(parts) >= 2:
-                # Take first two parts (setup and timepoint)
-                setup_tp_path = '/' + '/'.join(parts[:2])  # e.g., "/s00/t00000"
-                
-                if setup_tp_path in h5f:
-                    setup_tp_grp = h5f[setup_tp_path]
-                    # BDV expects these attributes for discovering datasets
-                    setup_tp_grp.attrs["subdivisions"] = [[1, 1, 1]]  # Single resolution level
-                    setup_tp_grp.attrs["resolutions"] = [[1, 1, 1]]   # No downsampling
-        
+        # Add subdivision and resolution datasets at setup level (required for BDV)
+        # BDV expects these as DATASETS, not attributes!
+        print("Adding BDV resolution metadata datasets to HDF5...")
+
+        # For the setup group (e.g., /s00), we need to create datasets
+        # Extract setup ID from pattern to construct the setup path
+        pattern_clean = dataset_pattern.lstrip("/")
+        setup_part = pattern_clean.split("/")[0]  # e.g., "s00"
+        setup_path = "/" + setup_part
+
+        # Create resolutions dataset: 2D array of doubles, shape (num_levels, 3)
+        # Each row is [z_downsample, y_downsample, x_downsample]
+        # For single resolution: [[1.0, 1.0, 1.0]]
+        resolutions_data = np.array([[1.0, 1.0, 1.0]], dtype=np.float64)
+        h5f.create_dataset(
+            f"{setup_path}/resolutions", data=resolutions_data, dtype=np.float64
+        )
+
+        # Create subdivisions dataset: 2D array of int32, shape (num_levels, 3)
+        # Each row is [z_blocksize, y_blocksize, x_blocksize]
+        # For single resolution: [[1, 1, 1]]
+        subdivisions_data = np.array([[1, 1, 1]], dtype=np.int32)
+        h5f.create_dataset(
+            f"{setup_path}/subdivisions", data=subdivisions_data, dtype=np.int32
+        )
+
+        print(f"  Created {setup_path}/resolutions dataset: {resolutions_data.shape}")
+        print(f"  Created {setup_path}/subdivisions dataset: {subdivisions_data.shape}")
+
         h5f.flush()
 
     h5_size_mb = Path(h5_fname).stat().st_size / (1024**2)
@@ -211,18 +225,18 @@ def write_bdv_hdf5(
     print(f"  File size: {h5_size_mb:.1f} MB")
     print(f"  Expected (uncompressed): {expected_size_mb:.1f} MB")
     if comp:
-        print(f"  Compression ratio: {expected_size_mb/h5_size_mb:.2f}x")
+        print(f"  Compression ratio: {expected_size_mb / h5_size_mb:.2f}x")
 
     # Generate BDV XML with Partitions
     print(f"\nGenerating BDV XML...")
 
     # Extract setup ID from pattern
-    pattern_clean = dataset_pattern.lstrip('/')
+    pattern_clean = dataset_pattern.lstrip("/")
     setup_id = 0
-    if '/s' in pattern_clean:
+    if "/s" in pattern_clean:
         try:
-            setup_part = pattern_clean.split('/s')[1].split('/')[0]
-            setup_digits = ''.join(c for c in setup_part if c.isdigit())
+            setup_part = pattern_clean.split("/s")[1].split("/")[0]
+            setup_digits = "".join(c for c in setup_part if c.isdigit())
             if setup_digits:
                 setup_id = int(setup_digits)
         except:
@@ -233,68 +247,74 @@ def write_bdv_hdf5(
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<SpimData version="0.2">',
         '  <BasePath type="relative">.</BasePath>',
-        '  <SequenceDescription>',
+        "  <SequenceDescription>",
         '    <ImageLoader format="bdv.hdf5">',
         f'      <hdf5 type="relative">{h5_fname}</hdf5>',
     ]
-    
+
     # Add Partitions - this is the KEY section that maps to HDF5 datasets
-    xml_parts.append('      <Partitions>')
+    xml_parts.append("      <Partitions>")
     for t in range(T):
         # Get the actual dataset path and remove leading slash for XML
-        dset_path = dataset_paths[t].lstrip('/')
+        dset_path = dataset_paths[t].lstrip("/")
         xml_parts.append(
             f'        <Partition path="{dset_path}" timepoint="{t}" setup="{setup_id}" />'
         )
-    xml_parts.append('      </Partitions>')
-    
-    xml_parts.extend([
-        '    </ImageLoader>',
-        '    <ViewSetups>',
-        '      <ViewSetup>',
-        f'        <id>{setup_id}</id>',
-        f'        <n>channel {setup_id}</n>',
-        f'        <size>{X} {Y} {Z}</size>',
-        '        <voxelSize>',
-        '          <unit>um</unit>',
-        f'          <size>{final_x_res} {final_y_res} {final_z_spacing}</size>',
-        '        </voxelSize>',
-        '        <attributes>',
-        f'          <channel>{setup_id}</channel>',
-        '        </attributes>',
-        '      </ViewSetup>',
-        '      <Attributes name="channel">',
-        '        <Channel>',
-        f'          <id>{setup_id}</id>',
-        f'          <n>{setup_id}</n>',
-        '        </Channel>',
-        '      </Attributes>',
-        '    </ViewSetups>',
-        '    <Timepoints type="range">',
-        '      <first>0</first>',
-        f'      <last>{T - 1}</last>',
-        '    </Timepoints>',
-        '  </SequenceDescription>',
-        '  <ViewRegistrations>',
-    ])
-    
+    xml_parts.append("      </Partitions>")
+
+    xml_parts.extend(
+        [
+            "    </ImageLoader>",
+            "    <ViewSetups>",
+            "      <ViewSetup>",
+            f"        <id>{setup_id}</id>",
+            f"        <n>channel {setup_id}</n>",
+            f"        <size>{X} {Y} {Z}</size>",
+            "        <voxelSize>",
+            "          <unit>um</unit>",
+            f"          <size>{final_x_res} {final_y_res} {final_z_spacing}</size>",
+            "        </voxelSize>",
+            "        <attributes>",
+            f"          <channel>{setup_id}</channel>",
+            "        </attributes>",
+            "      </ViewSetup>",
+            '      <Attributes name="channel">',
+            "        <Channel>",
+            f"          <id>{setup_id}</id>",
+            f"          <n>{setup_id}</n>",
+            "        </Channel>",
+            "      </Attributes>",
+            "    </ViewSetups>",
+            '    <Timepoints type="range">',
+            "      <first>0</first>",
+            f"      <last>{T - 1}</last>",
+            "    </Timepoints>",
+            "  </SequenceDescription>",
+            "  <ViewRegistrations>",
+        ]
+    )
+
     # Add registration for each timepoint
     for t in range(T):
-        xml_parts.extend([
-            f'    <ViewRegistration timepoint="{t}" setup="{setup_id}">',
-            '      <ViewTransform type="affine">',
-            '        <n>calibration</n>',
-            f'        <affine>{final_x_res} 0.0 0.0 0.0 0.0 {final_y_res} 0.0 0.0 0.0 0.0 {final_z_spacing} 0.0</affine>',
-            '      </ViewTransform>',
-            '    </ViewRegistration>',
-        ])
-    
-    xml_parts.extend([
-        '  </ViewRegistrations>',
-        '</SpimData>',
-    ])
-    
-    xml = '\n'.join(xml_parts)
+        xml_parts.extend(
+            [
+                f'    <ViewRegistration timepoint="{t}" setup="{setup_id}">',
+                '      <ViewTransform type="affine">',
+                "        <n>calibration</n>",
+                f"        <affine>{final_x_res} 0.0 0.0 0.0 0.0 {final_y_res} 0.0 0.0 0.0 0.0 {final_z_spacing} 0.0</affine>",
+                "      </ViewTransform>",
+                "    </ViewRegistration>",
+            ]
+        )
+
+    xml_parts.extend(
+        [
+            "  </ViewRegistrations>",
+            "</SpimData>",
+        ]
+    )
+
+    xml = "\n".join(xml_parts)
 
     with open(xml_fname, "w") as xf:
         xf.write(xml)
@@ -307,10 +327,11 @@ def write_bdv_hdf5(
     hyperstack_meta["bdv_info"] = {
         "dataset_paths": dataset_paths,
         "setup_id": setup_id,
-        "subdivisions": [[1, 1, 1]],
-        "resolutions": [[1, 1, 1]],
+        "resolutions_dataset": [[1.0, 1.0, 1.0]],
+        "subdivisions_dataset": [[1, 1, 1]],
+        "note": "resolutions and subdivisions are HDF5 datasets at setup level, not attributes",
     }
-    
+
     with open("4D_hyperstack_metadata.json", "w") as fh:
         json.dump(hyperstack_meta, fh, indent=2)
 
@@ -326,7 +347,9 @@ def main():
     print("=" * 80)
 
     if len(sys.argv) != 3:
-        print("Usage: merge_hyperstack.py <metadata.json> <config.json>", file=sys.stderr)
+        print(
+            "Usage: merge_hyperstack.py <metadata.json> <config.json>", file=sys.stderr
+        )
         sys.exit(1)
 
     metadata_path = sys.argv[1]
@@ -392,9 +415,13 @@ def main():
     final_y_res = original_y / scaling
     final_z_spacing = original_z
 
-    print(f"Original voxel size: {original_x:.4f} × {original_y:.4f} × {original_z:.4f} µm")
+    print(
+        f"Original voxel size: {original_x:.4f} × {original_y:.4f} × {original_z:.4f} µm"
+    )
     print(f"Scaling factor: {scaling}")
-    print(f"Final voxel size: {final_x_res:.4f} × {final_y_res:.4f} × {final_z_spacing:.4f} µm")
+    print(
+        f"Final voxel size: {final_x_res:.4f} × {final_y_res:.4f} × {final_z_spacing:.4f} µm"
+    )
 
     need_flip = False
     if isinstance(correct_y_cfg, str) and correct_y_cfg.lower() == "auto":
@@ -451,12 +478,14 @@ def main():
         # BDV default pattern: /s{setup}/t{timepoint}/s{level}/{channel}
         # Note: setup comes BEFORE timepoint in standard BDV format!
         dataset_pattern = out_cfg.get("bdv_dataset_name", "s00/t{t:05d}/s0/cells")
-        
-        if '{t' not in dataset_pattern:
-            print(f"WARNING: BDV dataset pattern missing {{t}} placeholder: {dataset_pattern}")
+
+        if "{t" not in dataset_pattern:
+            print(
+                f"WARNING: BDV dataset pattern missing {{t}} placeholder: {dataset_pattern}"
+            )
             print("  Using default pattern: s00/t{{t:05d}}/s0/cells")
             dataset_pattern = "s00/t{t:05d}/s0/cells"
-        
+
         hyperstack_meta["processing"]["bdv_dataset_pattern"] = dataset_pattern
 
         write_bdv_hdf5(
@@ -482,7 +511,9 @@ def main():
     print(f"Format: {out_format}")
     print(f"Timepoints: {T}")
     print(f"Dimensions: {Z} × {Y} × {X} (Z × Y × X)")
-    print(f"Voxel size: {final_x_res:.4f} × {final_y_res:.4f} × {final_z_spacing:.4f} µm")
+    print(
+        f"Voxel size: {final_x_res:.4f} × {final_y_res:.4f} × {final_z_spacing:.4f} µm"
+    )
     print(f"Y-flip applied: {need_flip}")
     print("=" * 80)
 
@@ -493,5 +524,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nERROR: {type(e).__name__}: {str(e)}", file=sys.stderr)
         import traceback
+
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
