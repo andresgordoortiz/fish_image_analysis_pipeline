@@ -1117,7 +1117,8 @@ process MERGE_TO_HYPERSTACK {
     container params.container
 
     script:
-    def config_json_str = groovy.json.JsonOutput.toJson(config).replace("'", "\\'")
+    // Create properly escaped JSON string for Python heredoc
+    def config_json_str = groovy.json.JsonOutput.toJson(config)
     def merge_script_name = merge_script.name
     """
     #!/usr/bin/env bash
@@ -1152,11 +1153,31 @@ process MERGE_TO_HYPERSTACK {
     echo "✓ Required packages available"
     echo ""
 
-    # Create temporary config file
+    # Create temporary config file using Python to avoid escaping issues
     echo "Creating temporary config file..."
-    cat > config_temp.json << 'CONFIG_EOF'
-${config_json_str}
-CONFIG_EOF
+    python3 << 'PYTHON_CONFIG'
+import json
+
+# Parse the JSON string from Groovy
+config_str = '''${config_json_str}'''
+config_data = json.loads(config_str)
+
+# Write it properly to file
+with open('config_temp.json', 'w') as f:
+    json.dump(config_data, f, indent=2)
+
+print("✓ Config file created")
+PYTHON_CONFIG
+
+    # Verify config file was created
+    if [ ! -f "config_temp.json" ]; then
+        echo "ERROR: Failed to create config_temp.json"
+        exit 1
+    fi
+
+    echo "Config file contents (first 10 lines):"
+    head -10 config_temp.json
+    echo ""
 
     # Run merge script
     echo "Running merge script..."
