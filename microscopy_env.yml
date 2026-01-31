@@ -37,6 +37,7 @@ dependencies:
 
   # HDF5 support
   - hdf5
+  - pybdv
 
   # Utilities
   - tqdm
