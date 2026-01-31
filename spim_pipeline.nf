@@ -1234,7 +1234,7 @@ process GENERATE_QC_REPORT {
     input:
     path all_logs
     path hyperstack_metadata
-    val config_json
+    path config_file  // <-- Changed to path
 
 
     output:
@@ -1242,6 +1242,7 @@ process GENERATE_QC_REPORT {
     path "pipeline_summary.json"
 
     script:
+    def config_filename = config_file.name
     """
     #!/bin/bash
     set -e
@@ -1260,7 +1261,7 @@ with open('${hyperstack_metadata}', 'r') as f:
     hyperstack_meta = json.load(f)
 
 # Load config
-with open('${config_json}', 'r') as f:
+with open('${config_filename}', 'r') as f:  # <-- Use actual filename
     config = json.load(f)
 
 # Collect all log files
@@ -1537,11 +1538,13 @@ workflow {
         .mix(PREPROCESS_DECONVOLVE.out.log)
         .mix(CELLPOSE_SEGMENT.out.log)
         .collect()
+// Create channel for config file
+    config_file_ch = Channel.fromPath(params.config_json, checkIfExists: true)
 
     GENERATE_QC_REPORT(
         all_logs,
         MERGE_TO_HYPERSTACK.out.metadata,
-        params.config_json
+        config_file_ch.collect()  // <-- File channel
     )
 }
 
