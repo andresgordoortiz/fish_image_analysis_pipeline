@@ -1192,7 +1192,7 @@ PYTHON_CONFIG
 
     # Verify output files
     echo ""
-    echo "Verifying output files..."
+    echo "Verifying output file or files..."
     
     if [ ! -f "4D_hyperstack_metadata.json" ]; then
         echo "ERROR: Metadata file not created"
