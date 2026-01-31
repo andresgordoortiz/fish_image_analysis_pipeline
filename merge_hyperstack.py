@@ -8,6 +8,8 @@ This script:
 3. Applies optional Y-axis flip correction
 4. Stacks into 4D array (T, Z, Y, X)
 5. Writes output in TIFF or BDV/HDF5 format with proper metadata
+
+FIXED: BDV format now correctly creates separate datasets per timepoint
 """
 
 import json
@@ -86,10 +88,19 @@ def write_bdv_hdf5(
     final_y_res,
     final_z_spacing,
     need_flip,
-    dataset_base,
+    dataset_pattern,
     hyperstack_meta,
 ):
-    """Write timepoints as BDV HDF5 + XML with streaming."""
+    """Write timepoints as BDV HDF5 + XML with streaming.
+    
+    BDV format requires SEPARATE datasets for each timepoint:
+    /t00000/s00/0/cells
+    /t00001/s00/0/cells
+    etc.
+    
+    Args:
+        dataset_pattern: Pattern like "t{t:05d}/s00/0/cells" for dataset naming
+    """
     import tifffile
 
     # Ensure h5py is available
@@ -109,18 +120,19 @@ def write_bdv_hdf5(
     h5_fname = "4D_hyperstack.h5"
     xml_fname = "4D_hyperstack.xml"
 
-    data_shape = (T, Z, Y, X)
-    chunk_t = 1
+    # BDV uses separate 3D datasets per timepoint
+    data_shape_per_tp = (Z, Y, X)
     chunk_z = min(8, Z)
     chunk_y = min(64, Y)
     chunk_x = min(64, X)
-    chunks = (chunk_t, chunk_z, chunk_y, chunk_x)
+    chunks = (chunk_z, chunk_y, chunk_x)
 
     print(f"\nHDF5 configuration:")
     print(f"  File: {h5_fname}")
-    print(f"  Dataset: /{dataset_base}")
-    print(f"  Shape: {data_shape} (T, Z, Y, X)")
+    print(f"  Dataset pattern: {dataset_pattern}")
+    print(f"  Shape per timepoint: {data_shape_per_tp} (Z, Y, X)")
     print(f"  Chunks: {chunks}")
+    print(f"  Timepoints: {T}")
 
     # Test compression support
     gzip_ok = True
@@ -144,35 +156,23 @@ def write_bdv_hdf5(
     if os.path.exists(h5_fname):
         os.remove(h5_fname)
 
-    print(f"\nCreating HDF5 file and streaming timepoints...")
+    print(f"\nCreating HDF5 file and writing {T} separate timepoint datasets...")
     with h5py.File(h5_fname, "w") as h5f:
-        # Create dataset
-        if comp:
-            dset = h5f.create_dataset(
-                dataset_base.format(t=0),
-                shape=data_shape,
-                dtype=np.uint16,
-                chunks=chunks,
-                compression=comp,
-                compression_opts=comp_opts,
-            )
-        else:
-            dset = h5f.create_dataset(
-                dataset_base.format(t=0),
-                shape=data_shape,
-                dtype=np.uint16,
-                chunks=chunks,
-            )
-
-        # Store voxel sizes as attributes
-        dset.attrs["element_size_um"] = [final_z_spacing, final_y_res, final_x_res]
-        dset.attrs["unit"] = "um"
-
-        # Stream write each timepoint
+        # Create SEPARATE dataset for EACH timepoint (BDV requirement)
         for t_idx, p in enumerate(seg_files):
+            # Format dataset name with timepoint index
+            # Remove leading slashes and add them back consistently
+            pattern = dataset_pattern.lstrip('/')
+            dset_name = pattern.format(t=t_idx)
+            
+            # Add leading slash for HDF5
+            if not dset_name.startswith('/'):
+                dset_name = '/' + dset_name
+            
             if (t_idx + 1) % 10 == 0 or t_idx == 0 or t_idx == len(seg_files) - 1:
-                print(f"  Writing timepoint {t_idx + 1}/{T}: {p.name}")
+                print(f"  Timepoint {t_idx + 1}/{T}: {p.name} -> {dset_name}")
 
+            # Load image
             arr = tifffile.imread(str(p)).astype(np.uint16)
 
             # Validate dimensions
@@ -187,14 +187,51 @@ def write_bdv_hdf5(
             if need_flip:
                 arr = np.flip(arr, axis=1)
 
-            dset[t_idx, :, :, :] = arr
-            h5f.flush()
+            # Create dataset for this timepoint
+            if comp:
+                dset = h5f.create_dataset(
+                    dset_name,
+                    data=arr,
+                    dtype=np.uint16,
+                    chunks=chunks,
+                    compression=comp,
+                    compression_opts=comp_opts,
+                )
+            else:
+                dset = h5f.create_dataset(
+                    dset_name,
+                    data=arr,
+                    dtype=np.uint16,
+                    chunks=chunks,
+                )
 
+            # Store voxel sizes as attributes on FIRST timepoint dataset
+            if t_idx == 0:
+                dset.attrs["element_size_um"] = [final_z_spacing, final_y_res, final_x_res]
+                dset.attrs["unit"] = "um"
+
+        h5f.flush()
+
+    # Verify file size
+    h5_size_mb = Path(h5_fname).stat().st_size / (1024**2)
+    expected_size_mb = (T * Z * Y * X * 2) / (1024**2)  # uint16 = 2 bytes
     print(f"\n✓ HDF5 file written")
+    print(f"  File size: {h5_size_mb:.1f} MB")
+    print(f"  Expected (uncompressed): {expected_size_mb:.1f} MB")
+    if comp:
+        print(f"  Compression ratio: {expected_size_mb/h5_size_mb:.2f}x")
 
     # Generate BDV XML
     print(f"\nGenerating BDV XML...")
 
+    # Extract pattern components for XML
+    # Pattern is like "t{t:05d}/s00/0/cells" or "t{t}/s00/0/c0"
+    # We need setup number (s00 -> 0) and subdivision format
+    pattern_clean = dataset_pattern.lstrip('/')
+    
+    # For simplicity, assume setup 0 and standard format
+    setup_id = 0
+    
     voxel_size_xml = f"{final_z_spacing} {final_y_res} {final_x_res}"
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -206,21 +243,21 @@ def write_bdv_hdf5(
     </ImageLoader>
     <ViewSetups>
       <ViewSetup>
-        <id>0</id>
-        <name>channel 0</name>
+        <id>{setup_id}</id>
+        <name>channel {setup_id}</name>
         <size>{X} {Y} {Z}</size>
         <voxelSize>
           <unit>um</unit>
           <size>{voxel_size_xml}</size>
         </voxelSize>
         <attributes>
-          <channel>0</channel>
+          <channel>{setup_id}</channel>
         </attributes>
       </ViewSetup>
       <Attributes name="channel">
         <Channel>
-          <id>0</id>
-          <name>0</name>
+          <id>{setup_id}</id>
+          <name>{setup_id}</name>
         </Channel>
       </Attributes>
     </ViewSetups>
@@ -233,8 +270,9 @@ def write_bdv_hdf5(
 """
 
     # Add registration for each timepoint
+    # Reference the actual datasets created
     for t in range(T):
-        xml += f'''    <ViewRegistration timepoint="{t}" setup="0">
+        xml += f'''    <ViewRegistration timepoint="{t}" setup="{setup_id}">
       <ViewTransform type="affine">
         <affine>1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0</affine>
       </ViewTransform>
@@ -262,7 +300,7 @@ def main():
     import tifffile
 
     print("=" * 80)
-    print("MERGE_TO_HYPERSTACK - Corrected Version")
+    print("MERGE_TO_HYPERSTACK - Fixed BDV Version")
     print("=" * 80)
 
     # Load metadata and config from command line args
@@ -410,8 +448,17 @@ def main():
         )
 
     elif out_format in ("bdv", "bigdataviewer", "hdf5"):
-        dataset_base = out_cfg.get("bdv_dataset_name", "t{t}/s00/0/cells").lstrip("/")
-        hyperstack_meta["processing"]["bdv_dataset"] = dataset_base
+        # Get BDV dataset pattern from config
+        # Default pattern should work with Mastodon
+        dataset_pattern = out_cfg.get("bdv_dataset_name", "t{t:05d}/s00/0/cells")
+        
+        # Ensure pattern has {t} placeholder
+        if '{t' not in dataset_pattern:
+            print(f"WARNING: BDV dataset pattern missing {{t}} placeholder: {dataset_pattern}")
+            print("  Using default pattern: t{{t:05d}}/s00/0/cells")
+            dataset_pattern = "t{t:05d}/s00/0/cells"
+        
+        hyperstack_meta["processing"]["bdv_dataset_pattern"] = dataset_pattern
 
         write_bdv_hdf5(
             seg_files,
@@ -423,7 +470,7 @@ def main():
             final_y_res,
             final_z_spacing,
             need_flip,
-            dataset_base,
+            dataset_pattern,
             hyperstack_meta,
         )
 
