@@ -90,7 +90,7 @@
   },
   "system": {
     "description": "Container images - resource allocation is in nextflow.config",
-    "container_image": "docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-8720eea",
+    "container_image": "docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-e455de8",
     "fiji_container_image": "docker://fiji/fiji:20220415",
     "comment": "Fiji container used only if ROI cropping is enabled"
   }

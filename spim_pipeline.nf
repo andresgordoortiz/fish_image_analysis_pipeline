@@ -32,7 +32,7 @@ params.config_json = null
 params.channel = 1
 params.preprocessing_script = './spim_pipeline_fixed.py'
 params.merge_script = './merge_hyperstack.py'
-params.container = 'docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1'
+params.container = 'docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-e455de8'
 params.fiji_container = 'docker://fiji/fiji:20220415'
 params.help = false
 
@@ -63,7 +63,7 @@ if (params.help) {
         --merge_script         Path to merge Python script
                                (default: ./merge_hyperstack.py)
         --container             Singularity/Docker container image
-                               (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-ad6c6a1)
+                               (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-e455de8)
         --fiji_container        Fiji container for ROI cropping
                                (default: docker://fiji/fiji:20220415)
         --help                 Show this help message
