@@ -1234,7 +1234,7 @@ process GENERATE_QC_REPORT {
     input:
     path all_logs
     path hyperstack_metadata
-    path config_file  // <-- Changed to path
+    path config_file  // Changed from: val config_json
 
 
     output:
@@ -1261,7 +1261,7 @@ with open('${hyperstack_metadata}', 'r') as f:
     hyperstack_meta = json.load(f)
 
 # Load config
-with open('${config_filename}', 'r') as f:  # <-- Use actual filename
+with open('${config_filename}', 'r') as f:  # Changed from: './config_medaka.json'
     config = json.load(f)
 
 # Collect all log files
