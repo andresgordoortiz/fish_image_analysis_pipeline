@@ -81,13 +81,8 @@
     "comment_image_scaling": "Must match preprocessing scaling for correct voxel sizes"
   },
   "output": {
-    "comment_format": "Choose: 'tiff' for ImageJ hyperstack or 'bdv' for BigDataViewer/Mastodon",
     "format": "bdv",
-    "comment_correct_y": "Y-axis flip correction: false, true, or 'auto' to detect from TIFF orientation",
-    "correct_y": "false",
-    "comment_bdv_dataset": "BDV dataset pattern MUST include {t} placeholder for timepoint index",
-    "bdv_dataset_name": "t{t:05d}/s00/0/cells",
-    "comment_bdv_note": "Standard BDV pattern works with Mastodon. Format: t00000, t00001, etc."
+    "bdv_dataset_name": "s00/t{t:05d}/s0/cells"
   },
   "system": {
     "description": "Container images - resource allocation is in nextflow.config",

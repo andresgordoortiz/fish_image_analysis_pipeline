@@ -184,22 +184,24 @@ def write_bdv_hdf5(
                 dset.attrs["element_size_um"] = [final_z_spacing, final_y_res, final_x_res]
                 dset.attrs["unit"] = "um"
 
-        # Add subdivision metadata to setup groups (required for BDV multi-resolution format)
+        # Add subdivision metadata to setup/timepoint groups (required for BDV multi-resolution format)
         print("Adding BDV subdivision metadata to HDF5 groups...")
         for t_idx in range(T):
             pattern = dataset_pattern.lstrip('/')
             dset_name = pattern.format(t=t_idx)
             
-            # Get the setup path (e.g., "/t00000/s00")
+            # Get the setup/timepoint path
+            # For pattern "s00/t00000/s0/cells", we want "/s00/t00000"
             parts = dset_name.split('/')
-            if len(parts) >= 3:
-                setup_path = '/' + '/'.join(parts[1:3])  # e.g., "/t00000/s00"
+            if len(parts) >= 2:
+                # Take first two parts (setup and timepoint)
+                setup_tp_path = '/' + '/'.join(parts[:2])  # e.g., "/s00/t00000"
                 
-                if setup_path in h5f:
-                    setup_grp = h5f[setup_path]
+                if setup_tp_path in h5f:
+                    setup_tp_grp = h5f[setup_tp_path]
                     # BDV expects these attributes for discovering datasets
-                    setup_grp.attrs["subdivisions"] = [[1, 1, 1]]  # Single resolution level
-                    setup_grp.attrs["resolutions"] = [[1, 1, 1]]   # No downsampling
+                    setup_tp_grp.attrs["subdivisions"] = [[1, 1, 1]]  # Single resolution level
+                    setup_tp_grp.attrs["resolutions"] = [[1, 1, 1]]   # No downsampling
         
         h5f.flush()
 
@@ -446,12 +448,14 @@ def main():
         )
 
     elif out_format in ("bdv", "bigdataviewer", "hdf5"):
-        dataset_pattern = out_cfg.get("bdv_dataset_name", "t{t:05d}/s00/0/cells")
+        # BDV default pattern: /s{setup}/t{timepoint}/s{level}/{channel}
+        # Note: setup comes BEFORE timepoint in standard BDV format!
+        dataset_pattern = out_cfg.get("bdv_dataset_name", "s00/t{t:05d}/s0/cells")
         
         if '{t' not in dataset_pattern:
             print(f"WARNING: BDV dataset pattern missing {{t}} placeholder: {dataset_pattern}")
-            print("  Using default pattern: t{{t:05d}}/s00/0/cells")
-            dataset_pattern = "t{t:05d}/s00/0/cells"
+            print("  Using default pattern: s00/t{{t:05d}}/s0/cells")
+            dataset_pattern = "s00/t{t:05d}/s0/cells"
         
         hyperstack_meta["processing"]["bdv_dataset_pattern"] = dataset_pattern
 
