@@ -2,14 +2,7 @@
 """
 Merge segmented timepoints into 4D hyperstack (TIFF or BDV/HDF5 format)
 
-This script:
-1. Loads all segmented timepoint files
-2. Validates dimensions consistency
-3. Applies optional Y-axis flip correction
-4. Stacks into 4D array (T, Z, Y, X)
-5. Writes output in TIFF or BDV/HDF5 format with proper metadata
-
-FIXED: BDV format now correctly creates separate datasets per timepoint
+FIXED: Proper BDV XML structure that correctly references HDF5 datasets
 """
 
 import json
@@ -30,7 +23,6 @@ def detect_flip_needed(first_path):
             if "Orientation" in tags:
                 val = tags["Orientation"].value
                 print(f"  TIFF Orientation tag: {val}")
-                # Orientations 3,4,7,8 indicate flipped images
                 return val in (3, 4, 7, 8)
     except Exception as e:
         print(f"  Orientation auto-detect error: {e}")
@@ -51,12 +43,10 @@ def write_tiff_hyperstack(
     print(f"Data type: {img4d.dtype}")
     print(f"Memory size: {img4d.nbytes / (1024**3):.2f} GB")
 
-    # Save metadata JSON
     with open("4D_hyperstack_metadata.json", "w") as fh:
         json.dump(hyperstack_meta, fh, indent=2)
     print("\n✓ Metadata JSON saved")
 
-    # Write TIFF with ImageJ metadata
     print("\nWriting 4D_hyperstack.tif...")
     tifffile.imwrite(
         "4D_hyperstack.tif",
@@ -91,19 +81,9 @@ def write_bdv_hdf5(
     dataset_pattern,
     hyperstack_meta,
 ):
-    """Write timepoints as BDV HDF5 + XML with streaming.
-    
-    BDV format requires SEPARATE datasets for each timepoint:
-    /t00000/s00/0/cells
-    /t00001/s00/0/cells
-    etc.
-    
-    Args:
-        dataset_pattern: Pattern like "t{t:05d}/s00/0/cells" for dataset naming
-    """
+    """Write timepoints as BDV HDF5 + XML with proper Partitions structure."""
     import tifffile
 
-    # Ensure h5py is available
     try:
         import h5py
     except ImportError:
@@ -114,13 +94,12 @@ def write_bdv_hdf5(
         import h5py
 
     print("\n" + "=" * 80)
-    print("Writing BDV HDF5 + XML (streaming mode)")
+    print("Writing BDV HDF5 + XML")
     print("=" * 80)
 
     h5_fname = "4D_hyperstack.h5"
     xml_fname = "4D_hyperstack.xml"
 
-    # BDV uses separate 3D datasets per timepoint
     data_shape_per_tp = (Z, Y, X)
     chunk_z = min(8, Z)
     chunk_y = min(64, Y)
@@ -134,7 +113,7 @@ def write_bdv_hdf5(
     print(f"  Chunks: {chunks}")
     print(f"  Timepoints: {T}")
 
-    # Test compression support
+    # Test compression
     gzip_ok = True
     try:
         tmp = "tmp_test.h5"
@@ -152,30 +131,28 @@ def write_bdv_hdf5(
     comp = "gzip" if gzip_ok else None
     comp_opts = 4 if gzip_ok else None
 
-    # Create HDF5 file
     if os.path.exists(h5_fname):
         os.remove(h5_fname)
 
-    print(f"\nCreating HDF5 file and writing {T} separate timepoint datasets...")
+    print(f"\nCreating HDF5 file with {T} timepoint datasets...")
+
+    dataset_paths = []
+
     with h5py.File(h5_fname, "w") as h5f:
-        # Create SEPARATE dataset for EACH timepoint (BDV requirement)
         for t_idx, p in enumerate(seg_files):
-            # Format dataset name with timepoint index
-            # Remove leading slashes and add them back consistently
-            pattern = dataset_pattern.lstrip('/')
+            pattern = dataset_pattern.lstrip("/")
             dset_name = pattern.format(t=t_idx)
-            
-            # Add leading slash for HDF5
-            if not dset_name.startswith('/'):
-                dset_name = '/' + dset_name
-            
+
+            if not dset_name.startswith("/"):
+                dset_name = "/" + dset_name
+
+            dataset_paths.append(dset_name)
+
             if (t_idx + 1) % 10 == 0 or t_idx == 0 or t_idx == len(seg_files) - 1:
                 print(f"  Timepoint {t_idx + 1}/{T}: {p.name} -> {dset_name}")
 
-            # Load image
             arr = tifffile.imread(str(p)).astype(np.uint16)
 
-            # Validate dimensions
             if arr.shape != (Z, Y, X):
                 raise RuntimeError(
                     f"Dimension mismatch in {p.name}:\n"
@@ -183,11 +160,9 @@ def write_bdv_hdf5(
                     f"  Got: {arr.shape}"
                 )
 
-            # Apply Y-flip if needed
             if need_flip:
                 arr = np.flip(arr, axis=1)
 
-            # Create dataset for this timepoint
             if comp:
                 dset = h5f.create_dataset(
                     dset_name,
@@ -205,90 +180,126 @@ def write_bdv_hdf5(
                     chunks=chunks,
                 )
 
-            # Store voxel sizes as attributes on FIRST timepoint dataset
             if t_idx == 0:
-                dset.attrs["element_size_um"] = [final_z_spacing, final_y_res, final_x_res]
+                dset.attrs["element_size_um"] = [
+                    final_z_spacing,
+                    final_y_res,
+                    final_x_res,
+                ]
                 dset.attrs["unit"] = "um"
 
         h5f.flush()
 
-    # Verify file size
     h5_size_mb = Path(h5_fname).stat().st_size / (1024**2)
-    expected_size_mb = (T * Z * Y * X * 2) / (1024**2)  # uint16 = 2 bytes
+    expected_size_mb = (T * Z * Y * X * 2) / (1024**2)
     print(f"\n✓ HDF5 file written")
     print(f"  File size: {h5_size_mb:.1f} MB")
     print(f"  Expected (uncompressed): {expected_size_mb:.1f} MB")
     if comp:
-        print(f"  Compression ratio: {expected_size_mb/h5_size_mb:.2f}x")
+        print(f"  Compression ratio: {expected_size_mb / h5_size_mb:.2f}x")
 
-    # Generate BDV XML
+    # Generate BDV XML with Partitions
     print(f"\nGenerating BDV XML...")
 
-    # Extract pattern components for XML
-    # Pattern is like "t{t:05d}/s00/0/cells" or "t{t}/s00/0/c0"
-    # We need setup number (s00 -> 0) and subdivision format
-    pattern_clean = dataset_pattern.lstrip('/')
-    
-    # For simplicity, assume setup 0 and standard format
+    # Extract setup ID from pattern
+    pattern_clean = dataset_pattern.lstrip("/")
     setup_id = 0
-    
-    voxel_size_xml = f"{final_z_spacing} {final_y_res} {final_x_res}"
+    if "/s" in pattern_clean:
+        try:
+            setup_part = pattern_clean.split("/s")[1].split("/")[0]
+            setup_digits = "".join(c for c in setup_part if c.isdigit())
+            if setup_digits:
+                setup_id = int(setup_digits)
+        except:
+            pass
 
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<SpimData version="0.2">
-  <BasePath type="relative">.</BasePath>
-  <SequenceDescription>
-    <ImageLoader format="bdv.hdf5">
-      <hdf5 type="relative">{h5_fname}</hdf5>
-    </ImageLoader>
-    <ViewSetups>
-      <ViewSetup>
-        <id>{setup_id}</id>
-        <name>channel {setup_id}</name>
-        <size>{X} {Y} {Z}</size>
-        <voxelSize>
-          <unit>um</unit>
-          <size>{voxel_size_xml}</size>
-        </voxelSize>
-        <attributes>
-          <channel>{setup_id}</channel>
-        </attributes>
-      </ViewSetup>
-      <Attributes name="channel">
-        <Channel>
-          <id>{setup_id}</id>
-          <name>{setup_id}</name>
-        </Channel>
-      </Attributes>
-    </ViewSetups>
-    <Timepoints type="range">
-      <first>0</first>
-      <last>{T - 1}</last>
-    </Timepoints>
-  </SequenceDescription>
-  <ViewRegistrations>
-"""
+    # Build XML
+    xml_parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<SpimData version="0.2">',
+        '  <BasePath type="relative">.</BasePath>',
+        "  <SequenceDescription>",
+        '    <ImageLoader format="bdv.hdf5">',
+        f'      <hdf5 type="relative">{h5_fname}</hdf5>',
+    ]
+
+    # Add Partitions - this is the KEY section that maps to HDF5 datasets
+    xml_parts.append("      <Partitions>")
+    for t in range(T):
+        # Get the actual dataset path and remove leading slash for XML
+        dset_path = dataset_paths[t].lstrip("/")
+        xml_parts.append(
+            f'        <Partition path="{dset_path}" timepoint="{t}" setup="{setup_id}" />'
+        )
+    xml_parts.append("      </Partitions>")
+
+    xml_parts.extend(
+        [
+            "    </ImageLoader>",
+            "    <ViewSetups>",
+            "      <ViewSetup>",
+            f"        <id>{setup_id}</id>",
+            f"        <n>channel {setup_id}</n>",
+            f"        <size>{X} {Y} {Z}</size>",
+            "        <voxelSize>",
+            "          <unit>um</unit>",
+            f"          <size>{final_x_res} {final_y_res} {final_z_spacing}</size>",
+            "        </voxelSize>",
+            "        <attributes>",
+            f"          <channel>{setup_id}</channel>",
+            "        </attributes>",
+            "      </ViewSetup>",
+            '      <Attributes name="channel">',
+            "        <Channel>",
+            f"          <id>{setup_id}</id>",
+            f"          <n>{setup_id}</n>",
+            "        </Channel>",
+            "      </Attributes>",
+            "    </ViewSetups>",
+            '    <Timepoints type="range">',
+            "      <first>0</first>",
+            f"      <last>{T - 1}</last>",
+            "    </Timepoints>",
+            "  </SequenceDescription>",
+            "  <ViewRegistrations>",
+        ]
+    )
 
     # Add registration for each timepoint
-    # Reference the actual datasets created
     for t in range(T):
-        xml += f'''    <ViewRegistration timepoint="{t}" setup="{setup_id}">
-      <ViewTransform type="affine">
-        <affine>1.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 0.0 1.0 0.0</affine>
-      </ViewTransform>
-    </ViewRegistration>
-'''
+        xml_parts.extend(
+            [
+                f'    <ViewRegistration timepoint="{t}" setup="{setup_id}">',
+                '      <ViewTransform type="affine">',
+                "        <n>calibration</n>",
+                f"        <affine>{final_x_res} 0.0 0.0 0.0 0.0 {final_y_res} 0.0 0.0 0.0 0.0 {final_z_spacing} 0.0</affine>",
+                "      </ViewTransform>",
+                "    </ViewRegistration>",
+            ]
+        )
 
-    xml += """  </ViewRegistrations>
-</SpimData>
-"""
+    xml_parts.extend(
+        [
+            "  </ViewRegistrations>",
+            "</SpimData>",
+        ]
+    )
+
+    xml = "\n".join(xml_parts)
 
     with open(xml_fname, "w") as xf:
         xf.write(xml)
 
-    print(f"✓ BDV XML written with {T} timepoints")
+    print(f"✓ BDV XML written")
+    print(f"  Setup ID: {setup_id}")
+    print(f"  Timepoints: {T}")
+    print(f"  Sample dataset: {dataset_paths[0]}")
 
-    # Save metadata JSON
+    hyperstack_meta["bdv_info"] = {
+        "dataset_paths": dataset_paths,
+        "setup_id": setup_id,
+    }
+
     with open("4D_hyperstack_metadata.json", "w") as fh:
         json.dump(hyperstack_meta, fh, indent=2)
 
@@ -300,10 +311,9 @@ def main():
     import tifffile
 
     print("=" * 80)
-    print("MERGE_TO_HYPERSTACK - Fixed BDV Version")
+    print("MERGE_TO_HYPERSTACK - BDV XML Fixed")
     print("=" * 80)
 
-    # Load metadata and config from command line args
     if len(sys.argv) != 3:
         print(
             "Usage: merge_hyperstack.py <metadata.json> <config.json>", file=sys.stderr
@@ -313,7 +323,6 @@ def main():
     metadata_path = sys.argv[1]
     config_path = sys.argv[2]
 
-    # Load shared metadata
     print("\nLoading metadata...")
     with open(metadata_path, "r") as fm:
         meta = json.load(fm)
@@ -321,7 +330,6 @@ def main():
     print(f"Metadata source: {meta.get('voxel_size_source', 'unknown')}")
     print(f"ROI cropped: {meta.get('was_roi_cropped', False)}")
 
-    # Load pipeline config
     with open(config_path, "r") as fc:
         config = json.load(fc)
 
@@ -329,7 +337,6 @@ def main():
     out_format = out_cfg.get("format", "tiff").lower()
     correct_y_cfg = out_cfg.get("correct_y", False)
 
-    # Discover segmented files
     seg_files = sorted(Path(".").glob("t*_segmented.tif"))
     if not seg_files:
         raise RuntimeError("No segmented files found (expected t*_segmented.tif)")
@@ -338,12 +345,10 @@ def main():
     print(f"  First: {seg_files[0].name}")
     print(f"  Last:  {seg_files[-1].name}")
 
-    # Get scaling from preprocessing config
     preprocessing_cfg = config.get("preprocessing", {})
     scaling = preprocessing_cfg.get("image_scaling", 1.0)
     print(f"Preprocessing scaling factor: {scaling}")
 
-    # Read actual dimensions from first segmented file
     print("\nReading actual dimensions from first segmented file...")
     with tifffile.TiffFile(str(seg_files[0])) as tf:
         Z = len(tf.pages)
@@ -353,7 +358,6 @@ def main():
     print(f"Actual dimensions: Z={Z}, Y={Y}, X={X}")
     print(f"Data type: {dtype}")
 
-    # Validate all files have same dimensions
     print("\nValidating dimension consistency across all timepoints...")
     for idx, p in enumerate(seg_files):
         arr = tifffile.imread(str(p))
@@ -361,9 +365,7 @@ def main():
             raise RuntimeError(
                 f"Dimension mismatch in {p.name} (timepoint {idx}):\n"
                 f"  Expected: (Z,Y,X) = ({Z}, {Y}, {X})\n"
-                f"  Got:      (Z,Y,X) = {arr.shape}\n"
-                f"  This suggests inconsistent processing between timepoints.\n"
-                f"  Check preprocessing and segmentation logs."
+                f"  Got:      (Z,Y,X) = {arr.shape}"
             )
         if arr.size == 0:
             raise RuntimeError(f"Empty array read from {p.name}")
@@ -372,7 +374,6 @@ def main():
 
     T = len(seg_files)
 
-    # Calculate final voxel sizes
     print("\nCalculating final voxel sizes...")
     original_x = meta.get("x_resolution_um", 1.0)
     original_y = meta.get("y_resolution_um", 1.0)
@@ -390,7 +391,6 @@ def main():
         f"Final voxel size: {final_x_res:.4f} × {final_y_res:.4f} × {final_z_spacing:.4f} µm"
     )
 
-    # Y-flip detection
     need_flip = False
     if isinstance(correct_y_cfg, str) and correct_y_cfg.lower() == "auto":
         print("\nAuto-detecting Y-axis flip...")
@@ -403,7 +403,6 @@ def main():
 
     print(f"Y-flip will be applied: {need_flip}")
 
-    # Prepare common metadata
     hyperstack_meta = {
         "shape": {"axes": "TZYX", "T": int(T), "Z": int(Z), "Y": int(Y), "X": int(X)},
         "voxel_size": {
@@ -422,9 +421,7 @@ def main():
         },
     }
 
-    # Write output based on format
     if out_format in ("tiff", "imagej", "hyperstack"):
-        # Load all timepoints into memory
         print(f"\nLoading {T} timepoints into memory...")
         all_arrs = []
         for idx, p in enumerate(seg_files):
@@ -433,13 +430,11 @@ def main():
 
             arr = tifffile.imread(str(p))
 
-            # Apply Y-flip if needed (axis 1 is Y in ZYX)
             if need_flip:
                 arr = np.flip(arr, axis=1)
 
             all_arrs.append(arr.astype(np.uint16))
 
-        # Stack into 4D array: (T, Z, Y, X)
         print(f"\nStacking into 4D array...")
         img4d = np.stack(all_arrs, axis=0)
 
@@ -448,16 +443,15 @@ def main():
         )
 
     elif out_format in ("bdv", "bigdataviewer", "hdf5"):
-        # Get BDV dataset pattern from config
-        # Default pattern should work with Mastodon
         dataset_pattern = out_cfg.get("bdv_dataset_name", "t{t:05d}/s00/0/cells")
-        
-        # Ensure pattern has {t} placeholder
-        if '{t' not in dataset_pattern:
-            print(f"WARNING: BDV dataset pattern missing {{t}} placeholder: {dataset_pattern}")
+
+        if "{t" not in dataset_pattern:
+            print(
+                f"WARNING: BDV dataset pattern missing {{t}} placeholder: {dataset_pattern}"
+            )
             print("  Using default pattern: t{{t:05d}}/s00/0/cells")
             dataset_pattern = "t{t:05d}/s00/0/cells"
-        
+
         hyperstack_meta["processing"]["bdv_dataset_pattern"] = dataset_pattern
 
         write_bdv_hdf5(
