@@ -1,132 +1,49 @@
 #!/usr/bin/env nextflow
 
 /*
- * ============================================================================
- * SPIM 4D Image Processing Pipeline - WITH OPTIONAL ROI CROPPING
- * ============================================================================
- *
- * This pipeline processes 4D SPIM images through:
- * 0. OPTIONAL: ROI-based cropping using Fiji (if roi_path provided in config)
- * 1. File parsing with timepoint extraction (t0051_Channel 1.tif format)
- * 2. Preprocessing and deconvolution per timepoint
- * 3. Cellpose segmentation per timepoint
- * 4. Merging all timepoints into a single 4D hyperstack with preserved metadata
- *
- * All parameters are loaded from a JSON configuration file for reproducibility.
- *
- * NEW: Optional ROI cropping with Fiji
- * NEW: Flexible voxel size configuration - auto-detect or manual override
- * FIX: Robust file finding that handles spaces in filenames and scaling mismatches
- * FIX: External Python script for merge process to avoid Nextflow parsing issues
+ * SPIM 4D Image Processing Pipeline
+ * IMP Vienna - Andrés Gordo & Guilherme Ventura
+ * 
+ * Processes lightsheet microscopy data: deconvolution, segmentation, and merging
+ * into a BigDataViewer-compatible 4D stack.
  */
 
 nextflow.enable.dsl=2
 
-// ============================================================================
-// PARAMETER DEFINITIONS
-// ============================================================================
-
-params.input_dir = null
-params.output_dir = null
+// Parameters - only config_json is required, everything else comes from it
 params.config_json = null
-params.channel = 1
 params.preprocessing_script = './spim_pipeline_fixed.py'
 params.merge_script = './merge_hyperstack.py'
-params.container = 'docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-e455de8'
-params.fiji_container = 'docker://fiji/fiji:20220415'
 params.help = false
 
-// Show help message
 if (params.help) {
     log.info """
-    ============================================================================
-    SPIM 4D Image Processing Pipeline with Optional ROI Cropping
-    ============================================================================
-
-    Usage:
-        nextflow run spim_pipeline_with_roi.nf \\
-            --input_dir <path> \\
-            --output_dir <path> \\
-            --config_json <path> \\
-            [options]
-
-    Required Arguments:
-        --input_dir         Directory containing input timepoint TIFF images
-                           (format: t0001_Channel 1.tif, t0002_Channel 1.tif, etc.)
-        --output_dir        Directory for all pipeline outputs
-        --config_json       JSON file with processing parameters
-
-    Optional Arguments:
-        --channel               Channel number to process (default: 1)
-        --preprocessing_script  Path to preprocessing Python script
-                               (default: ./spim_pipeline_fixed.py)
-        --merge_script         Path to merge Python script
-                               (default: ./merge_hyperstack.py)
-        --container             Singularity/Docker container image
-                               (default: docker://ghcr.io/andresgordoortiz/spim_preprocessing:sha-e455de8)
-        --fiji_container        Fiji container for ROI cropping
-                               (default: docker://fiji/fiji:20220415)
-        --help                 Show this help message
-
-    ROI Cropping (in config.json):
-        roi_cropping.enabled: true/false - Enable ROI cropping step
-        roi_cropping.roi_path: "/path/to/file.roi" - Path to ImageJ ROI file
-
-        NOTE: ROI should be created from one timepoint's raw image. It will be
-        applied to ALL timepoints. Cropping preserves voxel spacing but reduces
-        image dimensions.
-
-    Voxel Size Configuration (in config.json):
-        voxel_size.auto_detect: true  - Auto-detect from image metadata (default)
-                                false - Use manual values specified in config
-        voxel_size.x_um, y_um, z_um   - Manual voxel sizes (used if auto_detect=false)
-
-    Output Structure:
-        output_dir/
-        ├── 00_cropped/          - ROI-cropped images (if enabled)
-        ├── 01_preprocessed/     - Preprocessed & deconvolved images per timepoint
-        ├── 02_segmented/        - Cellpose segmentation masks per timepoint
-        ├── 03_hyperstack/       - Final 4D merged hyperstack with metadata
-        ├── metadata/            - Preserved metadata files
-        ├── logs/                - Processing logs
-        └── reports/             - QC reports
-
-    Example with ROI cropping:
-        nextflow run spim_pipeline_with_roi.nf \\
-            --input_dir ./data \\
-            --output_dir ./output \\
-            --config_json config_with_roi.json \\
-            --channel 2
-
-    ============================================================================
+    SPIM 4D Image Processing Pipeline
+    ---------------------------------
+    Usage: nextflow run spim_pipeline.nf --config_json config.json
+    
+    All settings are in config.json.
+    Submit with: sbatch submit_pipeline.sh
     """.stripIndent()
     exit 0
 }
 
-// Validate required parameters
-if (!params.input_dir || !params.output_dir || !params.config_json) {
-    log.error "ERROR: Missing required parameters!"
-    log.error "Required: --input_dir, --output_dir, --config_json"
-    log.error "Run with --help for usage information"
+if (!params.config_json) {
+    log.error "Missing --config_json parameter"
     exit 1
 }
 
-// Validate preprocessing script exists
 if (!file(params.preprocessing_script).exists()) {
-    log.error "ERROR: Preprocessing script not found: ${params.preprocessing_script}"
+    log.error "Preprocessing script not found: ${params.preprocessing_script}"
     exit 1
 }
 
-// Validate merge script exists
 if (!file(params.merge_script).exists()) {
-    log.error "ERROR: Merge script not found: ${params.merge_script}"
+    log.error "Merge script not found: ${params.merge_script}"
     exit 1
 }
 
-// ============================================================================
-// LOAD CONFIGURATION
-// ============================================================================
-
+// Load configuration from JSON
 def loadConfig(json_path) {
     def jsonSlurper = new groovy.json.JsonSlurper()
     return jsonSlurper.parse(new File(json_path))
@@ -134,71 +51,52 @@ def loadConfig(json_path) {
 
 config = loadConfig(params.config_json)
 
-// Validate voxel_size configuration
-if (!config.containsKey('voxel_size')) {
-    log.warn "WARNING: No 'voxel_size' section in config - defaulting to auto-detect"
-    config.voxel_size = [auto_detect: true]
+// Extract main parameters from config
+params.input_dir = config.input.directory
+params.output_dir = config.output.directory
+params.channel = config.input.channel
+params.container = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
+params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
+
+// Validate input directory
+if (!file(params.input_dir).exists()) {
+    log.error "Input directory not found: ${params.input_dir}"
+    exit 1
 }
 
-// Validate ROI cropping configuration
+// Set defaults for optional config sections
+if (!config.containsKey('voxel_size')) {
+    config.voxel_size = [auto_detect: true]
+}
 if (!config.containsKey('roi_cropping')) {
     config.roi_cropping = [enabled: false]
 }
 
-// Validate ROI file exists if cropping is enabled
+// Validate ROI file if cropping is enabled
 if (config.roi_cropping.enabled) {
-    if (!config.roi_cropping.containsKey('roi_path')) {
-        log.error "ERROR: ROI cropping enabled but no 'roi_path' specified in config"
-        exit 1
-    }
-    if (!file(config.roi_cropping.roi_path).exists()) {
-        log.error "ERROR: ROI file not found: ${config.roi_cropping.roi_path}"
+    if (!config.roi_cropping.containsKey('roi_path') || !file(config.roi_cropping.roi_path).exists()) {
+        log.error "ROI file not found: ${config.roi_cropping.roi_path}"
         exit 1
     }
 }
 
-// ============================================================================
-// WORKFLOW HEADER
-// ============================================================================
-
-def voxel_info = config.voxel_size.auto_detect ?
-    "Auto-detect from image metadata" :
-    "Manual: ${config.voxel_size.x_um} x ${config.voxel_size.y_um} x ${config.voxel_size.z_um} µm"
-
-def roi_info = config.roi_cropping.enabled ?
-    "ENABLED - using ${config.roi_cropping.roi_path}" :
-    "DISABLED"
+// Pipeline startup info
+def voxel_info = config.voxel_size.auto_detect ? "Auto-detect" : "Manual: ${config.voxel_size.x_um} x ${config.voxel_size.y_um} x ${config.voxel_size.z_um} µm"
+def roi_info = config.roi_cropping.enabled ? "Enabled" : "Disabled"
 
 log.info """
-============================================================================
-SPIM 4D Image Processing Pipeline - WITH ROI CROPPING
-============================================================================
-Input directory    : ${params.input_dir}
-Output directory   : ${params.output_dir}
-Configuration      : ${params.config_json}
-Channel to process : ${params.channel}
-ROI Cropping       : ${roi_info}
-Voxel size mode    : ${voxel_info}
-Preprocessing script: ${params.preprocessing_script}
-Merge script       : ${params.merge_script}
-Container          : ${params.container}
-Fiji Container     : ${params.fiji_container}
-
-Pipeline steps:
-  ${config.roi_cropping.enabled ? '0. ROI-based cropping with Fiji (all timepoints)' : ''}
-  1. Parse and sort timepoint files
-  2. Extract/Configure metadata with voxel sizes
-  3. Preprocessing & Deconvolution per timepoint
-  4. Cellpose Segmentation per timepoint
-  5. Merge into 4D hyperstack with preserved metadata
-
-Started at: ${new Date()}
-============================================================================
+================================================
+SPIM Pipeline - IMP Vienna
+================================================
+Input        : ${params.input_dir}
+Output       : ${params.output_dir}
+Channel      : ${params.channel}
+ROI Cropping : ${roi_info}
+Voxel Size   : ${voxel_info}
+================================================
 """.stripIndent()
 
-// ============================================================================
-// PROCESS: ROI-based Cropping with Fiji (OPTIONAL)
-// ============================================================================
+// Process: ROI-based Cropping (optional)
 
 process CROP_WITH_ROI {
     tag "t${String.format('%04d', timepoint)}"
@@ -953,6 +851,7 @@ process CELLPOSE_SEGMENT {
     tuple val(timepoint), path(processed_file)
     path metadata_json
     val segment_config
+    val image_scaling
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_segmented.tif"), emit: segmented
@@ -1049,15 +948,12 @@ import numpy as np
 with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
-# Load config
-config = json.loads('${config_json_str}')
-
 # Load mask
 mask = tifffile.imread("t${t_formatted}_segmented.tif")
 
 # Calculate voxel sizes (accounting for preprocessing scaling)
-x_res = metadata['x_resolution_um'] / config['image_scaling']
-y_res = metadata['y_resolution_um'] / config['image_scaling']
+x_res = metadata['x_resolution_um'] / ${image_scaling}
+y_res = metadata['y_resolution_um'] / ${image_scaling}
 z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
 
 # Re-save with metadata
@@ -1531,7 +1427,8 @@ workflow {
     CELLPOSE_SEGMENT(
         PREPROCESS_DECONVOLVE.out.processed,
         shared_metadata,
-        config.segmentation
+        config.segmentation,
+        config.preprocessing.image_scaling
     )
 
     // 4. Collect all segmented timepoints and merge into 4D hyperstack

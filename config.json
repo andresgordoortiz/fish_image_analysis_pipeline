@@ -1,0 +1,84 @@
+{
+  "pipeline": {
+    "name": "SPIM 4D Image Processing Pipeline",
+    "version": "1.0.0",
+    "author": "Andrés Gordo & Guillherme Ventura",
+    "institute": "IMP Vienna"
+  },
+
+  "input": {
+    "directory": "/groups/pinheiro/user/guilherme.ventura/2025/processed/M45/2025-05-28/concatenated_v2/stack_concatenation_v2/",
+    "channel": 2
+  },
+
+  "output": {
+    "directory": "./results/",
+    "format": "bdv",
+    "correct_y": false
+  },
+
+  "seqera_tower": {
+    "enabled": true,
+    "access_token": "eyJ0aWQiOiAxMzM2Nn0uZWRlMTAxYmIzZGE4ZDNjMzJjM2M1MmZkZThhNjBhZGI2M2EyNjE4Mg=="
+  },
+
+  "roi_cropping": {
+    "enabled": true,
+    "roi_path": "./medaka_spim_crop.roi"
+  },
+
+  "voxel_size": {
+    "auto_detect": false,
+    "x_um": 0.347,
+    "y_um": 0.347,
+    "z_um": 2.0
+  },
+
+  "preprocessing": {
+    "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
+    "image_scaling": 0.5,
+    "deconvolution": {
+      "niter": 6,
+      "niterz": 6,
+      "padding": 32
+    },
+    "normalization": {
+      "min_v": 0,
+      "max_v": 65535,
+      "percentile_low": 40.0,
+      "percentile_high": 99.99
+    },
+    "background_subtraction": {
+      "resolution_px0": 10,
+      "resolution_pz0": 10,
+      "noise_lvl": 2
+    },
+    "postprocessing": {
+      "sigma": 1.0
+    },
+    "correction_flags": {
+      "no_clahe": false,
+      "no_z_correction": false,
+      "no_shading": false
+    }
+  },
+
+  "segmentation": {
+    "model": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Thomas/cellpose/models/cpsam_Gui_tracking_20250801",
+    "diameter": 30,
+    "flow_threshold": 0.8,
+    "cellprob_threshold": 0.0,
+    "use_gpu": true,
+    "do_3d": true,
+    "save_tif": true,
+    "save_flows": false,
+    "save_npy": false
+  },
+
+  "system": {
+    "container_image": "library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559",
+    "fiji_container_image": "docker://fiji/fiji:20220415",
+    "profile": "standard",
+    "resume": true
+  }
+}

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Merge segmented timepoints into 4D hyperstack (TIFF or BDV/HDF5 format).
-Uses pybdv.make_bdv which automatically handles both HDF5 and XML generation.
+Merge segmented timepoints into 4D hyperstack.
+Supports TIFF or BigDataViewer HDF5+XML formats.
 
-FIXED: Removed manual write_xml_metadata() call - make_bdv() handles everything!
+IMP Vienna - Andrés Gordo & Guilherme Ventura
 """
 
 import json
@@ -13,17 +13,16 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
-# Try importing pybdv
 try:
     import pybdv
 except ImportError:
-    print("pybdv not found. Attempting install...")
+    print("Installing pybdv...")
     os.system("micromamba install -y -n microscopy_env -c conda-forge pybdv")
     import pybdv
 
 
 def detect_flip_needed(first_path):
-    """Auto-detect if Y-axis flip is needed based on TIFF orientation tag."""
+    """Check TIFF orientation tag to determine if Y-flip is needed."""
     try:
         with tifffile.TiffFile(str(first_path)) as tf:
             page = tf.pages[0]
@@ -40,10 +39,7 @@ def detect_flip_needed(first_path):
 def write_tiff_hyperstack(
     img4d, final_x_res, final_y_res, final_z_spacing, need_flip, hyperstack_meta
 ):
-    """Write 4D array as standard TIFF hyperstack."""
-    print("\n" + "=" * 60)
-    print("Writing TIFF hyperstack")
-    print("=" * 60)
+    """Write 4D array as ImageJ-compatible TIFF hyperstack."""
 
     # Save Metadata
     with open("4D_hyperstack_metadata.json", "w") as fh:
@@ -71,13 +67,7 @@ def write_tiff_hyperstack(
 def write_bdv_hdf5(
     seg_files, final_x_res, final_y_res, final_z_spacing, need_flip, hyperstack_meta
 ):
-    """
-    Write timepoints using pybdv.make_bdv.
-    This function generates both HDF5 and XML automatically - NO manual XML writing needed!
-    
-    CRITICAL FIX: pybdv.make_bdv() automatically creates the XML file.
-    DO NOT call write_xml_metadata() separately - it causes API conflicts!
-    """
+    """Write timepoints as BigDataViewer HDF5+XML using pybdv."""
     print("\n" + "=" * 60)
     print("Writing BDV HDF5 + XML (via pybdv.make_bdv)")
     print("=" * 60)

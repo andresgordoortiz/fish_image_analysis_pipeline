@@ -1,328 +1,181 @@
-# SPIM 4D Image Processing Pipeline - Corrected Version
+# SPIM 4D Image Processing Pipeline
 
-## 🔧 Key Changes from Original Pipeline
+A Nextflow pipeline for processing lightsheet microscopy (SPIM) data: deconvolution, segmentation with Cellpose, and merging into BigDataViewer-compatible 4D stacks.
 
-### 1. **File Naming Pattern Recognition**
-The corrected pipeline properly handles the specific naming convention:
-- **Pattern**: `t0051_Channel 1.tif`, `t0052_Channel 1.tif`, etc.
-- **Features**:
-  - Extracts timepoint number from `t####` prefix
-  - Handles the space in "Channel #" correctly
-  - Filters by channel number (default: 1, configurable via `--channel`)
-  - Sorts timepoints numerically for correct ordering
+**Authors:** Andrés Gordo & Guilherme Ventura  
+**Institute:** IMP Vienna
 
-### 2. **Simplified Workflow**
-The pipeline now follows your actual requirements:
+---
 
-```
-Input: Individual 3D Z-stacks per timepoint
-  ↓
-Step 1: Extract metadata from each timepoint
-  ↓
-Step 2: Preprocess & deconvolve each timepoint
-  ↓
-Step 3: Cellpose segmentation on each timepoint
-  ↓
-Step 4: Merge all timepoints into single 4D hyperstack
-  ↓
-Output: 4D_hyperstack.tif (TZYX with preserved metadata)
-```
+## Quick Start
 
-### 3. **Removed Unnecessary Steps**
-- ❌ Removed: Initial 4D splitting (files are already individual timepoints)
-- ❌ Removed: TrackMate tracking (can be done separately on the final hyperstack)
-- ✅ Kept: Essential processing and metadata preservation
-
-### 4. **Metadata Preservation**
-- Extracts and preserves voxel size from original images
-- Accounts for scaling during preprocessing
-- Properly sets ImageJ metadata in final hyperstack:
-  - Axes order: TZYX
-  - Frame count
-  - Slice count
-  - Resolution (X, Y)
-  - Z-spacing
-
-## 📋 Usage
-
-### Basic Command
 ```bash
-nextflow run spim_pipeline_fixed.nf \
-    --input_dir /path/to/timepoint/images \
-    --output_dir /path/to/output \
-    --config_json config.json \
-    --channel 1
+# 1. Clone the repository
+git clone https://github.com/andresgordoortiz/spim_preprocessing.git
+cd spim_preprocessing
+
+# 2. Edit the configuration file
+nano config.json    # Set your input/output paths and parameters
+
+# 3. Submit to the cluster
+sbatch submit_pipeline.sh
 ```
 
-### Parameters
-- `--input_dir`: Directory containing `t####_Channel #.tif` files
-- `--output_dir`: Where to save all outputs
-- `--config_json`: Configuration file (see example below)
-- `--channel`: Channel number to process (default: 1)
-- `--container`: Container image (has default value)
+That's it! The pipeline handles everything else.
 
-### Example Input Directory Structure
-```
-input_dir/
-├── t0001_Channel 1.tif  ← Z-stack, timepoint 1
-├── t0002_Channel 1.tif  ← Z-stack, timepoint 2
-├── t0003_Channel 1.tif
-├── t0004_Channel 1.tif
-└── ...
-├── t0001_Channel 2.tif  ← Will be ignored if --channel 1
-└── ...
-```
+---
 
-### Output Directory Structure
-```
-output_dir/
-├── 01_preprocessed/
-│   ├── t0001_processed.tif
-│   ├── t0002_processed.tif
-│   └── ...
-├── 02_segmented/
-│   ├── t0001_segmented.tif
-│   ├── t0002_segmented.tif
-│   └── ...
-├── 03_hyperstack/
-│   ├── 4D_hyperstack.tif          ← FINAL OUTPUT
-│   └── 4D_hyperstack_metadata.json
-├── metadata/
-│   ├── t0001_metadata.json
-│   ├── t0002_metadata.json
-│   └── ...
-├── logs/
-│   ├── preprocessing/
-│   └── segmentation/
-└── reports/
-    ├── pipeline_report.html
-    └── pipeline_summary.json
-```
+## What This Pipeline Does
 
-## ⚙️ Configuration File
+1. **ROI Cropping** (optional) — Crop all timepoints using an ImageJ ROI file
+2. **Preprocessing** — Shading correction, Z-intensity normalization, deconvolution
+3. **Segmentation** — 3D cell segmentation with Cellpose
+4. **Merging** — Combine all timepoints into a single 4D stack (TIFF or BigDataViewer HDF5)
 
-The configuration JSON has been updated to match the actual structure used in the code:
+---
+
+## Configuration
+
+All settings are in `config.json`. Here's what you need to change:
+
+### Essential Settings
 
 ```json
 {
-  "pipeline_info": {
-    "version": "1.0.0",
-    "description": "SPIM Pipeline Configuration",
-    "experiment": "Your experiment name"
+  "input": {
+    "directory": "/path/to/your/tiff/files/",
+    "channel": 2
   },
-
-  "preprocessing": {
-    "psf_path": "/path/to/PSF.tif",
-    "image_scaling": 0.5,
-
-    "deconvolution": {
-      "niter": 6,
-      "niterz": 6,
-      "padding": 32
-    },
-
-    "normalization": {
-      "min_v": 0,
-      "max_v": 65535,
-      "percentile_low": 40.0,
-      "percentile_high": 99.99
-    },
-
-    "background_subtraction": {
-      "resolution_px0": 10,
-      "resolution_pz0": 10,
-      "noise_lvl": 2
-    },
-
-    "postprocessing": {
-      "sigma": 1.0
-    },
-
-    "correction_flags": {
-      "no_clahe": false,
-      "no_z_correction": false,
-      "no_shading": false
-    }
-  },
-
-  "segmentation": {
-    "model": "/path/to/cellpose/model",
-    "diameter": 30,
-    "flow_threshold": 0.8,
-    "cellprob_threshold": 0.0,
-    "use_gpu": true,
-    "do_3d": true,
-    "save_tif": true,
-    "save_flows": false,
-    "save_npy": false,
-    "image_scaling": 0.5
+  "output": {
+    "directory": "./results/",
+    "format": "bdv"
   }
 }
 ```
 
-### Critical Configuration Notes
+Your input files should be named like: `t0001_Channel 1.tif`, `t0002_Channel 1.tif`, etc.
 
-1. **`image_scaling`**: Must be the same in both preprocessing and segmentation sections
-   - This ensures voxel sizes are calculated correctly
-   - Example: 0.5 = 50% downsampling
+### Voxel Size
 
-2. **`diameter`**: Cellpose cell diameter in pixels
-   - ⚠️ **NEVER use 0 for 3D segmentation** (will cause errors)
-   - Should match expected cell size after scaling
-   - Example: 30 pixels ≈ 15 µm diameter cells at 0.5 µm/pixel
+Either auto-detect from image metadata or set manually:
 
-3. **`do_3d`**: Must be `true` for volumetric Z-stacks
-
-## 🔍 Key Differences from Original
-
-| Aspect | Original | Corrected |
-|--------|----------|-----------|
-| Input assumption | Single 4D TIFF | Multiple 3D TIFFs (one per timepoint) |
-| File parsing | Generic pattern | Specific `t####_Channel #.tif` pattern |
-| Channel selection | Not available | `--channel` parameter |
-| Workflow | Split → Process → Merge → Track | Process → Merge |
-| Output | Tracked XML + CSV | 4D hyperstack TIFF |
-| Tracking | Built-in TrackMate | Separate step (on final hyperstack) |
-
-## 🎯 Use Cases
-
-### After Pipeline Completion
-
-The final `4D_hyperstack.tif` can be used for:
-
-1. **TrackMate tracking** (if needed):
-   - Open in Fiji/ImageJ
-   - Plugins → Tracking → TrackMate
-   - Use "Label image detector" since it's already segmented
-
-2. **Direct visualization**:
-   - Open in Fiji/ImageJ
-   - Already has correct voxel size metadata
-   - Can view as hyperstack (Image → Hyperstacks → Stack to Hyperstack)
-
-3. **Further analysis**:
-   - Load in Python with tifffile
-   - Analyze cell volumes, shapes, movements
-   - Export to other formats
-
-## 🐛 Troubleshooting
-
-### Problem: "No files found"
-**Solution**: Check that:
-- Files are named exactly as `t####_Channel #.tif`
-- There's a space between "Channel" and the number
-- The channel number matches your `--channel` parameter
-
-### Problem: "Could not parse timepoint"
-**Solution**: Verify filename format. The `t####` must be:
-- Lowercase 't'
-- Followed by digits
-- Example: `t0001`, `t0051`, `t0123`
-
-### Problem: Cellpose "diameter cannot be 0"
-**Solution**: In config.json, set a specific diameter value:
 ```json
-"diameter": 30  // NOT 0 for 3D!
+{
+  "voxel_size": {
+    "auto_detect": false,
+    "x_um": 0.347,
+    "y_um": 0.347,
+    "z_um": 2.0
+  }
+}
 ```
 
-### Problem: Inconsistent voxel sizes
-**Solution**: Ensure `image_scaling` is identical in both sections:
+### ROI Cropping (Optional)
+
+To crop all timepoints to a region of interest:
+
 ```json
-"preprocessing": {
-  "image_scaling": 0.5
-},
-"segmentation": {
-  "image_scaling": 0.5  // Must match!
+{
+  "roi_cropping": {
+    "enabled": true,
+    "roi_path": "./my_crop_region.roi"
+  }
 }
 ```
 
-## 📊 Expected Timeline
+Create the `.roi` file in ImageJ/Fiji by drawing a rectangle on one of your images and saving it (`Edit > Selection > Save...`).
 
-For a typical dataset (50 timepoints, 512×512×100 per timepoint):
+### Seqera Tower (Optional)
 
-| Step | Time per Timepoint | Total Time |
-|------|-------------------|------------|
-| Metadata extraction | < 1 min | < 1 hour |
-| Preprocessing | 5-10 min | 4-8 hours |
-| Segmentation | 2-5 min | 2-4 hours |
-| Merging | N/A | < 5 min |
-| **Total** | | **~6-13 hours** |
+Track your pipeline runs online at [tower.nf](https://tower.nf):
 
-Times depend on:
-- GPU availability
-- Image size
-- Number of iterations
-- Cluster load
+1. Create an account and get your access token
+2. Add it to the config:
 
-## 🚀 Running on SLURM Cluster
-
-Create a `nextflow.config` file:
-
-```groovy
-process {
-    executor = 'slurm'
-    queue = 'gpu'
-
-    withName: PREPROCESS_DECONVOLVE {
-        cpus = 8
-        memory = '64 GB'
-        time = '2h'
-        clusterOptions = '--gres=gpu:1'
-    }
-
-    withName: CELLPOSE_SEGMENT {
-        cpus = 4
-        memory = '64 GB'
-        time = '2h'
-        clusterOptions = '--gres=gpu:1 --exclude=clip-g1-[0-6]'
-    }
-
-    withName: MERGE_TO_HYPERSTACK {
-        cpus = 4
-        memory = '32 GB'
-        time = '30m'
-    }
-}
-
-singularity {
-    enabled = true
-    autoMounts = true
+```json
+{
+  "seqera_tower": {
+    "enabled": true,
+    "access_token": "your-token-here"
+  }
 }
 ```
 
-Then run:
+---
+
+## Output Structure
+
+```
+results/
+├── 00_cropped/           # ROI-cropped images (if enabled)
+├── 01_preprocessed/      # Deconvolved images per timepoint
+├── 02_segmented/         # Cellpose segmentation masks
+├── 03_hyperstack/        # Final 4D stack (HDF5+XML or TIFF)
+├── logs/                 # Processing logs
+├── metadata/             # Voxel size and image metadata
+└── reports/              # QC report and Nextflow reports
+```
+
+The final output in `03_hyperstack/` can be opened directly in BigDataViewer or Fiji.
+
+---
+
+## Container
+
+The pipeline uses a pre-built Singularity container hosted on Sylabs Cloud. On first run, it will be automatically pulled (~45 minutes). 
+
+---
+
+## Cluster Requirements
+
+- SLURM scheduler
+- Nextflow 23.04+
+- Singularity/Apptainer
+- GPU nodes (for deconvolution and Cellpose)
+
+The pipeline is configured for the IMP cluster but can be adapted to other SLURM environments by editing `nextflow.config`.
+
+---
+
+## Troubleshooting
+
+**Pipeline fails immediately:**
+- Check that your input directory exists and contains TIFF files
+- Verify the filename pattern matches `t####_Channel #.tif`
+
+**Out of memory:**
+- Edit `nextflow.config` to increase memory for specific processes
+
+**Singularity pull timeout:**
+- Use a pre-built `.sif` file (see above)
+- Or increase `pullTimeout` in `nextflow.config`
+
+**Resume after failure:**
+- The pipeline automatically resumes from where it left off
+- Just run `sbatch submit_pipeline.sh` again
+
+---
+
+## Advanced: Running Locally
+
+For testing on a local machine:
+
 ```bash
-nextflow run spim_pipeline_fixed.nf \
-    --input_dir /groups/yourlab/data/raw \
-    --output_dir /groups/yourlab/data/processed \
+nextflow run spim_pipeline.nf \
     --config_json config.json \
-    --channel 1 \
-    -c nextflow.config
+    -profile local
 ```
 
-## 📝 Notes
+---
 
-1. **Parallelization**: Each timepoint is processed independently, so the pipeline automatically parallelizes across available resources.
+## Citation
 
-2. **Resume capability**: Nextflow supports `-resume` to continue from where it stopped if interrupted.
+If you use this pipeline, please cite:
 
-3. **Memory requirements**: Adjust based on your image sizes. Larger images need more memory.
+> Gordo A., Ventura G. (2026). SPIM 4D Image Processing Pipeline. IMP Vienna.
 
-4. **GPU requirements**: Both preprocessing (deconvolution) and segmentation benefit from GPU acceleration.
+---
 
-## 📚 Related Files
+## Contact
 
-- `spim_pipeline_fixed.nf` - Main Nextflow pipeline
-- `config.json` - Configuration parameters
-- `spim_pipeline_fixed.py` - Preprocessing script (assumed to exist in container)
-
-## 🔗 Dependencies
-
-The container should include:
-- Python 3.8+
-- tifffile
-- numpy
-- cellpose
-- Preprocessing script (`spim_pipeline_fixed.py`)
-
-All handled by the specified container image.
+- **Andrés Gordo** — andres.ortiz@imp.ac.at

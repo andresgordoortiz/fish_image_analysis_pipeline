@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+"""
+SPIM Image Preprocessing Pipeline
+IMP Vienna - Andrés Gordo & Guilherme Ventura
+
+Deconvolution and preprocessing for lightsheet microscopy data.
+"""
+
 import argparse
 import psutil
 import time
@@ -15,9 +23,9 @@ from tqdm import tqdm
 from typing import Optional, Tuple
 import subprocess
 
-# --- FUNCTIONS (UNCHANGED FROM ORIGINAL) ---
 
 def image_scaling_intens(img, min_val, max_val, print_res=False):
+    """Normalize image intensity to given range."""
     img_shape = img.shape
     img_type = img.dtype
     img_min = np.amin(img)
@@ -25,7 +33,14 @@ def image_scaling_intens(img, min_val, max_val, print_res=False):
 
     if img_shape[0] < 300:
         img = np.reshape(img, newshape=-1)
-        img = cv2.normalize(img, None, alpha=min_val, beta=max_val, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+        img = cv2.normalize(
+            img,
+            None,
+            alpha=min_val,
+            beta=max_val,
+            norm_type=cv2.NORM_MINMAX,
+            dtype=cv2.CV_32F,
+        )
         img = np.reshape(img, newshape=img_shape)
     else:
         scale = img_max - img_min
@@ -37,39 +52,51 @@ def image_scaling_intens(img, min_val, max_val, print_res=False):
     if print_res == True:
         newimg_min = np.amin(img)
         newimg_max = np.amax(img)
-        print('     -Intensity Norm  from (%d , %d) to  (%d, %d) ' % (img_min, img_max, newimg_min, newimg_max))
+        print(
+            "     -Intensity Norm  from (%d , %d) to  (%d, %d) "
+            % (img_min, img_max, newimg_min, newimg_max)
+        )
 
     return img
 
+
 def read_tiff_voxel_size(file_path):
+    """Extract voxel size from TIFF metadata."""
+
     def _xy_voxel_size(tags, key):
-        assert key in ['XResolution', 'YResolution']
+        assert key in ["XResolution", "YResolution"]
         if key in tags:
             num_pixels, units = tags[key].value
             return units / num_pixels
-        return 1.
+        return 1.0
 
     with tifffile.TiffFile(file_path) as tiff:
         image_metadata = tiff.imagej_metadata
         if image_metadata is not None:
-            z = image_metadata.get('spacing', 1.)
+            z = image_metadata.get("spacing", 1.0)
         else:
-            z = 1.
+            z = 1.0
 
         tags = tiff.pages[0].tags
-        y = _xy_voxel_size(tags, 'YResolution')
-        x = _xy_voxel_size(tags, 'XResolution')
+        y = _xy_voxel_size(tags, "YResolution")
+        x = _xy_voxel_size(tags, "XResolution")
 
         return [x, y, z]
 
+
 def read_nd2_voxel_size(image):
+    """Extract voxel size from ND2 metadata."""
     md = image.metadata
     x = md["pixel_microns"]
     y = md["pixel_microns"]
     z = 3.0
     return [x, y, z]
 
-def z_intensity_correction(stack: np.ndarray, z_axis: int = 0, method: str = "p95", smooth_window: int = 9, eps: float = 1e-8, preserve_dtype: bool = True):
+
+def z_intensity_correction(
+    stack, z_axis=0, method="p95", smooth_window=9, eps=1e-8, preserve_dtype=True
+):
+    """Correct intensity variation along Z axis."""
     if stack.ndim != 3:
         raise ValueError(f"Expected 3D stack, got {stack.shape}")
     x = np.moveaxis(stack, z_axis, 0).astype(np.float32, copy=False)
@@ -103,9 +130,15 @@ def z_intensity_correction(stack: np.ndarray, z_axis: int = 0, method: str = "p9
         y = y.astype(stack.dtype, copy=False)
     return y, scales
 
-def shading_correct_xy_estimated(stack: np.ndarray, sigma_xy: float = 64.0, z_axis: int = 0, per_slice: bool = False, eps: float = 1e-6, preserve_dtype: bool = True):
+
+def shading_correct_xy_estimated(
+    stack, sigma_xy=64.0, z_axis=0, per_slice=False, eps=1e-6, preserve_dtype=True
+):
+    """Correct XY shading using estimated illumination profile."""
     if stack.ndim != 3:
-        raise ValueError(f"Expected a 3D stack, got shape {stack.shape} (ndim={stack.ndim}).")
+        raise ValueError(
+            f"Expected a 3D stack, got shape {stack.shape} (ndim={stack.ndim})."
+        )
     in_dtype = stack.dtype
     x = np.moveaxis(stack.astype(np.float32, copy=False), z_axis, 0)
     if per_slice:
@@ -132,9 +165,20 @@ def shading_correct_xy_estimated(stack: np.ndarray, sigma_xy: float = 64.0, z_ax
         corrected = corrected.astype(in_dtype, copy=False)
     return corrected, field
 
-def clahe_3d_stack(stack: np.ndarray, clip_limit: float = 0.01, kernel_size: Optional[Tuple[int, int]] = None, axis: int = 0, preserve_dtype: bool = True, p_low: float = 0.5, p_high: float = 99.5, eps: float = 1e-8):
-    print("Applying clahe_3d_stack")
+
+def clahe_3d_stack(
+    stack,
+    clip_limit=0.01,
+    kernel_size=None,
+    axis=0,
+    preserve_dtype=True,
+    p_low=0.5,
+    p_high=99.5,
+    eps=1e-8,
+):
+    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to 3D stack."""
     from skimage import exposure
+
     if stack.ndim != 3:
         raise ValueError(f"Expected a 3D stack, got shape {stack.shape}")
     in_dtype = stack.dtype
@@ -149,7 +193,9 @@ def clahe_3d_stack(stack: np.ndarray, clip_limit: float = 0.01, kernel_size: Opt
             continue
         img01 = np.clip(img, lo, hi)
         img01 = (img01 - lo) / (hi - lo)
-        out[i] = exposure.equalize_adapthist(img01, kernel_size=kernel_size, clip_limit=clip_limit).astype(np.float32, copy=False)
+        out[i] = exposure.equalize_adapthist(
+            img01, kernel_size=kernel_size, clip_limit=clip_limit
+        ).astype(np.float32, copy=False)
     out = np.moveaxis(out, 0, axis)
     if not preserve_dtype:
         return out
@@ -159,38 +205,51 @@ def clahe_3d_stack(stack: np.ndarray, clip_limit: float = 0.01, kernel_size: Opt
         return out
     return out.astype(in_dtype, copy=False)
 
+
 def reslice(img, position, x_res, z_res):
+    """Reslice image to isotropic voxels."""
     scale = z_res / x_res
     z, y, x = img.shape
     new_z = round(z * scale)
     img_max = np.amax(img).astype(np.float32)
     img_normalized = img.astype(np.float32) / img_max
-    if position == 'xz':
+    if position == "xz":
         reslice_img = np.transpose(img_normalized, [1, 0, 2])
         scale_img = np.zeros((y, new_z, x), dtype=np.float32)
         for i in range(y):
-            scale_img[i] = resize(reslice_img[i], (new_z, x), order=3, anti_aliasing=True)
-    elif position == 'yz':
+            scale_img[i] = resize(
+                reslice_img[i], (new_z, x), order=3, anti_aliasing=True
+            )
+    elif position == "yz":
         reslice_img = np.transpose(img_normalized, [2, 0, 1])
         scale_img = np.zeros((x, new_z, y), dtype=np.float32)
         for i in range(x):
-            scale_img[i] = resize(reslice_img[i], (new_z, y), order=3, anti_aliasing=True)
-    elif position == 'xy':
+            scale_img[i] = resize(
+                reslice_img[i], (new_z, y), order=3, anti_aliasing=True
+            )
+    elif position == "xy":
         reslice_img = np.transpose(img_normalized, [1, 0, 2])
         scale_img = np.zeros((y, new_z, x), dtype=np.float32)
         for i in range(y):
-            scale_img[i] = resize(reslice_img[i], (new_z, x), order=3, anti_aliasing=True)
+            scale_img[i] = resize(
+                reslice_img[i], (new_z, x), order=3, anti_aliasing=True
+            )
         scale_img = np.transpose(scale_img, [1, 0, 2])
     scale_img[scale_img < 0] = 0
     scale_img[scale_img > 1] = 1
     rescaled_img = (scale_img * img_max).astype(np.uint16)
     return rescaled_img
 
+
 def image_postprocessing(img, resolution_px, resolution_pz, noise_lvl, sigma):
+    """Apply background subtraction and Gaussian smoothing."""
     steps = []
-    if resolution_px > 0: steps.append("Remove Background/Noise")
-    if resolution_pz > 0: steps.append("Remove Background/Noise z")
-    if sigma > 0: steps.append("Gaussian Smoothing")
+    if resolution_px > 0:
+        steps.append("Remove Background/Noise")
+    if resolution_pz > 0:
+        steps.append("Remove Background/Noise z")
+    if sigma > 0:
+        steps.append("Gaussian Smoothing")
     pbar = tqdm(total=len(steps), desc="Postprocessing Image", unit="step")
     if resolution_px > 0:
         img = WBNS_image(img, resolution_px, noise_lvl)
@@ -206,13 +265,18 @@ def image_postprocessing(img, resolution_px, resolution_pz, noise_lvl, sigma):
     pbar.close()
     return img
 
+
 def getNormalizationThresholds(img, percentiles):
-    if np.ndim(img) > 1: img = img.flatten()
+    """Calculate intensity thresholds for normalization."""
+    if np.ndim(img) > 1:
+        img = img.flatten()
     low_thres = np.percentile(img, percentiles[0])
     high_thres = np.percentile(img, percentiles[1])
     return low_thres, high_thres
 
+
 def remove_outliers_image(img, low_thres, high_thres, print_res=False):
+    """Clip intensity outliers."""
     if print_res == True:
         img_min = np.amin(img)
         img_max = np.amax(img)
@@ -222,60 +286,123 @@ def remove_outliers_image(img, low_thres, high_thres, print_res=False):
     if print_res == True:
         newimg_min = np.amin(img)
         newimg_max = np.amax(img)
-        print('Cropping Intensity from (%d , %d) to  (%d, %d) ' % (img_min, img_max, newimg_min, newimg_max))
+        print(
+            "Cropping Intensity from (%d , %d) to  (%d, %d) "
+            % (img_min, img_max, newimg_min, newimg_max)
+        )
     return img
 
+
 def print_resource_usage():
+    """Print current CPU, RAM, and GPU usage."""
     vm = psutil.virtual_memory()
     cpu_pct = psutil.cpu_percent(interval=0.1)
-    print(f"    [Resource] CPU: {cpu_pct:.1f}% | RAM: {vm.used / (1024**3):.2f} / {vm.total / (1024**3):.2f} GB ({vm.percent:.1f}%)")
+    print(
+        f"    [Resource] CPU: {cpu_pct:.1f}% | RAM: {vm.used / (1024**3):.2f} / {vm.total / (1024**3):.2f} GB ({vm.percent:.1f}%)"
+    )
     try:
-        result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total',
-                               '--format=csv,noheader,nounits'],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2)
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+        )
         if result.returncode == 0:
-            for i, line in enumerate(result.stdout.strip().split('\n')):
-                util, mem_used, mem_total = line.split(',')
-                print(f"    [GPU {i}] Utilization: {util.strip()}% | Memory: {mem_used.strip()} / {mem_total.strip()} MB")
+            for i, line in enumerate(result.stdout.strip().split("\n")):
+                util, mem_used, mem_total = line.split(",")
+                print(
+                    f"    [GPU {i}] Utilization: {util.strip()}% | Memory: {mem_used.strip()} / {mem_total.strip()} MB"
+                )
     except Exception:
         pass
 
-# --- MAIN FUNCTION ---
 
 def main():
-    parser = argparse.ArgumentParser(description="SPIM Image Preprocessing Pipeline")
+    """Main preprocessing pipeline."""
+    parser = argparse.ArgumentParser(description="SPIM Image Preprocessing")
 
     # Paths
-    parser.add_argument("--input_file", type=str, required=True, help="Path to input image")
+    parser.add_argument(
+        "--input_file", type=str, required=True, help="Path to input image"
+    )
     parser.add_argument("--outdir", type=str, required=True, help="Output directory")
     parser.add_argument("--psf_path", type=str, required=True, help="Path to PSF model")
 
     # Image Parameters
-    parser.add_argument("--image_scaling", type=float, default=1.0, help="Image scaling factor")
-    parser.add_argument("--xy_pixel", type=float, default=0.0, help="Force XY pixel size (um). 0 to read from metadata")
-    parser.add_argument("--z_pixel", type=float, default=0.0, help="Force Z pixel size (um). 0 to read from metadata")
+    parser.add_argument(
+        "--image_scaling", type=float, default=1.0, help="Image scaling factor"
+    )
+    parser.add_argument(
+        "--xy_pixel",
+        type=float,
+        default=0.0,
+        help="Force XY pixel size (um). 0 to read from metadata",
+    )
+    parser.add_argument(
+        "--z_pixel",
+        type=float,
+        default=0.0,
+        help="Force Z pixel size (um). 0 to read from metadata",
+    )
 
     # Processing Flags
     parser.add_argument("--no_clahe", action="store_true", help="Disable CLAHE")
-    parser.add_argument("--no_z_correction", action="store_true", help="Disable Z intensity correction")
-    parser.add_argument("--no_shading", action="store_true", help="Disable Shading correction")
+    parser.add_argument(
+        "--no_z_correction", action="store_true", help="Disable Z intensity correction"
+    )
+    parser.add_argument(
+        "--no_shading", action="store_true", help="Disable Shading correction"
+    )
 
     # Deconvolution Params
-    parser.add_argument("--padding", type=int, default=32, help="Padding for deconvolution")
-    parser.add_argument("--niter", type=int, default=3, help="Iterations for 3D Deconvolution")
-    parser.add_argument("--niterz", type=int, default=3, help="Iterations for 2D XZ Deconvolution")
+    parser.add_argument(
+        "--padding", type=int, default=32, help="Padding for deconvolution"
+    )
+    parser.add_argument(
+        "--niter", type=int, default=3, help="Iterations for 3D Deconvolution"
+    )
+    parser.add_argument(
+        "--niterz", type=int, default=3, help="Iterations for 2D XZ Deconvolution"
+    )
 
     # Normalization Params
-    parser.add_argument("--min_v", type=float, default=0, help="Min value for normalization")
-    parser.add_argument("--max_v", type=float, default=65535, help="Max value for normalization")
-    parser.add_argument("--percentile_low", type=float, default=40, help="Low percentile for outlier removal")
-    parser.add_argument("--percentile_high", type=float, default=99.99, help="High percentile for outlier removal")
+    parser.add_argument(
+        "--min_v", type=float, default=0, help="Min value for normalization"
+    )
+    parser.add_argument(
+        "--max_v", type=float, default=65535, help="Max value for normalization"
+    )
+    parser.add_argument(
+        "--percentile_low",
+        type=float,
+        default=40,
+        help="Low percentile for outlier removal",
+    )
+    parser.add_argument(
+        "--percentile_high",
+        type=float,
+        default=99.99,
+        help="High percentile for outlier removal",
+    )
 
     # Background / Post-processing
-    parser.add_argument("--resolution_px0", type=float, default=10, help="BG Subtraction resolution")
-    parser.add_argument("--resolution_pz0", type=float, default=10, help="BG Subtraction resolution Z")
-    parser.add_argument("--noise_lvl", type=int, default=2, help="Noise level (MUST BE INTEGER)")  # FIXED: Changed from float to int
-    parser.add_argument("--sigma", type=float, default=1.0, help="Gaussian smoothing sigma")
+    parser.add_argument(
+        "--resolution_px0", type=float, default=10, help="BG Subtraction resolution"
+    )
+    parser.add_argument(
+        "--resolution_pz0", type=float, default=10, help="BG Subtraction resolution Z"
+    )
+    parser.add_argument(
+        "--noise_lvl", type=int, default=2, help="Noise level (MUST BE INTEGER)"
+    )  # FIXED: Changed from float to int
+    parser.add_argument(
+        "--sigma", type=float, default=1.0, help="Gaussian smoothing sigma"
+    )
 
     args = parser.parse_args()
 
@@ -323,7 +450,13 @@ def main():
         psf = tifffile.imread(args.psf_path)
         psf_shape = psf.shape
         if args.image_scaling > 0 and args.image_scaling != 1.0:
-            psf = rescale(psf, (args.image_scaling, args.image_scaling, args.image_scaling), order=3, preserve_range=True, anti_aliasing=True)
+            psf = rescale(
+                psf,
+                (args.image_scaling, args.image_scaling, args.image_scaling),
+                order=3,
+                preserve_range=True,
+                anti_aliasing=True,
+            )
             print(f"     -PSF dimension from : {psf_shape} to {psf.shape}")
         psf_f = psf.astype(np.float32)
         psf = psf_f / psf_f.sum()
@@ -343,11 +476,11 @@ def main():
     ext = os.path.splitext(image_name)[1].lower()
 
     try:
-        if ext in ['.tif', '.tiff']:
+        if ext in [".tif", ".tiff"]:
             print("  Loading TIFF image...")
             img = tifffile.imread(image_path).astype(np.uint16)
             voxel_size = read_tiff_voxel_size(image_path)
-        elif ext == '.nd2':
+        elif ext == ".nd2":
             print("  Loading ND2 image...")
             img = pims.open(image_path)
             voxel_size = read_nd2_voxel_size(img)
@@ -378,7 +511,13 @@ def main():
         t0 = time.time()
         img_shape = img.shape
         print(f"  - image dimension : {img.shape}, scaling {args.image_scaling}")
-        img = rescale(img, (1.0, args.image_scaling, args.image_scaling), order=3, preserve_range=True, anti_aliasing=True)
+        img = rescale(
+            img,
+            (1.0, args.image_scaling, args.image_scaling),
+            order=3,
+            preserve_range=True,
+            anti_aliasing=True,
+        )
         physical_pixel_sizeX /= args.image_scaling
         print(f"  - image dimension from : {img_shape} to {img.shape}")
         t1 = time.time()
@@ -394,7 +533,9 @@ def main():
     if apply_shading_correct:
         t0 = time.time()
         print("[Check-in] Running shading_correct_xy_estimated...")
-        img, field = shading_correct_xy_estimated(img, sigma_xy=96, z_axis=0, per_slice=False)
+        img, field = shading_correct_xy_estimated(
+            img, sigma_xy=96, z_axis=0, per_slice=False
+        )
         t1 = time.time()
         print(f"[Timer] Shading correction took {t1 - t0:.2f} seconds")
         print_resource_usage()
@@ -402,7 +543,9 @@ def main():
     if apply_z_intensity_correction:
         t0 = time.time()
         print("[Check-in] Running z_intensity_correction...")
-        img, scales = z_intensity_correction(img, z_axis=0, method="p95", smooth_window=11)
+        img, scales = z_intensity_correction(
+            img, z_axis=0, method="p95", smooth_window=11
+        )
         t1 = time.time()
         print(f"[Timer] Z-intensity correction took {t1 - t0:.2f} seconds")
         print_resource_usage()
@@ -411,7 +554,7 @@ def main():
     if abs(1.0 - scale) > 1e-4:
         t0 = time.time()
         print("[Check-in] Reslicing to isotropic...")
-        img = reslice(img, 'xy', physical_pixel_sizeX, physical_pixel_sizeZ)
+        img = reslice(img, "xy", physical_pixel_sizeX, physical_pixel_sizeZ)
         t1 = time.time()
         print(f"[Timer] Reslicing took {t1 - t0:.2f} seconds")
 
@@ -420,7 +563,9 @@ def main():
 
     # Recalculate voxel size after reslicing (THIS NOW WORKS CORRECTLY)
     new_physical_pixel_sizeZ = img_shape[0] * physical_pixel_sizeZ / new_img_shape[0]
-    print(f"  - image dimension from : {img_shape} to {new_img_shape} after isotropic interpolation")
+    print(
+        f"  - image dimension from : {img_shape} to {new_img_shape} after isotropic interpolation"
+    )
     print(f"  - z-space from : {physical_pixel_sizeZ} to {new_physical_pixel_sizeZ}")
     physical_pixel_sizeZ = new_physical_pixel_sizeZ
     print_resource_usage()
@@ -435,12 +580,18 @@ def main():
         t0 = time.time()
         print("[Check-in] Running 3D deconvolution...")
         img = image_scaling_intens(img, args.min_v, args.max_v, True)
-        img = np.pad(img, args.padding, mode='reflect')
-        imgSizeGB = img.nbytes / (1024 ** 3)
-        print(f'    -size(GB) : {imgSizeGB:.3f}')
+        img = np.pad(img, args.padding, mode="reflect")
+        imgSizeGB = img.nbytes / (1024**3)
+        print(f"    -size(GB) : {imgSizeGB:.3f}")
         print_resource_usage()
-        res_gpu = rl.doRLDeconvolutionFromNpArrays(img, psf, niter=args.niter, resAsUint8=False)
-        img = res_gpu[args.padding:-args.padding, args.padding:-args.padding, args.padding:-args.padding]
+        res_gpu = rl.doRLDeconvolutionFromNpArrays(
+            img, psf, niter=args.niter, resAsUint8=False
+        )
+        img = res_gpu[
+            args.padding : -args.padding,
+            args.padding : -args.padding,
+            args.padding : -args.padding,
+        ]
         t1 = time.time()
         print(f"[Timer] 3D deconvolution took {t1 - t0:.2f} seconds")
         print_resource_usage()
@@ -451,12 +602,18 @@ def main():
         img = image_scaling_intens(img, args.min_v, args.max_v, True)
         img_xz = np.transpose(img, [1, 0, 2])
         psf_xz = np.transpose(psf, [1, 0, 2])
-        img_xz = np.pad(img_xz, args.padding, mode='reflect')
-        imgSizeGB = img_xz.nbytes / (1024 ** 3)
-        print(f'    img_xz -size(GB) : {imgSizeGB:.3f}')
+        img_xz = np.pad(img_xz, args.padding, mode="reflect")
+        imgSizeGB = img_xz.nbytes / (1024**3)
+        print(f"    img_xz -size(GB) : {imgSizeGB:.3f}")
         print_resource_usage()
-        res_gpu = rl.doRLDeconvolutionFromNpArrays(img_xz, psf_xz, niter=args.niter, resAsUint8=False)
-        img_xz = res_gpu[args.padding:-args.padding, args.padding:-args.padding, args.padding:-args.padding]
+        res_gpu = rl.doRLDeconvolutionFromNpArrays(
+            img_xz, psf_xz, niter=args.niter, resAsUint8=False
+        )
+        img_xz = res_gpu[
+            args.padding : -args.padding,
+            args.padding : -args.padding,
+            args.padding : -args.padding,
+        ]
         img = np.transpose(img_xz, [1, 0, 2])
         t1 = time.time()
         print(f"[Timer] 2D (XZ) deconvolution took {t1 - t0:.2f} seconds")
@@ -465,7 +622,9 @@ def main():
     # Post-processing
     t0 = time.time()
     print("[Check-in] Running post-processing...")
-    img = image_postprocessing(img, resolution_px, resolution_pz, args.noise_lvl, args.sigma)
+    img = image_postprocessing(
+        img, resolution_px, resolution_pz, args.noise_lvl, args.sigma
+    )
     t1 = time.time()
     print(f"[Timer] Post-processing took {t1 - t0:.2f} seconds")
     print_resource_usage()
@@ -501,7 +660,7 @@ def main():
     # Save image with consistent naming (matching notebook)
     t0 = time.time()
     base_name = os.path.splitext(image_name)[0]
-    image_out_name = f"{base_name}_{int(100*args.image_scaling)}.tif"
+    image_out_name = f"{base_name}_{int(100 * args.image_scaling)}.tif"
     img_out_path = os.path.join(args.outdir, image_out_name)
     tifffile.imwrite(img_out_path, img)
     t1 = time.time()
@@ -522,6 +681,7 @@ def main():
     elapsed_time = time.time() - start_time_total
     print(f"[Done] Elapsed Time: {elapsed_time:.4f} seconds")
     print_resource_usage()
+
 
 if __name__ == "__main__":
     main()
