@@ -57,19 +57,21 @@ else
     echo "Seqera Tower: disabled"
 fi
 
-# Setup caching directories
-export NXF_SINGULARITY_CACHEDIR="$OUTPUT_DIR/singularity_images"
-export SINGULARITY_CACHEDIR="$OUTPUT_DIR/singularity_images/cache"
-export SINGULARITY_TMPDIR="$OUTPUT_DIR/singularity_images/tmp"
-export APPTAINER_CACHEDIR="$OUTPUT_DIR/singularity_images/cache"
-export APPTAINER_TMPDIR="$OUTPUT_DIR/singularity_images/tmp"
+# Setup caching directories - must set BOTH singularity and apptainer variables
+CACHE_DIR="$OUTPUT_DIR/singularity_images"
+export NXF_SINGULARITY_CACHEDIR="$CACHE_DIR"
+export NXF_APPTAINER_CACHEDIR="$CACHE_DIR"
+export SINGULARITY_CACHEDIR="$CACHE_DIR"
+export APPTAINER_CACHEDIR="$CACHE_DIR"
+export SINGULARITY_TMPDIR="$CACHE_DIR/tmp"
+export APPTAINER_TMPDIR="$CACHE_DIR/tmp"
 export NXF_TEMP="$OUTPUT_DIR/.nextflow_temp"
 export NXF_OPTS="-Xss4M"
 export NXF_JVM_ARGS="-Xms2g -Xmx5g"
-mkdir -p "$NXF_SINGULARITY_CACHEDIR" "$SINGULARITY_CACHEDIR" "$SINGULARITY_TMPDIR" "$NXF_TEMP"
+mkdir -p "$CACHE_DIR" "$CACHE_DIR/tmp" "$NXF_TEMP"
 
 # Check that container was pre-pulled (compute nodes often can't access internet)
-CONTAINER_SIF="$NXF_SINGULARITY_CACHEDIR/andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img"
+CONTAINER_SIF="$CACHE_DIR/andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img"
 if [ ! -f "$CONTAINER_SIF" ]; then
     echo ""
     echo "ERROR: Container image not found!"
@@ -78,6 +80,8 @@ if [ ! -f "$CONTAINER_SIF" ]; then
     echo ""
     exit 1
 fi
+
+echo "Container: $CONTAINER_SIF (cached)"
 
 # Print summary
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
