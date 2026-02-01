@@ -61,10 +61,23 @@ fi
 export NXF_SINGULARITY_CACHEDIR="$OUTPUT_DIR/singularity_images"
 export SINGULARITY_CACHEDIR="$OUTPUT_DIR/singularity_images/cache"
 export SINGULARITY_TMPDIR="$OUTPUT_DIR/singularity_images/tmp"
+export APPTAINER_CACHEDIR="$OUTPUT_DIR/singularity_images/cache"
+export APPTAINER_TMPDIR="$OUTPUT_DIR/singularity_images/tmp"
 export NXF_TEMP="$OUTPUT_DIR/.nextflow_temp"
 export NXF_OPTS="-Xss4M"
 export NXF_JVM_ARGS="-Xms2g -Xmx5g"
 mkdir -p "$NXF_SINGULARITY_CACHEDIR" "$SINGULARITY_CACHEDIR" "$SINGULARITY_TMPDIR" "$NXF_TEMP"
+
+# Check that container was pre-pulled (compute nodes often can't access internet)
+CONTAINER_SIF="$NXF_SINGULARITY_CACHEDIR/andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img"
+if [ ! -f "$CONTAINER_SIF" ]; then
+    echo ""
+    echo "ERROR: Container image not found!"
+    echo "Run the setup script from the login node first:"
+    echo "  ./setup_container.sh"
+    echo ""
+    exit 1
+fi
 
 # Print summary
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)

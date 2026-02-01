@@ -17,7 +17,10 @@ cd spim_preprocessing
 # 2. Edit the configuration file
 nano config.json    # Set your input/output paths and parameters
 
-# 3. Submit to the cluster
+# 3. Download the container (run once from login node - takes ~30 min)
+./setup_container.sh
+
+# 4. Submit to the cluster
 sbatch submit_pipeline.sh
 ```
 
@@ -122,7 +125,17 @@ The final output in `03_hyperstack/` can be opened directly in BigDataViewer or 
 
 ## Container
 
-The pipeline uses a pre-built Singularity container hosted on Sylabs Cloud. On first run, it will be automatically pulled (~45 minutes). 
+The pipeline uses a pre-built Apptainer/Singularity container hosted on Sylabs Cloud (~5GB).
+
+**Important:** Run the setup script from the login node before submitting:
+
+```bash
+./setup_container.sh
+```
+
+This downloads the container to your results directory. Compute nodes typically can't access external networks, so this step must be done from the login node where you have internet access.
+
+The container will be cached and reused for subsequent runs.
 
 ---
 
@@ -146,9 +159,10 @@ The pipeline is configured for the IMP cluster but can be adapted to other SLURM
 **Out of memory:**
 - Edit `nextflow.config` to increase memory for specific processes
 
-**Singularity pull timeout:**
-- Use a pre-built `.sif` file (see above)
-- Or increase `pullTimeout` in `nextflow.config`
+**Singularity pull timeout / connection reset:**
+- Make sure you ran `./setup_container.sh` from the login node first
+- Compute nodes typically cannot download from the internet
+- The container must be pre-cached before submitting the job
 
 **Resume after failure:**
 - The pipeline automatically resumes from where it left off
