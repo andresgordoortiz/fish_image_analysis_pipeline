@@ -2,7 +2,7 @@
   "pipeline": {
     "name": "SPIM 4D Image Processing Pipeline",
     "version": "1.0.0",
-    "author": "Andrés Gordo & Guillherme Ventura",
+    "author": "Andrés Gordo & Guilherme Ventura",
     "institute": "IMP Vienna"
   },
 
