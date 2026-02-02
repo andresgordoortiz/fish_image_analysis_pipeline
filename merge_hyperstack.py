@@ -146,17 +146,17 @@ def write_bdv_hdf5(
 def parse_output_formats(out_cfg):
     """
     Parse the output format configuration.
-    
+
     Supports:
     - "tiff" or "tif" -> only TIFF
     - "bdv" or "hdf5" or "xml" -> only BDV
     - "both" or "all" -> both formats
     - ["tiff", "bdv"] -> list of formats
-    
+
     Returns a set of formats to generate: {'tiff', 'bdv'}
     """
     format_spec = out_cfg.get("format", "tiff")
-    
+
     # Handle list of formats
     if isinstance(format_spec, list):
         formats = set()
@@ -167,10 +167,10 @@ def parse_output_formats(out_cfg):
             elif fmt_lower in ["bdv", "hdf5", "xml"]:
                 formats.add("bdv")
         return formats if formats else {"tiff"}
-    
+
     # Handle string format
     format_spec = format_spec.lower().strip()
-    
+
     if format_spec in ["both", "all"]:
         return {"tiff", "bdv"}
     elif format_spec in ["bdv", "hdf5", "xml"]:
