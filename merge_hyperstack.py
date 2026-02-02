@@ -143,6 +143,42 @@ def write_bdv_hdf5(
         json.dump(hyperstack_meta, fh, indent=2)
 
 
+def parse_output_formats(out_cfg):
+    """
+    Parse the output format configuration.
+    
+    Supports:
+    - "tiff" or "tif" -> only TIFF
+    - "bdv" or "hdf5" or "xml" -> only BDV
+    - "both" or "all" -> both formats
+    - ["tiff", "bdv"] -> list of formats
+    
+    Returns a set of formats to generate: {'tiff', 'bdv'}
+    """
+    format_spec = out_cfg.get("format", "tiff")
+    
+    # Handle list of formats
+    if isinstance(format_spec, list):
+        formats = set()
+        for fmt in format_spec:
+            fmt_lower = fmt.lower().strip()
+            if fmt_lower in ["tiff", "tif"]:
+                formats.add("tiff")
+            elif fmt_lower in ["bdv", "hdf5", "xml"]:
+                formats.add("bdv")
+        return formats if formats else {"tiff"}
+    
+    # Handle string format
+    format_spec = format_spec.lower().strip()
+    
+    if format_spec in ["both", "all"]:
+        return {"tiff", "bdv"}
+    elif format_spec in ["bdv", "hdf5", "xml"]:
+        return {"bdv"}
+    else:
+        return {"tiff"}
+
+
 def main():
     print("=" * 60)
     print("MERGE PIPELINE: TIFF -> BDV/HYPERSTACK")
@@ -162,7 +198,7 @@ def main():
 
     # 2. Configure Settings
     out_cfg = config.get("output", {})
-    out_format = out_cfg.get("format", "tiff").lower()  # 'tiff' or 'bdv'
+    output_formats = parse_output_formats(out_cfg)
 
     # Find files
     seg_files = sorted(Path(".").glob("t*_segmented.tif"))
@@ -190,8 +226,11 @@ def main():
     else:
         need_flip = bool(correct_y)
 
+    # Format display string
+    format_display = " + ".join(sorted(output_formats)).upper()
+
     print(f"Setup:")
-    print(f"  Format: {out_format}")
+    print(f"  Format(s): {format_display}")
     print(f"  Dimensions (Z,Y,X): {Z}, {Y}, {X}")
     print(f"  Voxel Size: {vox_z:.3f}, {vox_y:.3f}, {vox_x:.3f}")
     print(f"  Y-Flip: {need_flip}")
@@ -202,23 +241,38 @@ def main():
         "shape": {"T": len(seg_files), "Z": Z, "Y": Y, "X": X},
         "voxel_size": {"x_um": vox_x, "y_um": vox_y, "z_um": vox_z},
         "dtype": "uint16",
+        "output_formats": list(output_formats),
     }
 
-    # 5. Execute Writer
-    if out_format in ["bdv", "hdf5", "xml"]:
-        write_bdv_hdf5(seg_files, vox_x, vox_y, vox_z, need_flip, hyperstack_meta)
-    else:
-        # For TIFF, we must load all to RAM to stack
+    # 5. Execute Writer(s)
+    # For TIFF output, we need to load all data to RAM
+    img4d = None
+    if "tiff" in output_formats:
+        print("\n" + "=" * 60)
         print("Loading all timepoints into RAM for TIFF stacking...")
+        print("=" * 60)
         arrays = []
         for f in seg_files:
             arr = tifffile.imread(str(f))
             if need_flip:
                 arr = np.flip(arr, axis=1)
             arrays.append(arr)
-
         img4d = np.stack(arrays, axis=0)  # T, Z, Y, X
         write_tiff_hyperstack(img4d, vox_x, vox_y, vox_z, need_flip, hyperstack_meta)
+
+    if "bdv" in output_formats:
+        write_bdv_hdf5(seg_files, vox_x, vox_y, vox_z, need_flip, hyperstack_meta)
+
+    # 6. Final Summary
+    print("\n" + "=" * 60)
+    print("MERGE COMPLETE")
+    print("=" * 60)
+    print(f"Output format(s): {format_display}")
+    if "tiff" in output_formats:
+        print("  ✓ 4D_hyperstack.tif")
+    if "bdv" in output_formats:
+        print("  ✓ 4D_hyperstack.h5 + 4D_hyperstack.xml")
+    print("  ✓ 4D_hyperstack_metadata.json")
 
 
 if __name__ == "__main__":
