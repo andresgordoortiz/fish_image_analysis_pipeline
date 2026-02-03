@@ -39,7 +39,13 @@ def detect_flip_needed(first_path):
 def write_tiff_hyperstack_streaming(
     seg_files, final_x_res, final_y_res, final_z_spacing, need_flip, hyperstack_meta
 ):
-    """Write timepoints as ImageJ-compatible TIFF hyperstack using streaming (low memory)."""
+    """Write timepoints as ImageJ-compatible TIFF hyperstack using streaming (low memory).
+
+    ImageJ hyperstack format requires:
+    - Data written in TZCYX order (or subset like TZYX for single channel)
+    - Metadata with 'hyperstack': True and proper dimension counts
+    - Resolution stored as pixels-per-unit
+    """
 
     # Save Metadata
     with open("4D_hyperstack_metadata.json", "w") as fh:
@@ -54,6 +60,7 @@ def write_tiff_hyperstack_streaming(
     # Estimate file size
     estimated_gb = (T * Z * Y * X * 2) / (1024**3)  # uint16 = 2 bytes
     print(f"Writing 4D_hyperstack.tif (~{estimated_gb:.2f} GB estimated)...")
+    print(f"  Dimensions: T={T}, Z={Z}, Y={Y}, X={X}")
     print(f"  Using streaming mode to minimize memory usage")
     print(f"  Shape: T={T}, Z={Z}, Y={Y}, X={X}")
 
@@ -64,6 +71,33 @@ def write_tiff_hyperstack_streaming(
     # CRITICAL: All planes must be written with consistent parameters to avoid
     # "non-contiguous series" error
 
+<<<<<<< HEAD
+=======
+    # ImageJ hyperstack metadata - CRITICAL for proper slider display
+    # ImageJ uses: frames=T (time), slices=Z (depth), channels=C
+    # 'hyperstack': True is REQUIRED for ImageJ to show multiple sliders
+    imagej_metadata = {
+        "hyperstack": True,  # CRITICAL: enables multi-dimensional view
+        "axes": "TZYX",  # Dimension order (no C since single channel)
+        "frames": T,  # Number of timepoints (T slider)
+        "slices": Z,  # Number of Z slices (Z slider)
+        "channels": 1,  # Single channel (no C slider needed)
+        "spacing": final_z_spacing,  # Z spacing in units
+        "unit": "um",
+        "finterval": 1.0,  # Frame interval (can be updated if known)
+        "mode": "grayscale",
+        "loop": False,  # Don't auto-loop
+        "min": 0.0,  # Display range min
+        "max": 65535.0,  # Display range max (uint16)
+        "Info": f"4D Hyperstack: {T} timepoints, {Z} slices",
+    }
+
+    # Resolution: pixels per micron (TIFF standard is pixels-per-unit)
+    resolution = (1.0 / final_y_res, 1.0 / final_x_res)
+
+    # Use TiffWriter - write each timepoint as a contiguous 3D block
+    # This is more efficient and ImageJ interprets it correctly
+>>>>>>> 3c37a6a (Enhance TIFF writing process in merge_hyperstack.py with detailed metadata and improved memory handling for ImageJ compatibility)
     with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True, imagej=True) as tif:
         # Prepare metadata for first frame only
         imagej_metadata = {
@@ -76,16 +110,25 @@ def write_tiff_hyperstack_streaming(
             'loop': False,
         }
 
+<<<<<<< HEAD
         for t, file_path in enumerate(seg_files):
             print(f"  Writing timepoint {t + 1}/{T}: {file_path.name}")
 
             # Read single timepoint (Z, Y, X)
+=======
+            # Read single timepoint as 3D volume (Z, Y, X)
+>>>>>>> 3c37a6a (Enhance TIFF writing process in merge_hyperstack.py with detailed metadata and improved memory handling for ImageJ compatibility)
             data = tifffile.imread(str(file_path)).astype(np.uint16)
 
-            # Flip Y if needed
+            # Ensure data is 3D (Z, Y, X)
+            if data.ndim == 2:
+                data = data[np.newaxis, :, :]  # Add Z dimension if single slice
+
+            # Flip Y if needed (axis 1 is Y in ZYX)
             if need_flip:
                 data = np.flip(data, axis=1)
 
+<<<<<<< HEAD
             # Write each Z-slice as a separate 2D page
             # ImageJ hyperstack stores all slices as a sequence of 2D images
             for z_idx in range(data.shape[0]):
@@ -107,11 +150,27 @@ def write_tiff_hyperstack_streaming(
                         photometric='minisblack',
                         contiguous=True,
                     )
+=======
+            # Write entire timepoint volume at once
+            # Metadata only on first write - tifffile uses it for the whole file
+            tif.write(
+                data,
+                resolution=resolution,
+                metadata=imagej_metadata if t == 0 else None,
+                contiguous=True,
+            )
+>>>>>>> 3c37a6a (Enhance TIFF writing process in merge_hyperstack.py with detailed metadata and improved memory handling for ImageJ compatibility)
 
-            # Free memory
+            # Free memory immediately
             del data
 
+<<<<<<< HEAD
     print(f"✓ TIFF Write Complete")
+=======
+    print(f"\n✓ TIFF Hyperstack Written Successfully")
+    print(f"  Open in ImageJ/Fiji: File > Open > 4D_hyperstack.tif")
+    print(f"  Expected sliders: Z (depth) and T (time)")
+>>>>>>> 3c37a6a (Enhance TIFF writing process in merge_hyperstack.py with detailed metadata and improved memory handling for ImageJ compatibility)
 
 
 def write_bdv_hdf5(
