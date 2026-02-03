@@ -57,11 +57,13 @@ def write_tiff_hyperstack_streaming(
     print(f"  Using streaming mode to minimize memory usage")
     print(f"  Shape: T={T}, Z={Z}, Y={Y}, X={X}")
 
-    # For ImageJ hyperstack format, we need to write all frames as a sequence of 2D images
-    # with the metadata specifying the hyperstack structure.
-    # ImageJ expects images in TZCYX order when written as pages.
+    # For ImageJ hyperstack format with streaming, we write 2D planes sequentially.
+    # ImageJ expects planes in TZCYX order (T changes slowest, then Z, then C, then Y, X).
+    # The metadata tells ImageJ how to interpret the sequence of 2D images.
+    #
+    # We use imagej=True mode which handles the metadata format automatically.
 
-    with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True) as tif:
+    with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True, imagej=True) as tif:
         for t, file_path in enumerate(seg_files):
             print(f"  Writing timepoint {t + 1}/{T}: {file_path.name}")
 
@@ -72,33 +74,33 @@ def write_tiff_hyperstack_streaming(
             if need_flip:
                 data = np.flip(data, axis=1)
 
-            # Write this timepoint's Z-stack as a 3D block
-            # Only add ImageJ metadata on first write
-            if t == 0:
-                tif.write(
-                    data,
-                    photometric='minisblack',
-                    resolution=(1.0 / final_x_res, 1.0 / final_y_res),
-                    metadata={
-                        'spacing': final_z_spacing,
-                        'unit': 'um',
-                        'axes': 'TZYX',
-                        'frames': T,
-                        'slices': Z,
-                        'hyperstack': True,
-                        'mode': 'grayscale',
-                        'loop': False,
-                        'LabelImage': True,
-                    },
-                    ijmetadata={'Info': f'4D Hyperstack: {T} timepoints, {Z} slices'},
-                )
-            else:
-                # Subsequent timepoints - just write data, no metadata
-                tif.write(
-                    data,
-                    photometric='minisblack',
-                    resolution=(1.0 / final_x_res, 1.0 / final_y_res),
-                )
+            # Write each Z-slice as a separate 2D page
+            # ImageJ hyperstack stores all slices as a sequence of 2D images
+            for z_idx in range(data.shape[0]):
+                plane = data[z_idx]  # (Y, X)
+
+                # Only write metadata on the very first frame
+                if t == 0 and z_idx == 0:
+                    tif.write(
+                        plane,
+                        photometric='minisblack',
+                        resolution=(1.0 / final_x_res, 1.0 / final_y_res),
+                        metadata={
+                            'spacing': final_z_spacing,
+                            'unit': 'um',
+                            'frames': T,
+                            'slices': Z,
+                            'hyperstack': True,
+                            'mode': 'grayscale',
+                            'loop': False,
+                        },
+                    )
+                else:
+                    # All other frames - no metadata
+                    tif.write(
+                        plane,
+                        photometric='minisblack',
+                    )
 
             # Free memory
             del data
