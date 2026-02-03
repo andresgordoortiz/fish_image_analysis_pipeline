@@ -36,32 +36,61 @@ def detect_flip_needed(first_path):
     return False
 
 
-def write_tiff_hyperstack(
-    img4d, final_x_res, final_y_res, final_z_spacing, need_flip, hyperstack_meta
+def write_tiff_hyperstack_streaming(
+    seg_files, final_x_res, final_y_res, final_z_spacing, need_flip, hyperstack_meta
 ):
-    """Write 4D array as ImageJ-compatible TIFF hyperstack."""
+    """Write timepoints as ImageJ-compatible TIFF hyperstack using streaming (low memory)."""
 
     # Save Metadata
     with open("4D_hyperstack_metadata.json", "w") as fh:
         json.dump(hyperstack_meta, fh, indent=2)
 
-    print(f"Writing 4D_hyperstack.tif ({img4d.nbytes / 1024**3:.2f} GB)...")
+    T = len(seg_files)
+    # Get shape from first file
+    with tifffile.TiffFile(str(seg_files[0])) as tf:
+        Z = len(tf.pages)
+        Y, X = tf.pages[0].shape
 
-    tifffile.imwrite(
-        "4D_hyperstack.tif",
-        img4d.astype(np.uint16),
-        imagej=True,
-        resolution=(1.0 / final_x_res, 1.0 / final_y_res),
-        metadata={
-            "spacing": final_z_spacing,
-            "unit": "um",
-            "axes": "TZYX",
-            "frames": img4d.shape[0],
-            "slices": img4d.shape[1],
-            "LabelImage": True,  # Helps Fiji recognize it as segmentation
-        },
-    )
-    print("✓ TIFF Write Complete")
+    # Estimate file size
+    estimated_gb = (T * Z * Y * X * 2) / (1024**3)  # uint16 = 2 bytes
+    print(f"Writing 4D_hyperstack.tif (~{estimated_gb:.2f} GB estimated)...")
+    print(f"  Using streaming mode to minimize memory usage")
+
+    # Use TiffWriter for incremental writing
+    with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True, imagej=True) as tif:
+        for t, file_path in enumerate(seg_files):
+            print(f"  Writing timepoint {t + 1}/{T}: {file_path.name}", end="\r")
+
+            # Read single timepoint
+            data = tifffile.imread(str(file_path)).astype(np.uint16)
+
+            # Flip Y if needed
+            if need_flip:
+                data = np.flip(data, axis=1)
+
+            # Write this timepoint's Z-stack
+            # For ImageJ hyperstack, write each Z-slice with proper metadata
+            for z in range(data.shape[0]):
+                tif.write(
+                    data[z],
+                    resolution=(1.0 / final_x_res, 1.0 / final_y_res),
+                    metadata={
+                        "spacing": final_z_spacing,
+                        "unit": "um",
+                        "axes": "TZYX",
+                        "frames": T,
+                        "slices": Z,
+                        "LabelImage": True,
+                    }
+                    if (t == 0 and z == 0)
+                    else None,  # Only write metadata once
+                    contiguous=True,
+                )
+
+            # Free memory
+            del data
+
+    print(f"\n✓ TIFF Write Complete")
 
 
 def write_bdv_hdf5(
@@ -245,20 +274,14 @@ def main():
     }
 
     # 5. Execute Writer(s)
-    # For TIFF output, we need to load all data to RAM
-    img4d = None
+    # Use streaming approach to avoid loading all data into RAM
     if "tiff" in output_formats:
         print("\n" + "=" * 60)
-        print("Loading all timepoints into RAM for TIFF stacking...")
+        print("Writing TIFF hyperstack (streaming mode)...")
         print("=" * 60)
-        arrays = []
-        for f in seg_files:
-            arr = tifffile.imread(str(f))
-            if need_flip:
-                arr = np.flip(arr, axis=1)
-            arrays.append(arr)
-        img4d = np.stack(arrays, axis=0)  # T, Z, Y, X
-        write_tiff_hyperstack(img4d, vox_x, vox_y, vox_z, need_flip, hyperstack_meta)
+        write_tiff_hyperstack_streaming(
+            seg_files, vox_x, vox_y, vox_z, need_flip, hyperstack_meta
+        )
 
     if "bdv" in output_formats:
         write_bdv_hdf5(seg_files, vox_x, vox_y, vox_z, need_flip, hyperstack_meta)
