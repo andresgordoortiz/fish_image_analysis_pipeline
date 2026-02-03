@@ -62,14 +62,6 @@ def write_tiff_hyperstack_streaming(
     print(f"Writing 4D_hyperstack.tif (~{estimated_gb:.2f} GB estimated)...")
     print(f"  Dimensions: T={T}, Z={Z}, Y={Y}, X={X}")
     print(f"  Using streaming mode to minimize memory usage")
-    print(f"  Shape: T={T}, Z={Z}, Y={Y}, X={X}")
-
-    # For ImageJ hyperstack format with streaming, we write 2D planes sequentially.
-    # ImageJ expects planes in TZCYX order (T changes slowest, then Z, then C, then Y, X).
-    # The metadata tells ImageJ how to interpret the sequence of 2D images.
-    #
-    # CRITICAL: All planes must be written with consistent parameters to avoid
-    # "non-contiguous series" error
 
     # ImageJ hyperstack metadata - CRITICAL for proper slider display
     # ImageJ uses: frames=T (time), slices=Z (depth), channels=C
@@ -94,18 +86,9 @@ def write_tiff_hyperstack_streaming(
     resolution = (1.0 / final_y_res, 1.0 / final_x_res)
 
     # Use TiffWriter - write each timepoint as a contiguous 3D block
-    # This is more efficient and ImageJ interprets it correctly
     with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True, imagej=True) as tif:
-        # Prepare metadata for first frame only
-        imagej_metadata = {
-            'spacing': final_z_spacing,
-            'unit': 'um',
-            'frames': T,
-            'slices': Z,
-            'hyperstack': True,
-            'mode': 'grayscale',
-            'loop': False,
-        }
+        for t, file_path in enumerate(seg_files):
+            print(f"  Writing timepoint {t + 1}/{T}: {file_path.name}", end="\r")
 
             # Read single timepoint as 3D volume (Z, Y, X)
             data = tifffile.imread(str(file_path)).astype(np.uint16)
