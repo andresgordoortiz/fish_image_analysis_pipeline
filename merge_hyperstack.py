@@ -55,42 +55,55 @@ def write_tiff_hyperstack_streaming(
     estimated_gb = (T * Z * Y * X * 2) / (1024**3)  # uint16 = 2 bytes
     print(f"Writing 4D_hyperstack.tif (~{estimated_gb:.2f} GB estimated)...")
     print(f"  Using streaming mode to minimize memory usage")
+    print(f"  Shape: T={T}, Z={Z}, Y={Y}, X={X}")
 
-    # Use TiffWriter for incremental writing
-    with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True, imagej=True) as tif:
+    # For ImageJ hyperstack format, we need to write all frames as a sequence of 2D images
+    # with the metadata specifying the hyperstack structure.
+    # ImageJ expects images in TZCYX order when written as pages.
+
+    with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True) as tif:
         for t, file_path in enumerate(seg_files):
-            print(f"  Writing timepoint {t + 1}/{T}: {file_path.name}", end="\r")
+            print(f"  Writing timepoint {t + 1}/{T}: {file_path.name}")
 
-            # Read single timepoint
+            # Read single timepoint (Z, Y, X)
             data = tifffile.imread(str(file_path)).astype(np.uint16)
 
             # Flip Y if needed
             if need_flip:
                 data = np.flip(data, axis=1)
 
-            # Write this timepoint's Z-stack
-            # For ImageJ hyperstack, write each Z-slice with proper metadata
-            for z in range(data.shape[0]):
+            # Write this timepoint's Z-stack as a 3D block
+            # Only add ImageJ metadata on first write
+            if t == 0:
                 tif.write(
-                    data[z],
+                    data,
+                    photometric='minisblack',
                     resolution=(1.0 / final_x_res, 1.0 / final_y_res),
                     metadata={
-                        "spacing": final_z_spacing,
-                        "unit": "um",
-                        "axes": "TZYX",
-                        "frames": T,
-                        "slices": Z,
-                        "LabelImage": True,
-                    }
-                    if (t == 0 and z == 0)
-                    else None,  # Only write metadata once
-                    contiguous=True,
+                        'spacing': final_z_spacing,
+                        'unit': 'um',
+                        'axes': 'TZYX',
+                        'frames': T,
+                        'slices': Z,
+                        'hyperstack': True,
+                        'mode': 'grayscale',
+                        'loop': False,
+                        'LabelImage': True,
+                    },
+                    ijmetadata={'Info': f'4D Hyperstack: {T} timepoints, {Z} slices'},
+                )
+            else:
+                # Subsequent timepoints - just write data, no metadata
+                tif.write(
+                    data,
+                    photometric='minisblack',
+                    resolution=(1.0 / final_x_res, 1.0 / final_y_res),
                 )
 
             # Free memory
             del data
 
-    print(f"\n✓ TIFF Write Complete")
+    print(f"✓ TIFF Write Complete")
 
 
 def write_bdv_hdf5(
