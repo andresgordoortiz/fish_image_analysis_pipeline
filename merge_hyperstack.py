@@ -61,9 +61,21 @@ def write_tiff_hyperstack_streaming(
     # ImageJ expects planes in TZCYX order (T changes slowest, then Z, then C, then Y, X).
     # The metadata tells ImageJ how to interpret the sequence of 2D images.
     #
-    # We use imagej=True mode which handles the metadata format automatically.
+    # CRITICAL: All planes must be written with consistent parameters to avoid
+    # "non-contiguous series" error
 
     with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True, imagej=True) as tif:
+        # Prepare metadata for first frame only
+        imagej_metadata = {
+            'spacing': final_z_spacing,
+            'unit': 'um',
+            'frames': T,
+            'slices': Z,
+            'hyperstack': True,
+            'mode': 'grayscale',
+            'loop': False,
+        }
+
         for t, file_path in enumerate(seg_files):
             print(f"  Writing timepoint {t + 1}/{T}: {file_path.name}")
 
@@ -79,27 +91,21 @@ def write_tiff_hyperstack_streaming(
             for z_idx in range(data.shape[0]):
                 plane = data[z_idx]  # (Y, X)
 
-                # Only write metadata on the very first frame
+                # Write with metadata only on first frame, but keep photometric consistent
                 if t == 0 and z_idx == 0:
                     tif.write(
                         plane,
                         photometric='minisblack',
                         resolution=(1.0 / final_x_res, 1.0 / final_y_res),
-                        metadata={
-                            'spacing': final_z_spacing,
-                            'unit': 'um',
-                            'frames': T,
-                            'slices': Z,
-                            'hyperstack': True,
-                            'mode': 'grayscale',
-                            'loop': False,
-                        },
+                        metadata=imagej_metadata,
+                        contiguous=True,
                     )
                 else:
-                    # All other frames - no metadata
+                    # All other frames - same photometric, no metadata, contiguous
                     tif.write(
                         plane,
                         photometric='minisblack',
+                        contiguous=True,
                     )
 
             # Free memory
