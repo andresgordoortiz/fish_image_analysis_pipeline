@@ -101,8 +101,8 @@ Voxel Size   : ${voxel_info}
 process CROP_WITH_ROI {
     tag "t${String.format('%04d', timepoint)}"
 
-    maxRetries 1
-    errorStrategy 'terminate'
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
     publishDir "${params.output_dir}/00_cropped",
         mode: 'copy',
@@ -373,8 +373,8 @@ PYTHON_CROP_SCRIPT
 process EXTRACT_METADATA {
     tag "Extracting metadata"
 
-    maxRetries 1
-    errorStrategy 'terminate'
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
     publishDir "${params.output_dir}/metadata",
         mode: 'copy',
@@ -596,8 +596,8 @@ PYTHON_SCRIPT
 process PREPROCESS_DECONVOLVE {
     tag "t${String.format('%04d', timepoint)}"
 
-    maxRetries 1
-    errorStrategy 'terminate'
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
     publishDir "${params.output_dir}/01_preprocessed",
         mode: 'copy',
@@ -834,8 +834,8 @@ RESTORE_META
 process CELLPOSE_SEGMENT {
     tag "t${String.format('%04d', timepoint)}"
 
-    maxRetries 1
-    errorStrategy 'terminate'
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
     publishDir "${params.output_dir}/02_segmented",
         mode: 'copy',
@@ -993,8 +993,8 @@ PRESERVE_MASK_META
 process MERGE_TO_HYPERSTACK {
     tag "Creating 4D hyperstack"
 
-    maxRetries 1
-    errorStrategy 'terminate'
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
     publishDir "${params.output_dir}/03_hyperstack",
         mode: 'copy'
@@ -1121,8 +1121,8 @@ PYTHON_CONFIG
 // ============================================================================
 
 process GENERATE_QC_REPORT {
-    maxRetries 1
-    errorStrategy 'terminate'
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
     publishDir "${params.output_dir}/reports",
         mode: 'copy'
