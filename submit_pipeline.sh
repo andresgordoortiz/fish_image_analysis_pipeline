@@ -104,7 +104,7 @@ echo ""
 nextflow run ./spim_pipeline.nf \
     --config_json "$CONFIG_JSON" \
     -c ./nextflow.config \
-    --resume \
+    -resume \
     -with-report "$OUTPUT_DIR/reports/report_${TIMESTAMP}.html" \
     -with-timeline "$OUTPUT_DIR/reports/timeline_${TIMESTAMP}.html" \
     -with-trace "$OUTPUT_DIR/reports/trace_${TIMESTAMP}.txt" \
