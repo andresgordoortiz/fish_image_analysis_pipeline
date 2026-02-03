@@ -64,28 +64,31 @@ def write_tiff_hyperstack_streaming(
     print(f"  Using streaming mode to minimize memory usage")
 
     # ImageJ hyperstack metadata - CRITICAL for proper slider display
-    # ImageJ uses: frames=T (time), slices=Z (depth), channels=C
-    # 'hyperstack': True is REQUIRED for ImageJ to show multiple sliders
+    # ImageJ expects data in CZT order (channel fastest, then Z, then T)
+    # Since we have single channel, order is ZT (Z changes within each T)
+    #
+    # CRITICAL: 'images' must equal channels * slices * frames for ImageJ to parse correctly
     imagej_metadata = {
-        "hyperstack": True,  # CRITICAL: enables multi-dimensional view
-        "axes": "TZYX",  # Dimension order (no C since single channel)
-        "frames": T,  # Number of timepoints (T slider)
+        "ImageJ": "1.54f",  # ImageJ version marker
+        "images": T * Z,  # CRITICAL: total number of 2D images
+        "channels": 1,  # Single channel (C=1, no C slider)
         "slices": Z,  # Number of Z slices (Z slider)
-        "channels": 1,  # Single channel (no C slider needed)
-        "spacing": final_z_spacing,  # Z spacing in units
-        "unit": "um",
-        "finterval": 1.0,  # Frame interval (can be updated if known)
+        "frames": T,  # Number of timepoints (T slider)
+        "hyperstack": True,  # CRITICAL: enables multi-dimensional view
         "mode": "grayscale",
-        "loop": False,  # Don't auto-loop
+        "unit": "um",
+        "spacing": final_z_spacing,  # Z spacing in units
+        "loop": False,  # Don't auto-loop animation
         "min": 0.0,  # Display range min
         "max": 65535.0,  # Display range max (uint16)
-        "Info": f"4D Hyperstack: {T} timepoints, {Z} slices",
     }
 
     # Resolution: pixels per micron (TIFF standard is pixels-per-unit)
     resolution = (1.0 / final_y_res, 1.0 / final_x_res)
 
-    # Use TiffWriter - write each timepoint as a contiguous 3D block
+    # Write all timepoints sequentially
+    # ImageJ expects planes in CZT order: for each T, write all Z slices
+    # This is exactly what we do: loop T (outer), write Z stack (inner)
     with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True, imagej=True) as tif:
         for t, file_path in enumerate(seg_files):
             print(f"  Writing timepoint {t + 1}/{T}: {file_path.name}", end="\r")
@@ -102,7 +105,7 @@ def write_tiff_hyperstack_streaming(
                 data = np.flip(data, axis=1)
 
             # Write entire timepoint volume at once
-            # Metadata only on first write - tifffile uses it for the whole file
+            # Metadata only on first write - tifffile uses it for the entire file
             tif.write(
                 data,
                 resolution=resolution,
@@ -114,8 +117,9 @@ def write_tiff_hyperstack_streaming(
             del data
 
     print(f"\n✓ TIFF Hyperstack Written Successfully")
+    print(f"  Total: {T * Z} images = {T} timepoints × {Z} Z-slices")
     print(f"  Open in ImageJ/Fiji: File > Open > 4D_hyperstack.tif")
-    print(f"  Expected sliders: Z (depth) and T (time)")
+    print(f"  Expected sliders: Z (slices: {Z}) and T (frames: {T})")
 
 
 def write_bdv_hdf5(
