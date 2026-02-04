@@ -41,10 +41,13 @@ def write_tiff_hyperstack_streaming(
 ):
     """Write timepoints as ImageJ-compatible TIFF hyperstack using streaming (low memory).
 
-    ImageJ hyperstack format requires:
-    - Data written in TZCYX order (or subset like TZYX for single channel)
-    - Metadata with 'hyperstack': True and proper dimension counts
-    - Resolution stored as pixels-per-unit
+    ImageJ hyperstack format:
+    - Data written as 2D slices in TZCYX order (T slowest, then Z, then C, then YX)
+    - For single channel: write all Z slices for T=0, then all Z for T=1, etc.
+    - ImageJ description string in first IFD defines the hyperstack dimensions
+
+    Note: We use manual description instead of imagej=True because tifffile's
+    imagej mode overwrites our dimension metadata when streaming 2D slices.
     """
 
     # Save Metadata
@@ -61,35 +64,34 @@ def write_tiff_hyperstack_streaming(
     estimated_gb = (T * Z * Y * X * 2) / (1024**3)  # uint16 = 2 bytes
     print(f"Writing 4D_hyperstack.tif (~{estimated_gb:.2f} GB estimated)...")
     print(f"  Dimensions: T={T}, Z={Z}, Y={Y}, X={X}")
-    print(f"  Using streaming mode to minimize memory usage")
-
-    # ImageJ hyperstack metadata - CRITICAL for proper slider display
-    # ImageJ expects data in CZT order (channel fastest, then Z, then T)
-    # Since we have single channel, order is ZT (Z changes within each T)
-    #
-    # CRITICAL: 'images' must equal channels * slices * frames for ImageJ to parse correctly
-    imagej_metadata = {
-        "ImageJ": "1.54f",  # ImageJ version marker
-        "images": T * Z,  # CRITICAL: total number of 2D images
-        "channels": 1,  # Single channel (C=1, no C slider)
-        "slices": Z,  # Number of Z slices (Z slider)
-        "frames": T,  # Number of timepoints (T slider)
-        "hyperstack": True,  # CRITICAL: enables multi-dimensional view
-        "mode": "grayscale",
-        "unit": "um",
-        "spacing": final_z_spacing,  # Z spacing in units
-        "loop": False,  # Don't auto-loop animation
-        "min": 0.0,  # Display range min
-        "max": 65535.0,  # Display range max (uint16)
-    }
+    print(f"  Total 2D images: {T * Z}")
+    print(f"  Using streaming mode (writing 2D slices)")
 
     # Resolution: pixels per micron (TIFF standard is pixels-per-unit)
     resolution = (1.0 / final_y_res, 1.0 / final_x_res)
 
-    # Write all timepoints sequentially
-    # ImageJ expects planes in CZT order: for each T, write all Z slices
-    # This is exactly what we do: loop T (outer), write Z stack (inner)
-    with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True, imagej=True) as tif:
+    # Build ImageJ description string manually
+    # This is the ONLY reliable way to set hyperstack dimensions when streaming
+    # tifffile's imagej=True mode overwrites slices/frames with channels count
+    imagej_description = f"""ImageJ=1.54f
+images={T * Z}
+channels=1
+slices={Z}
+frames={T}
+hyperstack=true
+mode=grayscale
+loop=false
+spacing={final_z_spacing}
+unit=um
+min=0.0
+max=65535.0
+"""
+
+    # Write as sequence of 2D images WITHOUT imagej=True
+    # We manually provide the ImageJ description on the first frame
+    with tifffile.TiffWriter("4D_hyperstack.tif", bigtiff=True) as tif:
+        first_write = True
+
         for t, file_path in enumerate(seg_files):
             print(f"  Writing timepoint {t + 1}/{T}: {file_path.name}", end="\r")
 
@@ -98,22 +100,29 @@ def write_tiff_hyperstack_streaming(
 
             # Ensure data is 3D (Z, Y, X)
             if data.ndim == 2:
-                data = data[np.newaxis, :, :]  # Add Z dimension if single slice
+                data = data[np.newaxis, :, :]
 
             # Flip Y if needed (axis 1 is Y in ZYX)
             if need_flip:
                 data = np.flip(data, axis=1)
 
-            # Write entire timepoint volume at once
-            # Metadata only on first write - tifffile uses it for the entire file
-            tif.write(
-                data,
-                resolution=resolution,
-                metadata=imagej_metadata if t == 0 else None,
-                contiguous=True,
-            )
+            # Write each Z-slice as a 2D image
+            for z in range(data.shape[0]):
+                if first_write:
+                    # First frame: include ImageJ description and resolution
+                    tif.write(
+                        data[z],
+                        resolution=resolution,
+                        resolutionunit=tifffile.RESUNIT.MICROMETER,
+                        description=imagej_description,
+                        contiguous=True,
+                    )
+                    first_write = False
+                else:
+                    # Subsequent frames: just data
+                    tif.write(data[z], contiguous=True)
 
-            # Free memory immediately
+            # Free memory after each timepoint
             del data
 
     print(f"\n✓ TIFF Hyperstack Written Successfully")
