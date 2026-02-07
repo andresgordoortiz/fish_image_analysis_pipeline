@@ -793,15 +793,35 @@ with open('${metadata_json}', 'r') as f:
 # Load processed image
 img = tifffile.imread('t${t_formatted}_processed.tif')
 
-# Recalculate voxel sizes after scaling
-# NOTE: ROI cropping doesn't affect voxel size, only preprocessing scaling does
+# Recalculate voxel sizes after scaling AND isotropic reslicing
+# The preprocessing script (spim_pipeline_fixed.py) does TWO things:
+#   1. Rescales XY by image_scaling (0.5) -> XY voxel size doubles
+#   2. Reslices Z to make voxels isotropic -> Z slices are interpolated
+#
+# After XY scaling:
 x_res = metadata['x_resolution_um'] / ${cfg.image_scaling}
 y_res = metadata['y_resolution_um'] / ${cfg.image_scaling}
-z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
+original_z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
 
-print(f"Voxel sizes after preprocessing scaling:")
-print(f"  Original: {metadata['x_resolution_um']:.4f} x {metadata['y_resolution_um']:.4f} x {z_spacing:.4f} µm")
-print(f"  Scaled (×{${cfg.image_scaling}}): {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
+# After isotropic reslicing: the preprocessing script interpolates Z so that
+# z_spacing matches the scaled XY pixel size. We can compute the actual new
+# Z spacing from the original vs processed Z dimensions.
+original_z_slices = metadata['shape']['dimensions'][0]  # original Z count
+new_z_slices = img.shape[0]  # actual Z count after reslicing
+
+if new_z_slices != original_z_slices:
+    # Image was resliced to isotropic - recalculate Z spacing
+    z_spacing = original_z_slices * original_z_spacing / new_z_slices
+    print(f"Isotropic reslicing detected:")
+    print(f"  Z slices: {original_z_slices} -> {new_z_slices}")
+    print(f"  Z spacing: {original_z_spacing:.4f} -> {z_spacing:.4f} µm")
+else:
+    # No reslicing occurred (already isotropic)
+    z_spacing = original_z_spacing
+
+print(f"Voxel sizes after preprocessing:")
+print(f"  Original: {metadata['x_resolution_um']:.4f} x {metadata['y_resolution_um']:.4f} x {original_z_spacing:.4f} µm")
+print(f"  Final:    {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm (isotropic)")
 if metadata.get('was_roi_cropped', False):
     print(f"  (Image was ROI-cropped before preprocessing)")
 
@@ -951,10 +971,22 @@ with open('${metadata_json}', 'r') as f:
 # Load mask
 mask = tifffile.imread("t${t_formatted}_segmented.tif")
 
-# Calculate voxel sizes (accounting for preprocessing scaling)
+# Calculate voxel sizes (accounting for preprocessing scaling AND isotropic reslicing)
 x_res = metadata['x_resolution_um'] / ${image_scaling}
 y_res = metadata['y_resolution_um'] / ${image_scaling}
-z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
+original_z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
+
+# After isotropic reslicing, Z spacing changes to match scaled XY pixel size.
+# Compute from original vs actual Z dimensions.
+original_z_slices = metadata['shape']['dimensions'][0]
+new_z_slices = mask.shape[0]
+
+if new_z_slices != original_z_slices:
+    z_spacing = original_z_slices * original_z_spacing / new_z_slices
+else:
+    z_spacing = original_z_spacing
+
+print(f"Segmentation mask voxel size: {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
 
 # Re-save with metadata
 tifffile.imwrite(
