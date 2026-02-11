@@ -281,10 +281,22 @@ def main():
     # Calculate resolutions
     scaling = config.get("preprocessing", {}).get("image_scaling", 1.0)
 
-    # Metadata usually stores resolution in microns
+    # Metadata stores the ORIGINAL (pre-processing) resolution in microns
     vox_x = meta.get("x_resolution_um", 1.0) / scaling
     vox_y = meta.get("y_resolution_um", 1.0) / scaling
-    vox_z = meta.get("imagej", {}).get("spacing", 1.0)  # Z is typically not scaled
+    original_z_spacing = meta.get("imagej", {}).get("spacing", 1.0)
+
+    # The preprocessing script reslices the image to isotropic voxels.
+    # The actual Z spacing after reslicing can be computed from the original
+    # vs actual Z slice count. Read actual Z from the segmented files.
+    original_z_slices = meta.get("shape", {}).get("dimensions", [Z, Y, X])[0]
+    if Z != original_z_slices:
+        # Image was resliced to isotropic
+        vox_z = original_z_slices * original_z_spacing / Z
+        print(f"  Isotropic reslicing detected: Z slices {original_z_slices} -> {Z}")
+        print(f"  Z spacing: {original_z_spacing:.4f} -> {vox_z:.4f} µm")
+    else:
+        vox_z = original_z_spacing
 
     # Handle Y-Flip
     correct_y = out_cfg.get("correct_y", False)
