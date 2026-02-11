@@ -28,6 +28,13 @@ def image_scaling_intens(img, min_val, max_val, print_res=False):
     """Normalize image intensity to given range."""
     img_shape = img.shape
     img_type = img.dtype
+
+    # Replace NaN/Inf with 0 to prevent downstream failures
+    nan_count = np.count_nonzero(~np.isfinite(img))
+    if nan_count > 0:
+        print(f"    [Warning] Found {nan_count} NaN/Inf pixels — replacing with 0")
+        img = np.where(np.isfinite(img), img, 0)
+
     img_min = np.amin(img)
     img_max = np.amax(img)
 
@@ -45,7 +52,11 @@ def image_scaling_intens(img, min_val, max_val, print_res=False):
     else:
         scale = img_max - img_min
         new_scale = max_val - min_val
-        img = (new_scale * (img.astype(np.float32) - img_min) / scale) + min_val
+        if scale == 0:
+            # Constant image: assign min_val to avoid division by zero
+            img = np.full(img_shape, min_val, dtype=np.float32)
+        else:
+            img = (new_scale * (img.astype(np.float32) - img_min) / scale) + min_val
 
     img = img.astype(img_type.name)
 
@@ -193,9 +204,12 @@ def clahe_3d_stack(
             continue
         img01 = np.clip(img, lo, hi)
         img01 = (img01 - lo) / (hi - lo)
-        out[i] = exposure.equalize_adapthist(
+        result = exposure.equalize_adapthist(
             img01, kernel_size=kernel_size, clip_limit=clip_limit
         ).astype(np.float32, copy=False)
+        # Guard against NaN from skimage internal dtype conversions
+        np.nan_to_num(result, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+        out[i] = result
     out = np.moveaxis(out, 0, axis)
     if not preserve_dtype:
         return out
@@ -592,6 +606,10 @@ def main():
             args.padding : -args.padding,
             args.padding : -args.padding,
         ]
+        nan_count = np.count_nonzero(~np.isfinite(img))
+        if nan_count > 0:
+            print(f"    [Warning] 3D deconvolution produced {nan_count} NaN/Inf voxels — replacing with 0")
+            np.nan_to_num(img, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         t1 = time.time()
         print(f"[Timer] 3D deconvolution took {t1 - t0:.2f} seconds")
         print_resource_usage()
@@ -614,6 +632,10 @@ def main():
             args.padding : -args.padding,
             args.padding : -args.padding,
         ]
+        nan_count = np.count_nonzero(~np.isfinite(img_xz))
+        if nan_count > 0:
+            print(f"    [Warning] XZ deconvolution produced {nan_count} NaN/Inf voxels — replacing with 0")
+            np.nan_to_num(img_xz, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         img = np.transpose(img_xz, [1, 0, 2])
         t1 = time.time()
         print(f"[Timer] 2D (XZ) deconvolution took {t1 - t0:.2f} seconds")
