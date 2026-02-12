@@ -48,9 +48,15 @@ if (!file(params.merge_script).exists()) {
 }
 
 // Load configuration from JSON
+// Pre-process the file to handle invalid backslash escapes (e.g. "Position\ 5")
+// which are common when users copy shell-escaped paths into JSON
 def loadConfig(json_path) {
     def jsonSlurper = new groovy.json.JsonSlurper()
-    return jsonSlurper.parse(new File(json_path))
+    def raw = new File(json_path).text
+    // Remove backslashes that aren't valid JSON escapes (\\, \", \/, \b, \f, \n, \r, \t, \uXXXX)
+    // This turns "Position\ 5" into "Position 5"
+    raw = raw.replaceAll('\\\\(?![\\\\"/bfnrtu])', '')
+    return jsonSlurper.parseText(raw)
 }
 
 config = loadConfig(params.config_json)
