@@ -10,6 +10,10 @@
 
 nextflow.enable.dsl=2
 
+import java.nio.file.FileSystems
+import java.nio.file.Files
+import java.nio.file.Paths
+
 // Parameters - only config_json is required, everything else comes from it
 params.config_json = null
 params.preprocessing_script = './spim_pipeline_fixed.py'
@@ -1403,10 +1407,6 @@ workflow {
     // Parse input files with pattern: t####_Channel #.tif
     // Use java.nio.file.FileSystems to handle paths with spaces correctly
     // (Nextflow's fromPath glob can break on spaces in directory names)
-    import java.nio.file.FileSystems
-    import java.nio.file.Files
-    import java.nio.file.Paths
-
     def input_dir_path = Paths.get(params.input_dir)
     def glob_pattern = "t*_Channel ${params.channel}.tif"
     def matched_files = []
