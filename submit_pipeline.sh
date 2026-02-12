@@ -37,9 +37,15 @@ fi
 INPUT_DIR=$(sed -n '/"input"/,/}/p' "$CONFIG_JSON" | grep '"directory"' | sed 's/.*: *"\([^"]*\)".*/\1/')
 OUTPUT_DIR=$(sed -n '/"output"/,/}/p' "$CONFIG_JSON" | grep '"directory"' | sed 's/.*: *"\([^"]*\)".*/\1/')
 
+# Sanitize paths: remove shell-style backslash escaping (e.g. "Position\ 5" -> "Position 5")
+# and trailing slashes, in case users escape spaces in the JSON string
+INPUT_DIR=$(echo "$INPUT_DIR" | sed 's/\\\\//g; s/\\//g' | sed 's:/*$::')
+OUTPUT_DIR=$(echo "$OUTPUT_DIR" | sed 's/\\\\//g; s/\\//g' | sed 's:/*$::')
+
 # Validate input directory exists
 if [ ! -d "$INPUT_DIR" ]; then
     echo "ERROR: Input directory does not exist: $INPUT_DIR"
+    echo "  (If the path contains spaces, use plain spaces in config.json, not backslash-escaped)"
     exit 1
 fi
 
@@ -86,7 +92,7 @@ echo "Container: $CONTAINER_SIF (cached)"
 # Print summary
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$OUTPUT_DIR/pipeline_${TIMESTAMP}.log"
-N_FILES=$(find "$INPUT_DIR" -maxdepth 1 -type f \( -name "*.tif" -o -name "*.tiff" \) 2>/dev/null | wc -l)
+N_FILES=$(find "$INPUT_DIR" -maxdepth 1 -type f \( -name '*.tif' -o -name '*.tiff' \) 2>/dev/null | wc -l)
 
 echo ""
 echo "================================================"

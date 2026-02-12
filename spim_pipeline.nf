@@ -3,7 +3,7 @@
 /*
  * SPIM 4D Image Processing Pipeline
  * IMP Vienna - Andrés Gordo & Guilherme Ventura
- * 
+ *
  * Processes lightsheet microscopy data: deconvolution, segmentation, and merging
  * into a BigDataViewer-compatible 4D stack.
  */
@@ -21,7 +21,7 @@ if (params.help) {
     SPIM 4D Image Processing Pipeline
     ---------------------------------
     Usage: nextflow run spim_pipeline.nf --config_json config.json
-    
+
     All settings are in config.json.
     Submit with: sbatch submit_pipeline.sh
     """.stripIndent()
@@ -52,15 +52,23 @@ def loadConfig(json_path) {
 config = loadConfig(params.config_json)
 
 // Extract main parameters from config
-params.input_dir = config.input.directory
-params.output_dir = config.output.directory
+// Sanitize directory paths: strip backslash escaping and trailing slashes
+// Users sometimes write "Position\ 5" in JSON instead of "Position 5"
+def sanitizePath(String p) {
+    return p.replaceAll('\\\\', '').replaceAll('\\/', '/').replaceAll('/+$', '')
+}
+
+params.input_dir = sanitizePath(config.input.directory)
+params.output_dir = sanitizePath(config.output.directory)
 params.channel = config.input.channel
 params.container = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
 params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
 
 // Validate input directory
-if (!file(params.input_dir).exists()) {
+def input_dir_file = new File(params.input_dir)
+if (!input_dir_file.exists()) {
     log.error "Input directory not found: ${params.input_dir}"
+    log.error "If the path contains spaces, use plain spaces in config.json (not backslash-escaped)"
     exit 1
 }
 
@@ -74,8 +82,10 @@ if (!config.containsKey('roi_cropping')) {
 
 // Validate ROI file if cropping is enabled
 if (config.roi_cropping.enabled) {
-    if (!config.roi_cropping.containsKey('roi_path') || !file(config.roi_cropping.roi_path).exists()) {
-        log.error "ROI file not found: ${config.roi_cropping.roi_path}"
+    def roi_path = config.roi_cropping.containsKey('roi_path') ? sanitizePath(config.roi_cropping.roi_path) : null
+    if (roi_path) { config.roi_cropping.roi_path = roi_path }
+    if (!roi_path || !new File(roi_path).exists()) {
+        log.error "ROI file not found: ${roi_path}"
         exit 1
     }
 }
@@ -1060,7 +1070,7 @@ process MERGE_TO_HYPERSTACK {
     echo "Python version:"
     python3 --version
     echo ""
-    
+
     # Verify merge script is present
     if [ ! -f "${merge_script_name}" ]; then
         echo "ERROR: Merge script not found: ${merge_script_name}"
@@ -1068,7 +1078,7 @@ process MERGE_TO_HYPERSTACK {
         ls -lh
         exit 1
     fi
-    
+
     echo "Merge script: ${merge_script_name}"
     echo ""
 
@@ -1121,13 +1131,13 @@ PYTHON_CONFIG
     # Verify output files
     echo ""
     echo "Verifying output file or files..."
-    
+
     if [ ! -f "4D_hyperstack_metadata.json" ]; then
         echo "ERROR: Metadata file not created"
         exit 1
     fi
     echo "✓ Metadata file created"
-    
+
     # Check for TIFF or HDF5 output based on config
     if [ -f "4D_hyperstack.tif" ]; then
         FILE_SIZE=\$(du -h 4D_hyperstack.tif | cut -f1)
@@ -1142,7 +1152,7 @@ PYTHON_CONFIG
         echo "ERROR: No output file created (expected 4D_hyperstack.tif or 4D_hyperstack.h5)"
         exit 1
     fi
-    
+
     echo ""
     echo "✓ MERGE_TO_HYPERSTACK completed successfully"
     """
@@ -1391,11 +1401,32 @@ EOF
 
 workflow {
     // Parse input files with pattern: t####_Channel #.tif
-    input_pattern = "${params.input_dir}/t*_Channel ${params.channel}.tif"
+    // Use java.nio.file.FileSystems to handle paths with spaces correctly
+    // (Nextflow's fromPath glob can break on spaces in directory names)
+    import java.nio.file.FileSystems
+    import java.nio.file.Files
+    import java.nio.file.Paths
+
+    def input_dir_path = Paths.get(params.input_dir)
+    def glob_pattern = "t*_Channel ${params.channel}.tif"
+    def matched_files = []
+
+    def globMatcher = FileSystems.getDefault().getPathMatcher("glob:${glob_pattern}")
+    Files.list(input_dir_path).each { p ->
+        if (globMatcher.matches(p.getFileName())) {
+            matched_files.add(p.toFile())
+        }
+    }
+
+    if (matched_files.isEmpty()) {
+        error "No files found matching pattern: ${params.input_dir}/${glob_pattern}"
+    }
+
+    log.info "Found ${matched_files.size()} files matching pattern in: ${params.input_dir}"
 
     input_channel = Channel
-        .fromPath(input_pattern)
-        .ifEmpty { error "No files found matching pattern: ${input_pattern}" }
+        .fromList(matched_files.collect { f -> file(f.toPath()) })
+        .ifEmpty { error "No files found matching pattern: ${params.input_dir}/${glob_pattern}" }
         .map { file ->
             def matcher = (file.name =~ /t(\d+)_Channel/)
             if (matcher.find()) {
@@ -1414,7 +1445,7 @@ workflow {
 
     // Create channel for preprocessing script
     preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
-    
+
     // Create channel for merge script
     merge_script_ch = Channel.fromPath(params.merge_script, checkIfExists: true)
 
