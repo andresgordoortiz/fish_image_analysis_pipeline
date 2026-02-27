@@ -32,6 +32,9 @@ if [ ! -f "$CONFIG_JSON" ]; then
     exit 1
 fi
 
+shift 1
+EXTRA_NXF_ARGS="${@}"
+
 # Extract paths from config using grep/sed (simple JSON parsing)
 # We look for lines after "input" and "output" sections
 INPUT_DIR=$(sed -n '/"input"/,/}/p' "$CONFIG_JSON" | grep '"directory"' | sed 's/.*: *"\([^"]*\)".*/\1/')
@@ -115,6 +118,7 @@ nextflow run ./spim_pipeline.nf \
     -with-timeline "$OUTPUT_DIR/reports/timeline_${TIMESTAMP}.html" \
     -with-trace "$OUTPUT_DIR/reports/trace_${TIMESTAMP}.txt" \
     $TOWER_FLAG \
+    $EXTRA_NXF_ARGS \
     2>&1 | tee "$LOG_FILE" &
 
 pid=$!
