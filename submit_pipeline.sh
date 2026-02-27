@@ -26,13 +26,14 @@ module load java/21
 # Configuration file
 CONFIG_JSON="${1:-./config.json}"
 
-if [ ! -f "$CONFIG_JSON" ]; then
-    echo "ERROR: Configuration file not found: $CONFIG_JSON"
-    echo "Usage: sbatch submit_pipeline.sh [config.json]"
-    exit 1
+# Configuration file - only use $1 as config if it doesn't start with '-'
+if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+    CONFIG_JSON="$1"
+    shift 1
+else
+    CONFIG_JSON="./config.json"
 fi
 
-shift 1
 EXTRA_NXF_ARGS="${@}"
 
 # Extract paths from config using grep/sed (simple JSON parsing)
