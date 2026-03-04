@@ -23,9 +23,6 @@ module load build-env/f2022
 module load nextflow/25.04.7
 module load java/21
 
-# Configuration file
-CONFIG_JSON="${1:-./config.json}"
-
 # Configuration file - only use $1 as config if it doesn't start with '-'
 if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
     CONFIG_JSON="$1"

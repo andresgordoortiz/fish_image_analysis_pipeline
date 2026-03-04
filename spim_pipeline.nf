@@ -52,11 +52,31 @@ if (!file(params.merge_script).exists()) {
 // which are common when users copy shell-escaped paths into JSON
 def loadConfig(json_path) {
     def jsonSlurper = new groovy.json.JsonSlurper()
-    def raw = new File(json_path).text
+    // Use Nextflow's file() for proper path resolution relative to the launch/project directory.
+    // Do NOT use Java's new File() — its CWD may differ from the Nextflow launch directory.
+    def config_file = file(json_path.toString())
+    if (!config_file.exists()) {
+        log.error "Config file not found: ${json_path} (resolved to: ${config_file})"
+        exit 1
+    }
+    log.info "Loading config from: ${config_file}"
+    def raw = config_file.text
+    // Strip UTF-8 BOM if present (common when files are edited on Windows)
+    if (raw.length() > 0 && raw.charAt(0) == (char) 0xFEFF) {
+        raw = raw.substring(1)
+    }
+    raw = raw.trim()
     // Remove backslashes that aren't valid JSON escapes (\\, \", \/, \b, \f, \n, \r, \t, \uXXXX)
     // This turns "Position\ 5" into "Position 5"
     raw = raw.replaceAll('\\\\(?![\\\\"/bfnrtu])', '')
-    return jsonSlurper.parseText(raw)
+    try {
+        return jsonSlurper.parseText(raw)
+    } catch (Exception e) {
+        log.error "Failed to parse config JSON: ${config_file}"
+        log.error "First 200 characters of file content: ${raw.take(200)}"
+        log.error "Parse error: ${e.message}"
+        exit 1
+    }
 }
 
 config = loadConfig(params.config_json)
@@ -74,10 +94,10 @@ params.channel = config.input.channel
 params.container = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
 params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
 
-// Validate input directory
-def input_dir_file = new File(params.input_dir)
+// Validate input directory (use file() for Nextflow-native path resolution)
+def input_dir_file = file(params.input_dir)
 if (!input_dir_file.exists()) {
-    log.error "Input directory not found: ${params.input_dir}"
+    log.error "Input directory not found: ${params.input_dir} (resolved to: ${input_dir_file})"
     log.error "If the path contains spaces, use plain spaces in config.json (not backslash-escaped)"
     exit 1
 }
@@ -94,8 +114,8 @@ if (!config.containsKey('roi_cropping')) {
 if (config.roi_cropping.enabled) {
     def roi_path = config.roi_cropping.containsKey('roi_path') ? sanitizePath(config.roi_cropping.roi_path) : null
     if (roi_path) { config.roi_cropping.roi_path = roi_path }
-    if (!roi_path || !new File(roi_path).exists()) {
-        log.error "ROI file not found: ${roi_path}"
+    if (!roi_path || !file(roi_path).exists()) {
+        log.error "ROI file not found: ${roi_path} (resolved to: ${roi_path ? file(roi_path) : 'null'})"
         exit 1
     }
 }
