@@ -48,8 +48,17 @@ module load apptainer/1.3.4 2>/dev/null || module load singularity 2>/dev/null |
 }
 
 # Pull the container
-echo "Downloading container..."
+echo "Downloading main pipeline container..."
 apptainer pull --force "$CONTAINER_SIF" "$CONTAINER_URI"
+
+# Also pull the Fiji container (used for label downscaling)
+FIJI_DOCKER_URI="docker://fiji/fiji:20220415"
+echo ""
+echo "Downloading Fiji container (for label downscaling)..."
+apptainer pull --force --dir "$NXF_SINGULARITY_CACHEDIR" "$FIJI_DOCKER_URI" || {
+    echo "WARNING: Fiji container pull failed. Label downscaling will not be available."
+    echo "You can retry later or skip this if downscale_labels is set to 1.0"
+}
 
 echo ""
 echo "================================================"

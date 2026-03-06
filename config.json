@@ -14,7 +14,8 @@
   "output": {
     "directory": "./results/",
     "format": "bdv",
-    "correct_y": false
+    "correct_y": false,
+    "skip_merge": false
   },
 
   "seqera_tower": {
@@ -72,7 +73,8 @@
     "do_3d": true,
     "save_tif": true,
     "save_flows": false,
-    "save_npy": false
+    "save_npy": false,
+    "downscale_labels": 1.0
   },
 
   "system": {

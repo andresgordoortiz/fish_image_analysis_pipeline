@@ -42,11 +42,6 @@ if (!file(params.preprocessing_script).exists()) {
     exit 1
 }
 
-if (!file(params.merge_script).exists()) {
-    log.error "Merge script not found: ${params.merge_script}"
-    exit 1
-}
-
 // Load configuration from JSON
 // Pre-process the file to handle invalid backslash escapes (e.g. "Position\ 5")
 // which are common when users copy shell-escaped paths into JSON
@@ -120,9 +115,21 @@ if (config.roi_cropping.enabled) {
     }
 }
 
+// Set defaults for skip_merge and downscale_labels
+def skip_merge = config.output?.skip_merge ?: false
+def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
+
+// Validate downscale_labels range
+if (downscale_labels < 0.1 || downscale_labels > 1.0) {
+    log.error "downscale_labels must be between 0.1 and 1.0, got: ${downscale_labels}"
+    exit 1
+}
+
 // Pipeline startup info
 def voxel_info = config.voxel_size.auto_detect ? "Auto-detect" : "Manual: ${config.voxel_size.x_um} x ${config.voxel_size.y_um} x ${config.voxel_size.z_um} µm"
 def roi_info = config.roi_cropping.enabled ? "Enabled" : "Disabled"
+def merge_info = skip_merge ? "SKIPPED" : "Enabled"
+def downscale_info = downscale_labels < 1.0 ? "${downscale_labels} (Fiji nearest-neighbor)" : "Disabled"
 
 log.info """
 ================================================
@@ -133,6 +140,8 @@ Output       : ${params.output_dir}
 Channel      : ${params.channel}
 ROI Cropping : ${roi_info}
 Voxel Size   : ${voxel_info}
+Merge        : ${merge_info}
+Downscale    : ${downscale_info}
 ================================================
 """.stripIndent()
 
@@ -1189,239 +1198,90 @@ PYTHON_CONFIG
 }
 
 // ============================================================================
-// PROCESS: Generate QC Report
+// PROCESS: Downscale Segmented Labels (Fiji headless, nearest-neighbor)
 // ============================================================================
 
-process GENERATE_QC_REPORT {
+process DOWNSCALE_SEGMENTATION {
+    tag "t${String.format('%04d', timepoint)}"
+
     maxRetries 2
     errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
-    publishDir "${params.output_dir}/reports",
-        mode: 'copy'
+    publishDir "${params.output_dir}/02_segmented_downscaled",
+        mode: 'copy',
+        pattern: "*_downscaled.tif"
+
+    publishDir "${params.output_dir}/logs/downscaling",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.fiji_container
 
     input:
-    path all_logs
-    path hyperstack_metadata
-    path config_file
+    tuple val(timepoint), path(segmented_file)
+    val scale_factor
 
     output:
-    path "pipeline_report.html"
-    path "pipeline_summary.json"
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_downscaled.tif"), emit: downscaled
+    path "t${String.format('%04d', timepoint)}_downscale.log", emit: log
 
     script:
-    def config_filename = config_file.name
+    def t_formatted = String.format('%04d', timepoint)
+    def input_name = segmented_file.name
+    def output_name = "t${t_formatted}_downscaled.tif"
     """
     #!/bin/bash
-    set -e
+    set -euo pipefail
 
-    # Activate micromamba environment
-    eval "\$(micromamba shell hook --shell bash)"
-    micromamba activate microscopy_env
+    exec > >(tee t${t_formatted}_downscale.log) 2>&1
 
-    python3 << 'EOF'
-import json
-from pathlib import Path
-from datetime import datetime
+    echo "============================================"
+    echo "Downscaling segmented labels (Fiji headless)"
+    echo "Timepoint: ${timepoint}"
+    echo "Input: ${input_name}"
+    echo "Scale factor: ${scale_factor}"
+    echo "Interpolation: NONE (nearest neighbor)"
+    echo "============================================"
+    echo ""
 
-# Load hyperstack metadata
-with open('${hyperstack_metadata}', 'r') as f:
-    hyperstack_meta = json.load(f)
+    # Create Fiji macro for nearest-neighbor downscaling
+    # interpolation=None ensures label IDs are preserved (no blending)
+    cat > downscale.ijm << ENDMACRO
+open("\$PWD/${input_name}");
+factor = ${scale_factor};
+w = round(getWidth() * factor);
+h = round(getHeight() * factor);
+d = nSlices;
+print("Input dimensions: " + getWidth() + " x " + getHeight() + " x " + d);
+print("Output dimensions: " + w + " x " + h + " x " + d);
+print("Scale factor: " + factor);
+print("Interpolation: None (nearest neighbor)");
+run("Scale...", "x=" + factor + " y=" + factor + " z=1.0 width=" + w + " height=" + h + " depth=" + d + " interpolation=None process create");
+saveAs("Tiff", "\$PWD/${output_name}");
+print("Downscaled labels saved");
+run("Quit");
+ENDMACRO
 
-# Load config
-with open('${config_filename}', 'r') as f:
-    config = json.load(f)
+    echo "Fiji macro contents:"
+    cat downscale.ijm
+    echo ""
 
-# Collect all log files
-crop_logs = list(Path('.').glob('*_crop.log'))
-preprocess_logs = list(Path('.').glob('*_preprocess.log'))
-segment_logs = list(Path('.').glob('*_segment.log'))
+    # Run Fiji headless - no GUI, nearest-neighbor preserves label IDs
+    echo "Running Fiji headless..."
+    ImageJ-linux64 --headless --console -macro \$PWD/downscale.ijm
 
-# Generate summary
-summary = {
-    'pipeline_version': '1.0.0-with-roi-cropping',
-    'execution_date': datetime.now().isoformat(),
-    'input_channel': ${params.channel},
-    'roi_cropping': {
-        'enabled': hyperstack_meta.get('was_roi_cropped', False),
-        'n_timepoints_cropped': len(crop_logs) if crop_logs else 0
-    },
-    'voxel_size_configuration': {
-        'mode': hyperstack_meta['voxel_size'].get('source', 'unknown'),
-        'final_voxel_size_um': hyperstack_meta['voxel_size']
-    },
-    'configuration': config,
-    'results': {
-        'n_timepoints_processed': len(preprocess_logs),
-        'n_timepoints_segmented': len(segment_logs),
-        'final_hyperstack_shape': hyperstack_meta['shape'],
-        'voxel_size_um': hyperstack_meta['voxel_size']
-    }
-}
+    # Verify output
+    if [ ! -f "${output_name}" ]; then
+        echo "ERROR: Downscaled output not created: ${output_name}"
+        echo "Directory contents:"
+        ls -lha
+        exit 1
+    fi
 
-# Save summary JSON
-with open('pipeline_summary.json', 'w') as f:
-    json.dump(summary, f, indent=2)
-
-# Determine voxel size badge
-voxel_source = hyperstack_meta['voxel_size'].get('source', 'unknown')
-if voxel_source == 'auto_detected':
-    voxel_badge = '<span style="background-color: #27ae60; color: white; padding: 5px 10px; border-radius: 3px;">AUTO-DETECTED</span>'
-elif voxel_source == 'manual_override':
-    voxel_badge = '<span style="background-color: #e67e22; color: white; padding: 5px 10px; border-radius: 3px;">MANUAL OVERRIDE</span>'
-else:
-    voxel_badge = '<span style="background-color: #95a5a6; color: white; padding: 5px 10px; border-radius: 3px;">UNKNOWN</span>'
-
-# ROI cropping badge
-roi_cropped = hyperstack_meta.get('was_roi_cropped', False)
-roi_badge = '<span style="background-color: #3498db; color: white; padding: 5px 10px; border-radius: 3px;">YES</span>' if roi_cropped else '<span style="background-color: #95a5a6; color: white; padding: 5px 10px; border-radius: 3px;">NO</span>'
-
-# Prepare config sections for HTML (avoiding dict literals in f-strings)
-roi_cropping_section = ''
-if config.get('roi_cropping', {}).get('enabled', False):
-    roi_cropping_json = json.dumps(config.get('roi_cropping', {}), indent=2)
-    roi_cropping_section = f'<h3>ROI Cropping</h3>\\n<pre>{roi_cropping_json}</pre>'
-
-voxel_size_default = {'auto_detect': True}
-voxel_size_json = json.dumps(config.get('voxel_size', voxel_size_default), indent=2)
-
-preprocessing_json = json.dumps(config['preprocessing'], indent=2)
-segmentation_json = json.dumps(config['segmentation'], indent=2)
-
-roi_step = ''
-if roi_cropped:
-    roi_path = config.get('roi_cropping', {}).get('roi_path', 'N/A')
-    roi_step = f'<li><strong>ROI Cropping</strong> - Applied ROI from {roi_path} to all timepoints</li>'
-
-roi_output_row = ''
-if roi_cropped:
-    roi_output_row = '<tr><td>00_cropped/</td><td>ROI-cropped images per timepoint</td></tr>'
-
-# Generate HTML report
-html = f'''<!DOCTYPE html>
-<html>
-<head>
-    <title>SPIM Pipeline Report</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }}
-        .container {{ max-width: 1200px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
-        h2 {{ color: #34495e; margin-top: 30px; border-bottom: 2px solid #ecf0f1; padding-bottom: 5px; }}
-        table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
-        th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
-        th {{ background-color: #3498db; color: white; }}
-        tr:nth-child(even) {{ background-color: #f9f9f9; }}
-        .success {{ color: #27ae60; font-weight: bold; }}
-        .info {{ color: #3498db; font-weight: bold; }}
-        .warning {{ color: #f39c12; }}
-        pre {{ background-color: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; border-left: 4px solid #3498db; }}
-        .metric {{ background-color: #ecf0f1; padding: 15px; margin: 10px 0; border-radius: 5px; }}
-        .metric-value {{ font-size: 24px; font-weight: bold; color: #2c3e50; }}
-        .metric-label {{ font-size: 14px; color: #7f8c8d; }}
-        .highlight-box {{ background-color: #fff3cd; border-left: 4px solid #f39c12; padding: 15px; margin: 20px 0; border-radius: 5px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔬 SPIM 4D Image Processing Pipeline Report</h1>
-
-        <div class="metric">
-            <div class="metric-value">{hyperstack_meta['n_timepoints']} Timepoints</div>
-            <div class="metric-label">Successfully processed and merged into 4D hyperstack</div>
-        </div>
-
-        <div class="highlight-box">
-            <h3 style="margin-top: 0;">✂️ ROI Cropping</h3>
-            <p><strong>Enabled:</strong> {roi_badge}</p>
-            {f'<p><strong>Timepoints cropped:</strong> {len(crop_logs)}</p>' if roi_cropped else ''}
-            <p><em>Note: ROI cropping reduces image dimensions but preserves voxel spacing</em></p>
-        </div>
-
-        <div class="highlight-box">
-            <h3 style="margin-top: 0;">📏 Voxel Size Configuration</h3>
-            <p><strong>Mode:</strong> {voxel_badge}</p>
-            <p><strong>Final voxel size:</strong> {hyperstack_meta['voxel_size']['x_um']:.4f} × {hyperstack_meta['voxel_size']['y_um']:.4f} × {hyperstack_meta['voxel_size']['z_um']:.4f} µm</p>
-        </div>
-
-        <h2>📊 Execution Summary</h2>
-        <table>
-            <tr><th>Parameter</th><th>Value</th></tr>
-            <tr><td>Pipeline Version</td><td>{summary['pipeline_version']}</td></tr>
-            <tr><td>Execution Date</td><td>{summary['execution_date']}</td></tr>
-            <tr><td>Input Channel</td><td class="info">{summary['input_channel']}</td></tr>
-            <tr><td>ROI Cropping Enabled</td><td>{roi_badge}</td></tr>
-            <tr><td>Timepoints Preprocessed</td><td class="success">{summary['results']['n_timepoints_processed']}</td></tr>
-            <tr><td>Timepoints Segmented</td><td class="success">{summary['results']['n_timepoints_segmented']}</td></tr>
-        </table>
-
-        <h2>🎯 Final Hyperstack Details</h2>
-        <table>
-            <tr><th>Property</th><th>Value</th></tr>
-            <tr><td>Axes Order</td><td class="info">TZYX</td></tr>
-            <tr><td>T (Timepoints)</td><td>{hyperstack_meta['shape']['T']}</td></tr>
-            <tr><td>Z (Slices)</td><td>{hyperstack_meta['shape']['Z']}</td></tr>
-            <tr><td>Y (Height)</td><td>{hyperstack_meta['shape']['Y']}</td></tr>
-            <tr><td>X (Width)</td><td>{hyperstack_meta['shape']['X']}</td></tr>
-            <tr><td>ROI Cropped</td><td>{roi_badge}</td></tr>
-            <tr><td>Voxel Size Source</td><td>{voxel_badge}</td></tr>
-            <tr><td>X Resolution</td><td>{hyperstack_meta['voxel_size']['x_um']:.4f} µm</td></tr>
-            <tr><td>Y Resolution</td><td>{hyperstack_meta['voxel_size']['y_um']:.4f} µm</td></tr>
-            <tr><td>Z Spacing</td><td>{hyperstack_meta['voxel_size']['z_um']:.4f} µm</td></tr>
-            <tr><td>Data Type</td><td>{hyperstack_meta['dtype']}</td></tr>
-            <tr><td>Label Image</td><td class="success">Yes (segmentation masks)</td></tr>
-        </table>
-
-        <h2>⚙️ Processing Configuration</h2>
-
-        {roi_cropping_section}
-
-        <h3>Voxel Size Settings</h3>
-        <pre>{voxel_size_json}</pre>
-
-        <h3>Preprocessing</h3>
-        <pre>{preprocessing_json}</pre>
-
-        <h3>Segmentation (Cellpose)</h3>
-        <pre>{segmentation_json}</pre>
-
-        <h2>📋 Pipeline Steps</h2>
-        <ol>
-            <li><strong>File Parsing</strong> - Extracted timepoints from filename pattern (t####_Channel #.tif)</li>
-            {roi_step}
-            <li><strong>Metadata Extraction/Configuration</strong> - {'Auto-detected' if voxel_source == 'auto_detected' else 'Manual override of'} voxel sizes from image metadata</li>
-            <li><strong>Preprocessing & Deconvolution</strong> - Applied corrections and deconvolution per timepoint</li>
-            <li><strong>Cellpose Segmentation</strong> - 3D cell segmentation per timepoint</li>
-            <li><strong>Hyperstack Merging</strong> - Combined all timepoints into single 4D TIFF with preserved metadata</li>
-        </ol>
-
-        <h2>📂 Output Files</h2>
-        <table>
-            <tr><th>Directory</th><th>Contents</th></tr>
-            {roi_output_row}
-            <tr><td>01_preprocessed/</td><td>Preprocessed and deconvolved images per timepoint</td></tr>
-            <tr><td>02_segmented/</td><td>Cellpose segmentation masks per timepoint</td></tr>
-            <tr><td>03_hyperstack/</td><td><strong>4D_hyperstack.tif</strong> - Final merged 4D image</td></tr>
-            <tr><td>metadata/</td><td>JSON metadata files with voxel size information</td></tr>
-            <tr><td>logs/</td><td>Processing logs for debugging</td></tr>
-            <tr><td>reports/</td><td>This QC report</td></tr>
-        </table>
-
-        <div class="metric">
-            <div class="metric-label">✅ Pipeline completed successfully</div>
-        </div>
-
-        <p style="text-align: center; color: #7f8c8d; margin-top: 30px;">
-            <em>Report generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</em>
-        </p>
-    </div>
-</body>
-</html>
-'''
-
-with open('pipeline_report.html', 'w') as f:
-    f.write(html)
-
-print("QC report generated successfully")
-EOF
+    FILE_SIZE=\$(du -h "${output_name}" | cut -f1)
+    echo ""
+    echo "Downscaled labels saved: ${output_name} (\$FILE_SIZE)"
+    echo "Timepoint ${timepoint} downscaling complete"
     """
 }
 
@@ -1472,8 +1332,10 @@ workflow {
     // Create channel for preprocessing script
     preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
 
-    // Create channel for merge script
-    merge_script_ch = Channel.fromPath(params.merge_script, checkIfExists: true)
+    // Create channel for merge script (only needed if merge is enabled)
+    if (!skip_merge) {
+        merge_script_ch = Channel.fromPath(params.merge_script, checkIfExists: true)
+    }
 
     // OPTIONAL: ROI Cropping Step
     if (config.roi_cropping.enabled) {
@@ -1520,36 +1382,31 @@ workflow {
         config.preprocessing.image_scaling
     )
 
-    // 4. Collect all segmented timepoints and merge into 4D hyperstack
-    all_segmented = CELLPOSE_SEGMENT.out.segmented
-        .map { timepoint, segmented_file -> segmented_file }
-        .collect()
-
-    MERGE_TO_HYPERSTACK(
-        all_segmented,
-        shared_metadata,
-        merge_script_ch.collect()
-    )
-
-    // 5. Generate QC report
-    all_logs = Channel.empty()
-
-    if (config.roi_cropping.enabled) {
-        all_logs = all_logs.mix(CROP_WITH_ROI.out.log)
+    // 4. OPTIONAL: Downscale segmented labels using Fiji headless (nearest-neighbor)
+    if (downscale_labels < 1.0) {
+        log.info "Label downscaling enabled: factor=${downscale_labels} (Fiji nearest-neighbor, no interpolation)"
+        DOWNSCALE_SEGMENTATION(
+            CELLPOSE_SEGMENT.out.segmented,
+            downscale_labels
+        )
     }
 
-    all_logs = all_logs
-        .mix(PREPROCESS_DECONVOLVE.out.log)
-        .mix(CELLPOSE_SEGMENT.out.log)
-        .collect()
-// Create channel for config file
-    config_file_ch = Channel.fromPath(params.config_json, checkIfExists: true)
+    // 5. OPTIONAL: Merge all segmented timepoints into 4D hyperstack
+    if (!skip_merge) {
+        log.info "Hyperstack merging enabled"
 
-    GENERATE_QC_REPORT(
-        all_logs,
-        MERGE_TO_HYPERSTACK.out.metadata,
-        config_file_ch.collect()  // <-- File channel
-    )
+        all_segmented = CELLPOSE_SEGMENT.out.segmented
+            .map { timepoint, segmented_file -> segmented_file }
+            .collect()
+
+        MERGE_TO_HYPERSTACK(
+            all_segmented,
+            shared_metadata,
+            merge_script_ch.collect()
+        )
+    } else {
+        log.info "Hyperstack merging SKIPPED (skip_merge=true)"
+    }
 }
 
 // ============================================================================
@@ -1559,6 +1416,9 @@ workflow {
 workflow.onComplete {
     def voxel_mode = config.voxel_size?.auto_detect ? "Auto-detected" : "Manual override"
     def roi_status = config.roi_cropping?.enabled ? "ENABLED" : "DISABLED"
+    def merge_status = (config.output?.skip_merge ?: false) ? "SKIPPED" : "ENABLED"
+    def ds_factor = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
+    def downscale_status = ds_factor < 1.0 ? "ENABLED (${ds_factor})" : "DISABLED"
 
     log.info """
     ============================================================================
@@ -1569,14 +1429,16 @@ workflow.onComplete {
     Channel      : ${params.channel}
     ROI cropping : ${roi_status}
     Voxel mode   : ${voxel_mode}
+    Merge        : ${merge_status}
+    Downscale    : ${downscale_status}
     Output dir   : ${params.output_dir}
 
     Results:
       ${config.roi_cropping?.enabled ? "- Cropped images     : ${params.output_dir}/00_cropped/" : ""}
       - Preprocessed images : ${params.output_dir}/01_preprocessed/
       - Segmented masks     : ${params.output_dir}/02_segmented/
-      - 4D Hyperstack       : ${params.output_dir}/03_hyperstack/4D_hyperstack.tif
-      - QC report           : ${params.output_dir}/reports/pipeline_report.html
+      ${ds_factor < 1.0 ? "- Downscaled labels  : ${params.output_dir}/02_segmented_downscaled/" : ""}
+      ${!(config.output?.skip_merge ?: false) ? "- 4D Hyperstack      : ${params.output_dir}/03_hyperstack/" : ""}
       - Logs                : ${params.output_dir}/logs/
 
     Completed at: ${workflow.complete}
