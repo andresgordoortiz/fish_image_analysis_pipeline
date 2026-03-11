@@ -18,6 +18,7 @@ import java.nio.file.Paths
 params.config_json = null
 params.preprocessing_script = './spim_pipeline_fixed.py'
 params.merge_script = './merge_hyperstack.py'
+params.benchmark_script = './benchmark_pipeline.py'
 params.help = false
 
 if (params.help) {
@@ -1322,6 +1323,82 @@ ENDMACRO
 }
 
 // ============================================================================
+// PROCESS: Benchmark Pipeline Outputs
+// ============================================================================
+
+process BENCHMARK {
+    tag "benchmark"
+
+    maxRetries 1
+    errorStrategy 'ignore'  // Benchmark failure should not fail the pipeline
+
+    publishDir "${params.output_dir}/benchmark",
+        mode: 'copy',
+        pattern: "benchmark_*"
+
+    publishDir "${params.output_dir}/logs/benchmark",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    path preprocessed_files
+    path segmented_files
+    path benchmark_script
+
+    output:
+    path "benchmark_results.csv", emit: csv
+    path "benchmark_results.json", emit: json
+    path "benchmark.log", emit: log
+
+    script:
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    # Activate micromamba environment
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    exec > >(tee benchmark.log) 2>&1
+
+    echo "============================================"
+    echo "Running Pipeline Benchmark"
+    echo "============================================"
+
+    # Create directory structure expected by benchmark script
+    mkdir -p results_tmp/01_preprocessed results_tmp/02_segmented
+
+    # Link preprocessed files
+    for f in *_processed.tif; do
+        [ -f "\$f" ] && ln -s "\$PWD/\$f" results_tmp/01_preprocessed/
+    done
+
+    # Link segmented files
+    for f in *_segmented.tif; do
+        [ -f "\$f" ] && ln -s "\$PWD/\$f" results_tmp/02_segmented/
+    done
+
+    echo "Preprocessed files:"
+    ls -lh results_tmp/01_preprocessed/ 2>/dev/null || echo "  (none)"
+    echo "Segmented files:"
+    ls -lh results_tmp/02_segmented/ 2>/dev/null || echo "  (none)"
+    echo ""
+
+    # Run benchmark
+    python3 ${benchmark_script.name} \\
+        --results_dir results_tmp/ \\
+        --labels "pipeline_run" \\
+        --output_csv benchmark_results.csv \\
+        --output_json benchmark_results.json
+
+    echo ""
+    echo "Benchmark completed"
+    """
+}
+
+// ============================================================================
 // MAIN WORKFLOW
 // ============================================================================
 
@@ -1443,6 +1520,31 @@ workflow {
     } else {
         log.info "Hyperstack merging SKIPPED (skip_merge=true)"
     }
+
+    // 6. OPTIONAL: Benchmark pipeline outputs
+    def run_benchmark = config.benchmark?.enabled ?: false
+    if (run_benchmark) {
+        log.info "Benchmarking enabled - will compute quality metrics"
+
+        benchmark_script_ch = Channel.fromPath(params.benchmark_script, checkIfExists: true)
+
+        // Collect all preprocessed and segmented files
+        all_preprocessed = PREPROCESS_DECONVOLVE.out.processed
+            .map { timepoint, processed_file -> processed_file }
+            .collect()
+
+        all_seg_for_bench = CELLPOSE_SEGMENT.out.segmented
+            .map { timepoint, segmented_file -> segmented_file }
+            .collect()
+
+        BENCHMARK(
+            all_preprocessed,
+            all_seg_for_bench,
+            benchmark_script_ch.collect()
+        )
+    } else {
+        log.info "Benchmarking disabled"
+    }
 }
 
 // ============================================================================
@@ -1456,6 +1558,8 @@ workflow.onComplete {
     def ds_factor = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
     def downscale_status = ds_factor < 1.0 ? "ENABLED (${ds_factor})" : "DISABLED"
 
+    def benchmark_status = (config.benchmark?.enabled ?: false) ? "ENABLED" : "DISABLED"
+
     log.info """
     ============================================================================
     Pipeline completed!
@@ -1467,6 +1571,7 @@ workflow.onComplete {
     Voxel mode   : ${voxel_mode}
     Merge        : ${merge_status}
     Downscale    : ${downscale_status}
+    Benchmark    : ${benchmark_status}
     Output dir   : ${params.output_dir}
 
     Results:
@@ -1475,6 +1580,7 @@ workflow.onComplete {
       - Segmented masks     : ${params.output_dir}/02_segmented/
       ${ds_factor < 1.0 ? "- Downscaled labels  : ${params.output_dir}/02_segmented_downscaled/" : ""}
       ${!(config.output?.skip_merge ?: false) ? "- 4D Hyperstack      : ${params.output_dir}/03_hyperstack/" : ""}
+      ${(config.benchmark?.enabled ?: false) ? "- Benchmark          : ${params.output_dir}/benchmark/" : ""}
       - Logs                : ${params.output_dir}/logs/
 
     Completed at: ${workflow.complete}

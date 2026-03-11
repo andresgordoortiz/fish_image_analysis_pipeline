@@ -82,6 +82,10 @@
     "downscale_labels": 1.0
   },
 
+  "benchmark": {
+    "enabled": true
+  },
+
   "system": {
     "container_image": "library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559",
     "fiji_container_image": "docker://fiji/fiji:20220415",
