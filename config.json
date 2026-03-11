@@ -41,7 +41,9 @@
     "deconvolution": {
       "niter": 6,
       "niterz": 6,
-      "padding": 32
+      "padding": 32,
+      "padding_mode": "reflect",
+      "edge_mask_px": 0
     },
     "normalization": {
       "min_v": 0,
@@ -71,6 +73,9 @@
     "cellprob_threshold": 0.0,
     "use_gpu": true,
     "do_3d": true,
+    "anisotropy": null,
+    "stitch_threshold": null,
+    "min_size": 15,
     "save_tif": true,
     "save_flows": false,
     "save_npy": false,

@@ -119,6 +119,23 @@ if (config.roi_cropping.enabled) {
 def skip_merge = config.output?.skip_merge ?: false
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
 
+// Set defaults for new optional parameters
+if (!config.preprocessing.deconvolution.containsKey('padding_mode')) {
+    config.preprocessing.deconvolution.padding_mode = 'reflect'
+}
+if (!config.preprocessing.deconvolution.containsKey('edge_mask_px')) {
+    config.preprocessing.deconvolution.edge_mask_px = 0
+}
+if (!config.segmentation.containsKey('anisotropy')) {
+    config.segmentation.anisotropy = null
+}
+if (!config.segmentation.containsKey('stitch_threshold')) {
+    config.segmentation.stitch_threshold = null
+}
+if (!config.segmentation.containsKey('min_size')) {
+    config.segmentation.min_size = 15
+}
+
 // Validate downscale_labels range
 if (downscale_labels < 0.1 || downscale_labels > 1.0) {
     log.error "downscale_labels must be between 0.1 and 1.0, got: ${downscale_labels}"
@@ -130,6 +147,8 @@ def voxel_info = config.voxel_size.auto_detect ? "Auto-detect" : "Manual: ${conf
 def roi_info = config.roi_cropping.enabled ? "Enabled" : "Disabled"
 def merge_info = skip_merge ? "SKIPPED" : "Enabled"
 def downscale_info = downscale_labels < 1.0 ? "${downscale_labels} (Fiji nearest-neighbor)" : "Disabled"
+def edge_mask_info = config.preprocessing.deconvolution.edge_mask_px > 0 ? "${config.preprocessing.deconvolution.edge_mask_px}px" : "Disabled"
+def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stitch_threshold != null ? "2D+Stitch(${config.segmentation.stitch_threshold})" : "2D")
 
 log.info """
 ================================================
@@ -142,6 +161,9 @@ ROI Cropping : ${roi_info}
 Voxel Size   : ${voxel_info}
 Merge        : ${merge_info}
 Downscale    : ${downscale_info}
+Pad mode     : ${config.preprocessing.deconvolution.padding_mode}
+Edge mask    : ${edge_mask_info}
+Seg mode     : ${seg_mode_info}
 ================================================
 """.stripIndent()
 
@@ -742,7 +764,9 @@ cmd = [
     '--resolution_px0', str(config['background_subtraction']['resolution_px0']),
     '--resolution_pz0', str(config['background_subtraction']['resolution_pz0']),
     '--noise_lvl', str(config['background_subtraction']['noise_lvl']),
-    '--padding', str(config['deconvolution']['padding'])
+    '--padding', str(config['deconvolution']['padding']),
+    '--padding_mode', str(config['deconvolution'].get('padding_mode', 'reflect')),
+    '--edge_mask_px', str(config['deconvolution'].get('edge_mask_px', 0))
 ]
 
 # Add optional flags from correction_flags
@@ -976,6 +1000,18 @@ if config.get('save_flows', False):
     cmd.append('--save_flows')
 if not config.get('save_npy', True):
     cmd.append('--no_npy')
+
+# Add anisotropy if specified
+if config.get('anisotropy') is not None:
+    cmd.extend(['--anisotropy', str(config['anisotropy'])])
+
+# Add stitch_threshold for 2D+stitch mode (only when do_3d is False)
+if config.get('stitch_threshold') is not None and not config.get('do_3d', False):
+    cmd.extend(['--stitch_threshold', str(config['stitch_threshold'])])
+
+# Add min_size if specified
+if config.get('min_size') is not None:
+    cmd.extend(['--min_size', str(config['min_size'])])
 
 print("Running Cellpose:", ' '.join(cmd))
 print("")

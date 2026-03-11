@@ -417,6 +417,15 @@ def main():
     parser.add_argument(
         "--sigma", type=float, default=1.0, help="Gaussian smoothing sigma"
     )
+    parser.add_argument(
+        "--padding_mode", type=str, default="reflect",
+        choices=["reflect", "edge", "constant", "symmetric", "wrap"],
+        help="Padding mode for deconvolution (default: reflect)"
+    )
+    parser.add_argument(
+        "--edge_mask_px", type=int, default=0,
+        help="Zero out this many border pixels after deconvolution to remove edge artifacts (0=disabled)"
+    )
 
     args = parser.parse_args()
 
@@ -594,7 +603,7 @@ def main():
         t0 = time.time()
         print("[Check-in] Running 3D deconvolution...")
         img = image_scaling_intens(img, args.min_v, args.max_v, True)
-        img = np.pad(img, args.padding, mode="reflect")
+        img = np.pad(img, args.padding, mode=args.padding_mode)
         imgSizeGB = img.nbytes / (1024**3)
         print(f"    -size(GB) : {imgSizeGB:.3f}")
         print_resource_usage()
@@ -620,7 +629,7 @@ def main():
         img = image_scaling_intens(img, args.min_v, args.max_v, True)
         img_xz = np.transpose(img, [1, 0, 2])
         psf_xz = np.transpose(psf, [1, 0, 2])
-        img_xz = np.pad(img_xz, args.padding, mode="reflect")
+        img_xz = np.pad(img_xz, args.padding, mode=args.padding_mode)
         imgSizeGB = img_xz.nbytes / (1024**3)
         print(f"    img_xz -size(GB) : {imgSizeGB:.3f}")
         print_resource_usage()
@@ -640,6 +649,17 @@ def main():
         t1 = time.time()
         print(f"[Timer] 2D (XZ) deconvolution took {t1 - t0:.2f} seconds")
         print_resource_usage()
+
+    # Edge masking: zero out border pixels to remove deconvolution edge artifacts
+    if args.edge_mask_px > 0 and (args.niter > 0 or args.niterz > 0):
+        b = args.edge_mask_px
+        print(f"[Check-in] Applying edge mask: zeroing {b}px border...")
+        img[:b, :, :] = 0
+        img[-b:, :, :] = 0
+        img[:, :b, :] = 0
+        img[:, -b:, :] = 0
+        img[:, :, :b] = 0
+        img[:, :, -b:] = 0
 
     # Post-processing
     t0 = time.time()
