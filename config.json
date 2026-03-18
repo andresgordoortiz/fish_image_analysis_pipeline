@@ -39,12 +39,12 @@
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
     "image_scaling": 0.5,
     "deconvolution": {
-      "niter": 6,
-      "niterz": 6,
-      "padding": 32,
-      "padding_mode": "reflect",
-      "edge_mask_px": 0,
-      "edge_taper_width": 0
+      "niter": 3,
+      "niterz": 3,
+      "padding": 64,
+      "padding_mode": "edge",
+      "edge_mask_px": 8,
+      "edge_taper_width": 24
     },
     "normalization": {
       "min_v": 0,

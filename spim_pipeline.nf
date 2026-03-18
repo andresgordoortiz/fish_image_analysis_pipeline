@@ -1541,6 +1541,10 @@ workflow {
 
         benchmark_script_ch = Channel.fromPath(params.benchmark_script, checkIfExists: true)
 
+        // Resolve output_dir to absolute path (it may be relative like './results/')
+        def abs_output_dir = file(params.output_dir).toAbsolutePath().toString()
+        log.info "Benchmark will read from: ${abs_output_dir}"
+
         // Wait for segmentation to finish, then run benchmark on the publishDir directly.
         // This avoids staging hundreds of GB of TIF files into the benchmark work dir.
         ready_signal = CELLPOSE_SEGMENT.out.segmented
@@ -1548,7 +1552,7 @@ workflow {
             .collect()
 
         BENCHMARK(
-            params.output_dir,
+            abs_output_dir,
             ready_signal,
             benchmark_script_ch.collect()
         )
