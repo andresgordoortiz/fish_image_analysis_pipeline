@@ -8,7 +8,7 @@
 # SPIM Pipeline Submission Script
 # All configuration is in config.json - edit that file, not this one!
 
-set -euo pipefail
+set -uo pipefail
 
 # Handle job cancellation gracefully
 _term() {
@@ -18,10 +18,21 @@ _term() {
 }
 trap _term TERM INT
 
-# Load required modules
-module load build-env/f2022
-module load nextflow/25.04.7
-module load java/21
+# Load required modules (module load can return non-zero on HPC systems even on success)
+echo "Loading modules..."
+module load build-env/f2022 2>&1 || true
+module load nextflow/25.04.7 2>&1 || true
+module load java/21 2>&1 || true
+
+# Verify critical commands are available
+if ! command -v nextflow &>/dev/null; then
+    echo "ERROR: nextflow not found after module load. Check 'module avail nextflow'."
+    exit 1
+fi
+echo "Modules loaded: nextflow $(nextflow -version 2>&1 | grep -oP 'version \K\S+' || echo '?')"
+
+# Re-enable strict error handling for the rest of the script
+set -e
 
 # Configuration file - only use $1 as config if it doesn't start with '-'
 if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
