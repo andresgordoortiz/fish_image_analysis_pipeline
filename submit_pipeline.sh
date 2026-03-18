@@ -84,16 +84,27 @@ mkdir -p "$CACHE_DIR" "$CACHE_DIR/tmp" "$NXF_TEMP"
 CONTAINER_BASENAME="andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img"
 CONTAINER_SIF="$CACHE_DIR/$CONTAINER_BASENAME"
 if [ ! -f "$CONTAINER_SIF" ]; then
-    # Check legacy location (output dir based cache)
-    OLD_CACHE="$OUTPUT_DIR/singularity_images/$CONTAINER_BASENAME"
-    if [ -f "$OLD_CACHE" ]; then
-        echo "Migrating container cache to project-level location..."
-        cp -L "$OLD_CACHE" "$CONTAINER_SIF"
+    # Search legacy locations: output dir and any results_*/singularity_images/ folders
+    FOUND=""
+    for SEARCH_DIR in \
+        "$OUTPUT_DIR/singularity_images" \
+        "$SCRIPT_DIR"/results*/singularity_images \
+        "$SCRIPT_DIR"/results_*/singularity_images; do
+        if [ -f "$SEARCH_DIR/$CONTAINER_BASENAME" ]; then
+            FOUND="$SEARCH_DIR/$CONTAINER_BASENAME"
+            break
+        fi
+    done
+
+    if [ -n "$FOUND" ]; then
+        echo "Found container at: $FOUND"
+        echo "Migrating to project-level cache: $CACHE_DIR/"
+        cp -L "$FOUND" "$CONTAINER_SIF"
     else
         echo ""
         echo "ERROR: Container image not found!"
         echo "  Checked: $CONTAINER_SIF"
-        echo "  Also checked: $OLD_CACHE"
+        echo "  Also searched: results*/singularity_images/"
         echo "Run the setup script from the login node first:"
         echo "  ./setup_container.sh"
         echo ""
