@@ -1356,7 +1356,7 @@ process BENCHMARK {
     output:
     path "benchmark_results.csv", emit: csv, optional: true
     path "benchmark_results.json", emit: json, optional: true
-    path "benchmark.log", emit: log
+    path "benchmark.log", emit: log, optional: true
 
     script:
     """
@@ -1367,47 +1367,66 @@ process BENCHMARK {
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
 
-    # All output to log file
-    {
-        echo "============================================"
-        echo "Running Pipeline Benchmark"
-        echo "============================================"
-        echo "Results directory: ${results_dir}"
-        echo "Python: \$(which python3)"
-        echo ""
+    echo "============================================"
+    echo "Running Pipeline Benchmark"
+    echo "============================================"
+    echo "Results directory: ${results_dir}"
+    echo "Python: \$(which python3)"
+    echo ""
 
-        # Check files exist in the publishDir
-        echo "=== Preprocessed files ==="
-        ls -lh ${results_dir}/01_preprocessed/*.tif 2>/dev/null | head -20 || echo "  (none found)"
-        PREPROC_COUNT=\$(ls ${results_dir}/01_preprocessed/*_processed.tif 2>/dev/null | wc -l)
-        echo "Total preprocessed: \$PREPROC_COUNT"
-        echo ""
+    # Check files exist in the publishDir
+    echo "=== Preprocessed files ==="
+    ls -lh ${results_dir}/01_preprocessed/*_processed.tif 2>/dev/null | head -10 || echo "  (none found)"
+    PREPROC_COUNT=\$(ls ${results_dir}/01_preprocessed/*_processed.tif 2>/dev/null | wc -l | tr -d ' ')
+    echo "Total preprocessed: \$PREPROC_COUNT"
+    echo ""
 
-        echo "=== Segmented files ==="
-        ls -lh ${results_dir}/02_segmented/*.tif 2>/dev/null | head -20 || echo "  (none found)"
-        SEG_COUNT=\$(ls ${results_dir}/02_segmented/*_segmented.tif 2>/dev/null | wc -l)
-        echo "Total segmented: \$SEG_COUNT"
-        echo ""
+    echo "=== Segmented files ==="
+    ls -lh ${results_dir}/02_segmented/*_segmented.tif 2>/dev/null | head -10 || echo "  (none found)"
+    SEG_COUNT=\$(ls ${results_dir}/02_segmented/*_segmented.tif 2>/dev/null | wc -l | tr -d ' ')
+    echo "Total segmented: \$SEG_COUNT"
+    echo ""
 
-        if [ "\$PREPROC_COUNT" -eq 0 ] && [ "\$SEG_COUNT" -eq 0 ]; then
-            echo "ERROR: No pipeline output files found in ${results_dir}"
-            echo "Check that preprocessing and segmentation completed successfully."
-            exit 1
+    if [ "\$PREPROC_COUNT" -eq 0 ] && [ "\$SEG_COUNT" -eq 0 ]; then
+        echo "ERROR: No pipeline output files found in ${results_dir}"
+        echo "Check that preprocessing and segmentation completed successfully."
+        exit 1
+    fi
+
+    # Sample up to 3 timepoints for fast benchmarking
+    # Find timepoint numbers from filenames and pick first, middle, last
+    TIMEPOINTS=\$(ls ${results_dir}/01_preprocessed/*_processed.tif 2>/dev/null \\
+        | sed 's/.*\\/t\\([0-9]*\\)_.*/\\1/' \\
+        | sort -n)
+
+    if [ -n "\$TIMEPOINTS" ]; then
+        N_TP=\$(echo "\$TIMEPOINTS" | wc -l | tr -d ' ')
+        if [ "\$N_TP" -le 3 ]; then
+            SAMPLE_TPS=\$(echo "\$TIMEPOINTS" | tr '\\n' ' ')
+        else
+            FIRST=\$(echo "\$TIMEPOINTS" | head -1)
+            MIDDLE=\$(echo "\$TIMEPOINTS" | sed -n "\$((N_TP/2))p")
+            LAST=\$(echo "\$TIMEPOINTS" | tail -1)
+            SAMPLE_TPS="\$FIRST \$MIDDLE \$LAST"
         fi
+        echo "Sampling timepoints: \$SAMPLE_TPS (out of \$N_TP total)"
+        TP_ARGS="--timepoints \$SAMPLE_TPS"
+    else
+        TP_ARGS=""
+    fi
+    echo ""
 
-        # Run benchmark directly on the publishDir — no copying needed
-        python3 ${benchmark_script.name} \\
-            --results_dir ${results_dir}/ \\
-            --labels "pipeline_run" \\
-            --output_csv benchmark_results.csv \\
-            --output_json benchmark_results.json
+    # Run benchmark (output goes to stdout so .command.out gets it in real-time)
+    python3 ${benchmark_script.name} \\
+        --results_dir ${results_dir}/ \\
+        --labels "pipeline_run" \\
+        --output_csv benchmark_results.csv \\
+        --output_json benchmark_results.json \\
+        \$TP_ARGS \\
+        2>&1 | tee benchmark.log
 
-        echo ""
-        echo "Benchmark completed successfully"
-    } > benchmark.log 2>&1
-
-    # Show log in Nextflow stdout
-    cat benchmark.log
+    echo ""
+    echo "Benchmark completed"
     """
 }
 

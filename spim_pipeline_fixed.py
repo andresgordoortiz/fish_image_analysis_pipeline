@@ -646,6 +646,15 @@ def main():
     print(f"  BG subtraction : {resolution_px},  {resolution_pz}")
 
     # Deconvolution (GPU)
+    # Determine effective padding mode: when edge taper is active, the borders
+    # are faded to ~0, so 'edge'/'reflect' padding would replicate near-zero
+    # values and create a dark frame that RL rings against.  Use 'constant'
+    # (zero-pad) instead so the padded region matches the tapered border.
+    effective_padding_mode = args.padding_mode
+    if args.edge_taper_width > 0 and args.padding_mode != 'constant':
+        print(f"  [Info] Edge taper active → overriding padding_mode '{args.padding_mode}' with 'constant'")
+        effective_padding_mode = 'constant'
+
     if args.niter > 0:
         t0 = time.time()
         print("[Check-in] Running 3D deconvolution...")
@@ -654,7 +663,7 @@ def main():
         if args.edge_taper_width > 0:
             print(f"    Applying edge taper (width={args.edge_taper_width}px) before 3D deconv...")
             img = edge_taper_3d(img, args.edge_taper_width)
-        img = np.pad(img, args.padding, mode=args.padding_mode)
+        img = np.pad(img, args.padding, mode=effective_padding_mode)
         imgSizeGB = img.nbytes / (1024**3)
         print(f"    -size(GB) : {imgSizeGB:.3f}")
         print_resource_usage()
@@ -677,14 +686,16 @@ def main():
     if args.niterz > 0:
         t0 = time.time()
         print("[Check-in] Running 2D (XZ) deconvolution...")
-        img = image_scaling_intens(img, args.min_v, args.max_v, True)
-        # Pre-deconvolution edge taper for XZ pass
-        if args.edge_taper_width > 0:
-            print(f"    Applying edge taper (width={args.edge_taper_width}px) before XZ deconv...")
-            img = edge_taper_3d(img, args.edge_taper_width)
+        # Skip re-normalization if 3D deconv just ran — preserves dynamic range
+        if args.niter == 0:
+            img = image_scaling_intens(img, args.min_v, args.max_v, True)
+        # Transpose to XZ view FIRST, then taper in the space RL will operate on
         img_xz = np.transpose(img, [1, 0, 2])
         psf_xz = np.transpose(psf, [1, 0, 2])
-        img_xz = np.pad(img_xz, args.padding, mode=args.padding_mode)
+        if args.edge_taper_width > 0:
+            print(f"    Applying edge taper (width={args.edge_taper_width}px) before XZ deconv...")
+            img_xz = edge_taper_3d(img_xz, args.edge_taper_width)
+        img_xz = np.pad(img_xz, args.padding, mode=effective_padding_mode)
         imgSizeGB = img_xz.nbytes / (1024**3)
         print(f"    img_xz -size(GB) : {imgSizeGB:.3f}")
         print_resource_usage()
