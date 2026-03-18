@@ -1349,8 +1349,8 @@ process BENCHMARK {
     container params.container
 
     input:
-    path preprocessed_files
-    path segmented_files
+    val results_dir
+    val ready_signal  // dummy signal to ensure upstream processes are done
     path benchmark_script
 
     output:
@@ -1361,64 +1361,43 @@ process BENCHMARK {
     script:
     """
     #!/bin/bash
-    set -euo pipefail
+    set -uo pipefail
 
     # Activate micromamba environment
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
 
-    # All output goes to log file (no exec/tee — avoids process substitution race)
+    # All output to log file
     {
         echo "============================================"
         echo "Running Pipeline Benchmark"
         echo "============================================"
-        echo "Work directory: \$(pwd)"
+        echo "Results directory: ${results_dir}"
         echo "Python: \$(which python3)"
         echo ""
-        echo "=== Files staged by Nextflow ==="
-        ls -lh *.tif 2>/dev/null || echo "  (no .tif files found)"
+
+        # Check files exist in the publishDir
+        echo "=== Preprocessed files ==="
+        ls -lh ${results_dir}/01_preprocessed/*.tif 2>/dev/null | head -20 || echo "  (none found)"
+        PREPROC_COUNT=\$(ls ${results_dir}/01_preprocessed/*_processed.tif 2>/dev/null | wc -l)
+        echo "Total preprocessed: \$PREPROC_COUNT"
         echo ""
 
-        # Create directory structure expected by benchmark script
-        mkdir -p results_tmp/01_preprocessed results_tmp/02_segmented
-
-        # Copy preprocessed files (cp is more robust than symlinks for Nextflow-staged files)
-        PREPROC_COUNT=0
-        for f in *_processed.tif; do
-            if [ -f "\$f" ]; then
-                cp -L "\$f" results_tmp/01_preprocessed/
-                PREPROC_COUNT=\$((PREPROC_COUNT + 1))
-            fi
-        done
-        echo "Preprocessed files copied: \$PREPROC_COUNT"
-
-        # Copy segmented files
-        SEG_COUNT=0
-        for f in *_segmented.tif; do
-            if [ -f "\$f" ]; then
-                cp -L "\$f" results_tmp/02_segmented/
-                SEG_COUNT=\$((SEG_COUNT + 1))
-            fi
-        done
-        echo "Segmented files copied: \$SEG_COUNT"
+        echo "=== Segmented files ==="
+        ls -lh ${results_dir}/02_segmented/*.tif 2>/dev/null | head -20 || echo "  (none found)"
+        SEG_COUNT=\$(ls ${results_dir}/02_segmented/*_segmented.tif 2>/dev/null | wc -l)
+        echo "Total segmented: \$SEG_COUNT"
         echo ""
 
         if [ "\$PREPROC_COUNT" -eq 0 ] && [ "\$SEG_COUNT" -eq 0 ]; then
-            echo "ERROR: No pipeline output files found. Nothing to benchmark."
-            echo "This can happen if the file naming pattern does not match."
-            echo "Expected: *_processed.tif and *_segmented.tif"
+            echo "ERROR: No pipeline output files found in ${results_dir}"
+            echo "Check that preprocessing and segmentation completed successfully."
             exit 1
         fi
 
-        echo "Preprocessed files:"
-        ls -lh results_tmp/01_preprocessed/ 2>/dev/null || echo "  (none)"
-        echo "Segmented files:"
-        ls -lh results_tmp/02_segmented/ 2>/dev/null || echo "  (none)"
-        echo ""
-
-        # Run benchmark
+        # Run benchmark directly on the publishDir — no copying needed
         python3 ${benchmark_script.name} \\
-            --results_dir results_tmp/ \\
+            --results_dir ${results_dir}/ \\
             --labels "pipeline_run" \\
             --output_csv benchmark_results.csv \\
             --output_json benchmark_results.json
@@ -1427,7 +1406,7 @@ process BENCHMARK {
         echo "Benchmark completed successfully"
     } > benchmark.log 2>&1
 
-    # Show log contents in Nextflow output too
+    # Show log in Nextflow stdout
     cat benchmark.log
     """
 }
@@ -1562,18 +1541,15 @@ workflow {
 
         benchmark_script_ch = Channel.fromPath(params.benchmark_script, checkIfExists: true)
 
-        // Collect all preprocessed and segmented files
-        all_preprocessed = PREPROCESS_DECONVOLVE.out.processed
-            .map { timepoint, processed_file -> processed_file }
-            .collect()
-
-        all_seg_for_bench = CELLPOSE_SEGMENT.out.segmented
-            .map { timepoint, segmented_file -> segmented_file }
+        // Wait for segmentation to finish, then run benchmark on the publishDir directly.
+        // This avoids staging hundreds of GB of TIF files into the benchmark work dir.
+        ready_signal = CELLPOSE_SEGMENT.out.segmented
+            .map { timepoint, segmented_file -> true }
             .collect()
 
         BENCHMARK(
-            all_preprocessed,
-            all_seg_for_bench,
+            params.output_dir,
+            ready_signal,
             benchmark_script_ch.collect()
         )
     } else {

@@ -514,7 +514,7 @@ def main():
         tempScale = 0
 
     # PSF Loading
-    if args.niter > 0:
+    if args.niter > 0 or args.niterz > 0:
         t0 = time.time()
         print(f"Loading PSF from {args.psf_path}")
         psf = tifffile.imread(args.psf_path)
@@ -689,7 +689,7 @@ def main():
         print(f"    img_xz -size(GB) : {imgSizeGB:.3f}")
         print_resource_usage()
         res_gpu = rl.doRLDeconvolutionFromNpArrays(
-            img_xz, psf_xz, niter=args.niter, resAsUint8=False
+            img_xz, psf_xz, niter=args.niterz, resAsUint8=False
         )
         img_xz = res_gpu[
             args.padding : -args.padding,
