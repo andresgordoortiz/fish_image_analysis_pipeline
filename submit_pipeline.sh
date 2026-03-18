@@ -65,7 +65,9 @@ else
 fi
 
 # Setup caching directories - must set BOTH singularity and apptainer variables
-CACHE_DIR="$OUTPUT_DIR/singularity_images"
+# Use a fixed project-level cache so changing output_dir doesn't break container lookup
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CACHE_DIR="${SCRIPT_DIR}/.singularity_cache"
 export NXF_SINGULARITY_CACHEDIR="$CACHE_DIR"
 export NXF_APPTAINER_CACHEDIR="$CACHE_DIR"
 export SINGULARITY_CACHEDIR="$CACHE_DIR"
@@ -78,14 +80,25 @@ export NXF_JVM_ARGS="-Xms2g -Xmx5g"
 mkdir -p "$CACHE_DIR" "$CACHE_DIR/tmp" "$NXF_TEMP"
 
 # Check that container was pre-pulled (compute nodes often can't access internet)
-CONTAINER_SIF="$CACHE_DIR/andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img"
+# Also check the old location ($OUTPUT_DIR/singularity_images) for backward compat
+CONTAINER_BASENAME="andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img"
+CONTAINER_SIF="$CACHE_DIR/$CONTAINER_BASENAME"
 if [ ! -f "$CONTAINER_SIF" ]; then
-    echo ""
-    echo "ERROR: Container image not found!"
-    echo "Run the setup script from the login node first:"
-    echo "  ./setup_container.sh"
-    echo ""
-    exit 1
+    # Check legacy location (output dir based cache)
+    OLD_CACHE="$OUTPUT_DIR/singularity_images/$CONTAINER_BASENAME"
+    if [ -f "$OLD_CACHE" ]; then
+        echo "Migrating container cache to project-level location..."
+        cp -L "$OLD_CACHE" "$CONTAINER_SIF"
+    else
+        echo ""
+        echo "ERROR: Container image not found!"
+        echo "  Checked: $CONTAINER_SIF"
+        echo "  Also checked: $OLD_CACHE"
+        echo "Run the setup script from the login node first:"
+        echo "  ./setup_container.sh"
+        echo ""
+        exit 1
+    fi
 fi
 
 echo "Container: $CONTAINER_SIF (cached)"
