@@ -43,7 +43,8 @@
       "niterz": 6,
       "padding": 32,
       "padding_mode": "reflect",
-      "edge_mask_px": 0
+      "edge_mask_px": 0,
+      "edge_taper_width": 0
     },
     "normalization": {
       "min_v": 0,

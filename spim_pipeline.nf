@@ -127,6 +127,9 @@ if (!config.preprocessing.deconvolution.containsKey('padding_mode')) {
 if (!config.preprocessing.deconvolution.containsKey('edge_mask_px')) {
     config.preprocessing.deconvolution.edge_mask_px = 0
 }
+if (!config.preprocessing.deconvolution.containsKey('edge_taper_width')) {
+    config.preprocessing.deconvolution.edge_taper_width = 0
+}
 if (!config.segmentation.containsKey('anisotropy')) {
     config.segmentation.anisotropy = null
 }
@@ -149,6 +152,7 @@ def roi_info = config.roi_cropping.enabled ? "Enabled" : "Disabled"
 def merge_info = skip_merge ? "SKIPPED" : "Enabled"
 def downscale_info = downscale_labels < 1.0 ? "${downscale_labels} (Fiji nearest-neighbor)" : "Disabled"
 def edge_mask_info = config.preprocessing.deconvolution.edge_mask_px > 0 ? "${config.preprocessing.deconvolution.edge_mask_px}px" : "Disabled"
+def edge_taper_info = config.preprocessing.deconvolution.edge_taper_width > 0 ? "${config.preprocessing.deconvolution.edge_taper_width}px" : "Disabled"
 def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stitch_threshold != null ? "2D+Stitch(${config.segmentation.stitch_threshold})" : "2D")
 
 log.info """
@@ -163,6 +167,7 @@ Voxel Size   : ${voxel_info}
 Merge        : ${merge_info}
 Downscale    : ${downscale_info}
 Pad mode     : ${config.preprocessing.deconvolution.padding_mode}
+Edge taper   : ${edge_taper_info}
 Edge mask    : ${edge_mask_info}
 Seg mode     : ${seg_mode_info}
 ================================================
@@ -767,7 +772,8 @@ cmd = [
     '--noise_lvl', str(config['background_subtraction']['noise_lvl']),
     '--padding', str(config['deconvolution']['padding']),
     '--padding_mode', str(config['deconvolution'].get('padding_mode', 'reflect')),
-    '--edge_mask_px', str(config['deconvolution'].get('edge_mask_px', 0))
+    '--edge_mask_px', str(config['deconvolution'].get('edge_mask_px', 0)),
+    '--edge_taper_width', str(config['deconvolution'].get('edge_taper_width', 0))
 ]
 
 # Add optional flags from correction_flags
@@ -1348,8 +1354,8 @@ process BENCHMARK {
     path benchmark_script
 
     output:
-    path "benchmark_results.csv", emit: csv
-    path "benchmark_results.json", emit: json
+    path "benchmark_results.csv", emit: csv, optional: true
+    path "benchmark_results.json", emit: json, optional: true
     path "benchmark.log", emit: log
 
     script:
@@ -1361,40 +1367,68 @@ process BENCHMARK {
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
 
-    exec > >(tee benchmark.log) 2>&1
+    # All output goes to log file (no exec/tee — avoids process substitution race)
+    {
+        echo "============================================"
+        echo "Running Pipeline Benchmark"
+        echo "============================================"
+        echo "Work directory: \$(pwd)"
+        echo "Python: \$(which python3)"
+        echo ""
+        echo "=== Files staged by Nextflow ==="
+        ls -lh *.tif 2>/dev/null || echo "  (no .tif files found)"
+        echo ""
 
-    echo "============================================"
-    echo "Running Pipeline Benchmark"
-    echo "============================================"
+        # Create directory structure expected by benchmark script
+        mkdir -p results_tmp/01_preprocessed results_tmp/02_segmented
 
-    # Create directory structure expected by benchmark script
-    mkdir -p results_tmp/01_preprocessed results_tmp/02_segmented
+        # Copy preprocessed files (cp is more robust than symlinks for Nextflow-staged files)
+        PREPROC_COUNT=0
+        for f in *_processed.tif; do
+            if [ -f "\$f" ]; then
+                cp -L "\$f" results_tmp/01_preprocessed/
+                PREPROC_COUNT=\$((PREPROC_COUNT + 1))
+            fi
+        done
+        echo "Preprocessed files copied: \$PREPROC_COUNT"
 
-    # Link preprocessed files
-    for f in *_processed.tif; do
-        [ -f "\$f" ] && ln -s "\$PWD/\$f" results_tmp/01_preprocessed/
-    done
+        # Copy segmented files
+        SEG_COUNT=0
+        for f in *_segmented.tif; do
+            if [ -f "\$f" ]; then
+                cp -L "\$f" results_tmp/02_segmented/
+                SEG_COUNT=\$((SEG_COUNT + 1))
+            fi
+        done
+        echo "Segmented files copied: \$SEG_COUNT"
+        echo ""
 
-    # Link segmented files
-    for f in *_segmented.tif; do
-        [ -f "\$f" ] && ln -s "\$PWD/\$f" results_tmp/02_segmented/
-    done
+        if [ "\$PREPROC_COUNT" -eq 0 ] && [ "\$SEG_COUNT" -eq 0 ]; then
+            echo "ERROR: No pipeline output files found. Nothing to benchmark."
+            echo "This can happen if the file naming pattern does not match."
+            echo "Expected: *_processed.tif and *_segmented.tif"
+            exit 1
+        fi
 
-    echo "Preprocessed files:"
-    ls -lh results_tmp/01_preprocessed/ 2>/dev/null || echo "  (none)"
-    echo "Segmented files:"
-    ls -lh results_tmp/02_segmented/ 2>/dev/null || echo "  (none)"
-    echo ""
+        echo "Preprocessed files:"
+        ls -lh results_tmp/01_preprocessed/ 2>/dev/null || echo "  (none)"
+        echo "Segmented files:"
+        ls -lh results_tmp/02_segmented/ 2>/dev/null || echo "  (none)"
+        echo ""
 
-    # Run benchmark
-    python3 ${benchmark_script.name} \\
-        --results_dir results_tmp/ \\
-        --labels "pipeline_run" \\
-        --output_csv benchmark_results.csv \\
-        --output_json benchmark_results.json
+        # Run benchmark
+        python3 ${benchmark_script.name} \\
+            --results_dir results_tmp/ \\
+            --labels "pipeline_run" \\
+            --output_csv benchmark_results.csv \\
+            --output_json benchmark_results.json
 
-    echo ""
-    echo "Benchmark completed"
+        echo ""
+        echo "Benchmark completed successfully"
+    } > benchmark.log 2>&1
+
+    # Show log contents in Nextflow output too
+    cat benchmark.log
     """
 }
 

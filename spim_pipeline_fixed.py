@@ -255,6 +255,49 @@ def reslice(img, position, x_res, z_res):
     return rescaled_img
 
 
+def edge_taper_3d(img, width):
+    """Apply a cosine (Tukey) taper to all edges of a 3D volume.
+
+    This smoothly fades the image intensity to zero over `width` pixels
+    at every boundary. Applied BEFORE deconvolution to prevent
+    Richardson-Lucy from amplifying boundary artifacts.
+
+    Args:
+        img: 3D numpy array (Z, Y, X)
+        width: number of pixels over which to taper (0 = disabled)
+    Returns:
+        Tapered image (same dtype as input if integer, else float32)
+    """
+    if width <= 0:
+        return img
+    in_dtype = img.dtype
+    out = img.astype(np.float32, copy=True)
+    z, y, x = out.shape
+
+    # Build 1D half-cosine taper: 0 at edge -> 1 at width
+    def _taper_1d(length, w):
+        w = min(w, length // 2)
+        t = np.ones(length, dtype=np.float32)
+        ramp = 0.5 * (1 - np.cos(np.pi * np.arange(w, dtype=np.float32) / w))
+        t[:w] = ramp
+        t[-w:] = ramp[::-1]
+        return t
+
+    tz = _taper_1d(z, width)
+    ty = _taper_1d(y, width)
+    tx = _taper_1d(x, width)
+
+    # Apply as separable product: taper(z) * taper(y) * taper(x)
+    out *= tz[:, None, None]
+    out *= ty[None, :, None]
+    out *= tx[None, None, :]
+
+    if np.issubdtype(in_dtype, np.integer):
+        info = np.iinfo(in_dtype)
+        out = np.clip(out, info.min, info.max).astype(in_dtype)
+    return out
+
+
 def image_postprocessing(img, resolution_px, resolution_pz, noise_lvl, sigma):
     """Apply background subtraction and Gaussian smoothing."""
     steps = []
@@ -425,6 +468,10 @@ def main():
     parser.add_argument(
         "--edge_mask_px", type=int, default=0,
         help="Zero out this many border pixels after deconvolution to remove edge artifacts (0=disabled)"
+    )
+    parser.add_argument(
+        "--edge_taper_width", type=int, default=0,
+        help="Cosine-taper this many border pixels BEFORE deconvolution to prevent edge ringing (0=disabled). Recommended: 16-32."
     )
 
     args = parser.parse_args()
@@ -603,6 +650,10 @@ def main():
         t0 = time.time()
         print("[Check-in] Running 3D deconvolution...")
         img = image_scaling_intens(img, args.min_v, args.max_v, True)
+        # Pre-deconvolution edge taper: fade borders to zero so RL can't amplify them
+        if args.edge_taper_width > 0:
+            print(f"    Applying edge taper (width={args.edge_taper_width}px) before 3D deconv...")
+            img = edge_taper_3d(img, args.edge_taper_width)
         img = np.pad(img, args.padding, mode=args.padding_mode)
         imgSizeGB = img.nbytes / (1024**3)
         print(f"    -size(GB) : {imgSizeGB:.3f}")
@@ -627,6 +678,10 @@ def main():
         t0 = time.time()
         print("[Check-in] Running 2D (XZ) deconvolution...")
         img = image_scaling_intens(img, args.min_v, args.max_v, True)
+        # Pre-deconvolution edge taper for XZ pass
+        if args.edge_taper_width > 0:
+            print(f"    Applying edge taper (width={args.edge_taper_width}px) before XZ deconv...")
+            img = edge_taper_3d(img, args.edge_taper_width)
         img_xz = np.transpose(img, [1, 0, 2])
         psf_xz = np.transpose(psf, [1, 0, 2])
         img_xz = np.pad(img_xz, args.padding, mode=args.padding_mode)
