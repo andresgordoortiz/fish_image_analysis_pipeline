@@ -837,6 +837,11 @@ def main():
     # Apply tissue mask ONCE — after all processing is done.
     # This is the only safe place: WBNS and CLAHE need the natural image
     # gradients to avoid creating ringing artifacts at mask boundaries.
+    # WBNS (wavelet) may pad dimensions to even numbers, so crop first.
+    mz, my, mx = tissue_mask.shape
+    if img.shape != tissue_mask.shape:
+        print(f"    [Info] Shape mismatch: img {img.shape} vs mask {tissue_mask.shape} — cropping to match")
+        img = img[:mz, :my, :mx]
     print("[Check-in] Applying tissue mask to suppress background noise...")
     img[~tissue_mask] = 0
     del tissue_mask
