@@ -76,9 +76,7 @@ else
 fi
 
 # Setup caching directories - must set BOTH singularity and apptainer variables
-# Use a fixed project-level cache so changing output_dir doesn't break container lookup
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CACHE_DIR="${SCRIPT_DIR}/.singularity_cache"
+CACHE_DIR="$OUTPUT_DIR/singularity_images"
 export NXF_SINGULARITY_CACHEDIR="$CACHE_DIR"
 export NXF_APPTAINER_CACHEDIR="$CACHE_DIR"
 export SINGULARITY_CACHEDIR="$CACHE_DIR"
@@ -91,36 +89,20 @@ export NXF_JVM_ARGS="-Xms2g -Xmx5g"
 mkdir -p "$CACHE_DIR" "$CACHE_DIR/tmp" "$NXF_TEMP"
 
 # Check that container was pre-pulled (compute nodes often can't access internet)
-# Also check the old location ($OUTPUT_DIR/singularity_images) for backward compat
 CONTAINER_BASENAME="andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img"
 CONTAINER_SIF="$CACHE_DIR/$CONTAINER_BASENAME"
 if [ ! -f "$CONTAINER_SIF" ]; then
-    # Search legacy locations: output dir and any results_*/singularity_images/ folders
-    FOUND=""
-    for SEARCH_DIR in \
-        "$OUTPUT_DIR/singularity_images" \
-        "$SCRIPT_DIR"/results*/singularity_images \
-        "$SCRIPT_DIR"/results_*/singularity_images; do
-        if [ -f "$SEARCH_DIR/$CONTAINER_BASENAME" ]; then
-            FOUND="$SEARCH_DIR/$CONTAINER_BASENAME"
-            break
-        fi
-    done
-
-    if [ -n "$FOUND" ]; then
-        echo "Found container at: $FOUND"
-        echo "Migrating to project-level cache: $CACHE_DIR/"
-        cp -L "$FOUND" "$CONTAINER_SIF"
-    else
-        echo ""
-        echo "ERROR: Container image not found!"
-        echo "  Checked: $CONTAINER_SIF"
-        echo "  Also searched: results*/singularity_images/"
-        echo "Run the setup script from the login node first:"
-        echo "  ./setup_container.sh"
-        echo ""
-        exit 1
-    fi
+    echo ""
+    echo "ERROR: Container image not found!"
+    echo "  Expected: $CONTAINER_SIF"
+    echo ""
+    echo "Run the setup script from the login node first:"
+    echo "  ./setup_container.sh"
+    echo ""
+    echo "Or copy from an existing results directory:"
+    echo "  cp -L results_testing/singularity_images/$CONTAINER_BASENAME $CACHE_DIR/"
+    echo ""
+    exit 1
 fi
 
 echo "Container: $CONTAINER_SIF (cached)"
