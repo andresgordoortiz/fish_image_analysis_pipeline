@@ -272,8 +272,8 @@ def reslice(img, position, x_res, z_res):
     return rescaled_img
 
 
-def edge_taper_3d(img, width):
-    """Apply a cosine (Tukey) taper to all edges of a 3D volume.
+def edge_taper_3d(img, width, skip_axes=()):
+    """Apply a cosine (Tukey) taper to edges of a 3D volume.
 
     This smoothly fades the image intensity to zero over `width` pixels
     at every boundary. Applied BEFORE deconvolution to prevent
@@ -282,6 +282,8 @@ def edge_taper_3d(img, width):
     Args:
         img: 3D numpy array (Z, Y, X)
         width: number of pixels over which to taper (0 = disabled)
+        skip_axes: tuple of axis indices (0=Z, 1=Y, 2=X) to NOT taper.
+            E.g. skip_axes=(0,) leaves Z untouched.
     Returns:
         Tapered image (same dtype as input if integer, else float32)
     """
@@ -300,14 +302,15 @@ def edge_taper_3d(img, width):
         t[-w:] = ramp[::-1]
         return t
 
-    tz = _taper_1d(z, width)
-    ty = _taper_1d(y, width)
-    tx = _taper_1d(x, width)
-
-    # Apply as separable product: taper(z) * taper(y) * taper(x)
-    out *= tz[:, None, None]
-    out *= ty[None, :, None]
-    out *= tx[None, None, :]
+    if 0 not in skip_axes:
+        tz = _taper_1d(z, width)
+        out *= tz[:, None, None]
+    if 1 not in skip_axes:
+        ty = _taper_1d(y, width)
+        out *= ty[None, :, None]
+    if 2 not in skip_axes:
+        tx = _taper_1d(x, width)
+        out *= tx[None, None, :]
 
     if np.issubdtype(in_dtype, np.integer):
         info = np.iinfo(in_dtype)
@@ -758,8 +761,8 @@ def main():
         img = image_scaling_intens(img, args.min_v, args.max_v, True)
         # Pre-deconvolution edge taper: fade borders to zero so RL can't amplify them
         if args.edge_taper_width > 0:
-            print(f"    Applying edge taper (width={args.edge_taper_width}px) before 3D deconv...")
-            img = edge_taper_3d(img, args.edge_taper_width)
+            print(f"    Applying edge taper (width={args.edge_taper_width}px, skip Z) before 3D deconv...")
+            img = edge_taper_3d(img, args.edge_taper_width, skip_axes=(0,))
         img = np.pad(img, args.padding, mode=effective_padding_mode)
         imgSizeGB = img.nbytes / (1024**3)
         print(f"    -size(GB) : {imgSizeGB:.3f}")
@@ -790,8 +793,9 @@ def main():
         img_xz = np.transpose(img, [1, 0, 2])
         psf_xz = np.transpose(psf, [1, 0, 2])
         if args.edge_taper_width > 0:
-            print(f"    Applying edge taper (width={args.edge_taper_width}px) before XZ deconv...")
-            img_xz = edge_taper_3d(img_xz, args.edge_taper_width)
+            # img_xz is (Y, Z, X) — skip Y (axis 0) and Z (axis 1), taper only X edges
+            print(f"    Applying edge taper (width={args.edge_taper_width}px, X-only) before XZ deconv...")
+            img_xz = edge_taper_3d(img_xz, args.edge_taper_width, skip_axes=(0, 1))
         img_xz = np.pad(img_xz, args.padding, mode=effective_padding_mode)
         imgSizeGB = img_xz.nbytes / (1024**3)
         print(f"    img_xz -size(GB) : {imgSizeGB:.3f}")
@@ -814,11 +818,10 @@ def main():
         print_resource_usage()
 
     # Edge masking: zero out border pixels to remove deconvolution edge artifacts
+    # Only mask Y and X edges — embryo extends to Z boundaries
     if args.edge_mask_px > 0 and (args.niter > 0 or args.niterz > 0):
         b = args.edge_mask_px
-        print(f"[Check-in] Applying edge mask: zeroing {b}px border...")
-        img[:b, :, :] = 0
-        img[-b:, :, :] = 0
+        print(f"[Check-in] Applying edge mask: zeroing {b}px border (Y,X only)...")
         img[:, :b, :] = 0
         img[:, -b:, :] = 0
         img[:, :, :b] = 0
