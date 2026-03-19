@@ -503,7 +503,7 @@ def main():
     )
     parser.add_argument(
         "--mask_border_px", type=int, default=10,
-        help="Trim tissue mask this many pixels from XY image borders to remove edge artifacts. 0=disabled."
+        help="Trim tissue mask this many pixels from XY image borders to remove edge artifacts. 0=disabled. Default: 10"
     )
 
     args = parser.parse_args()
@@ -870,6 +870,14 @@ def main():
     # Final Save
     t0 = time.time()
     print("[Check-in] Final intensity scaling and saving...")
+    # Final hard edge cleanup: zero the XY border unconditionally.
+    # This is the last safety net against any deconv/CLAHE edge artifacts.
+    _b = args.mask_border_px
+    if _b > 0:
+        img[:, :_b, :] = 0
+        img[:, -_b:, :] = 0
+        img[:, :, :_b] = 0
+        img[:, :, -_b:] = 0
     img = image_scaling_intens(img, args.min_v, args.max_v, True)
     img = img.astype(np.uint16)
     t1 = time.time()
