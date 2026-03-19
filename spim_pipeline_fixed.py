@@ -808,6 +808,14 @@ def main():
         img[:, :, :b] = 0
         img[:, :, -b:] = 0
 
+    # Post-deconv border taper: deconvolution creates ringing at image borders
+    # that extends inward. A smooth cosine fade kills this ringing gradually
+    # so WBNS/CLAHE downstream don't see a hard edge to amplify.
+    if args.niter > 0 or args.niterz > 0:
+        _post_taper = max(args.mask_border_px, 40)
+        print(f"[Check-in] Post-deconv border taper ({_post_taper}px on Y,X)...")
+        img = edge_taper_3d(img, _post_taper, skip_axes=(0,))
+
     # Post-processing (WBNS + Gaussian smoothing)
     # DO NOT apply tissue mask before WBNS — a hard zero boundary causes
     # wavelet ringing inside the tissue that CLAHE then amplifies.
