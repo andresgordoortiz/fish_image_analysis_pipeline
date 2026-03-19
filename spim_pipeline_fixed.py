@@ -704,19 +704,6 @@ def main():
     tissue_mask = ndi.binary_dilation(tissue_mask, structure=struct, iterations=8)
     tissue_mask = binary_fill_holes(tissue_mask)
 
-    # Z-fill: if slices z1..z2 contain tissue, ensure slices in between
-    # are not empty (prevents first/last frames from being zeroed out).
-    _z_has_tissue = np.any(tissue_mask, axis=(1, 2))
-    _z_idx = np.where(_z_has_tissue)[0]
-    if len(_z_idx) > 0:
-        _z_lo, _z_hi = int(_z_idx[0]), int(_z_idx[-1])
-        # Project the 2D XY union of all tissue slices
-        _xy_proj = np.any(tissue_mask[_z_lo:_z_hi + 1], axis=0)
-        for _zi in range(_z_lo, _z_hi + 1):
-            if not _z_has_tissue[_zi]:
-                tissue_mask[_zi] = _xy_proj
-        print(f"    Z-fill: tissue range z={_z_lo}..{_z_hi} (of {tissue_mask.shape[0]} slices)")
-
     # Trim mask from image XY borders: embryo is centred, edges are background.
     # Without this, dilation can push the mask to the image edges where
     # CLAHE/WBNS create artefacts.
@@ -839,7 +826,15 @@ def main():
         img[:, :, :b] = 0
         img[:, :, -b:] = 0
 
-    # Post-processing
+    # Clean background after deconvolution (deconv can create ringing in background)
+    if args.niter > 0 or args.niterz > 0:
+        print("[Check-in] Applying tissue mask after deconvolution...")
+        img[~tissue_mask] = 0
+
+    # Post-processing (WBNS + Gaussian smoothing)
+    # Zero background first so WBNS doesn't create residual noise at edges
+    print("[Check-in] Applying tissue mask before WBNS...")
+    img[~tissue_mask] = 0
     t0 = time.time()
     print("[Check-in] Running post-processing...")
     img = image_postprocessing(
@@ -850,6 +845,12 @@ def main():
     print_resource_usage()
 
     if apply_clahe:
+        # Zero background before CLAHE — this is the critical step.
+        # CLAHE amplifies ANY signal in its tiles, including faint background
+        # noise from WBNS. By zeroing background first, CLAHE tiles at the
+        # tissue boundary see clean zeros and bg_threshold_pct preserves them.
+        print("[Check-in] Applying tissue mask before CLAHE...")
+        img[~tissue_mask] = 0
         t0 = time.time()
         print(f"[Check-in] Applying CLAHE (clip_limit={args.clahe_clip_limit})...")
         img_xz = np.transpose(img, [1, 0, 2])
@@ -863,9 +864,8 @@ def main():
             img = ndi.gaussian_filter(img, sigma=args.clahe_post_smooth)
         print_resource_usage()
 
-    # Apply tissue mask (computed early from resliced image) to zero out
-    # background noise introduced by shading correction, WBNS, and CLAHE.
-    print("[Check-in] Applying tissue mask to suppress background noise...")
+    # Final tissue mask application — safety net for anything that leaked through
+    print("[Check-in] Applying tissue mask (final cleanup)...")
     img[~tissue_mask] = 0
     del tissue_mask
 
@@ -882,14 +882,6 @@ def main():
     # Final Save
     t0 = time.time()
     print("[Check-in] Final intensity scaling and saving...")
-    # Final hard edge cleanup: zero the XY border unconditionally.
-    # This is the last safety net against any deconv/CLAHE edge artifacts.
-    _b = args.mask_border_px
-    if _b > 0:
-        img[:, :_b, :] = 0
-        img[:, -_b:, :] = 0
-        img[:, :, :_b] = 0
-        img[:, :, -_b:] = 0
     img = image_scaling_intens(img, args.min_v, args.max_v, True)
     img = img.astype(np.uint16)
     t1 = time.time()
