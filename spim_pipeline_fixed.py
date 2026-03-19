@@ -721,24 +721,6 @@ def main():
     t1 = time.time()
     print(f"[Timer] Tissue mask computation took {t1 - t0:.2f} seconds")
 
-    # Pre-deconv masking: instead of a hard zero (which RL rings against),
-    # use a smooth taper at the tissue-mask boundary.  The distance transform
-    # gives us the distance from each background pixel to the nearest tissue
-    # pixel; we invert it for tissue pixels near the boundary.
-    if args.niter > 0 or args.niterz > 0:
-        _taper_width = max(args.edge_taper_width, 30)  # at least 30px taper zone
-        print(f"[Check-in] Applying smooth tissue-boundary taper ({_taper_width}px) before deconvolution...")
-        from scipy.ndimage import distance_transform_edt
-        # Distance from each tissue pixel to the nearest background pixel
-        _dist_inside = distance_transform_edt(tissue_mask).astype(np.float32)
-        # Build taper: 0 at boundary → 1 at _taper_width pixels inside tissue
-        _taper = np.clip(_dist_inside / _taper_width, 0, 1)
-        # Smooth cosine profile instead of linear ramp (gentler transition)
-        _taper = 0.5 * (1 - np.cos(np.pi * _taper))
-        img = img * _taper
-        del _dist_inside, _taper
-        print(f"    Taper applied: background zeroed, tissue edges smoothly faded")
-
     # Recalculate resolution for BG subtraction
     resolution_px = int(args.resolution_px0 / new_physical_pixel_sizeZ)
     resolution_pz = int(args.resolution_pz0 / new_physical_pixel_sizeZ)
@@ -826,15 +808,10 @@ def main():
         img[:, :, :b] = 0
         img[:, :, -b:] = 0
 
-    # Clean background after deconvolution (deconv can create ringing in background)
-    if args.niter > 0 or args.niterz > 0:
-        print("[Check-in] Applying tissue mask after deconvolution...")
-        img[~tissue_mask] = 0
-
     # Post-processing (WBNS + Gaussian smoothing)
-    # Zero background first so WBNS doesn't create residual noise at edges
-    print("[Check-in] Applying tissue mask before WBNS...")
-    img[~tissue_mask] = 0
+    # DO NOT apply tissue mask before WBNS — a hard zero boundary causes
+    # wavelet ringing inside the tissue that CLAHE then amplifies.
+    # Let WBNS process the natural image with its gradual falloff.
     t0 = time.time()
     print("[Check-in] Running post-processing...")
     img = image_postprocessing(
@@ -845,12 +822,6 @@ def main():
     print_resource_usage()
 
     if apply_clahe:
-        # Zero background before CLAHE — this is the critical step.
-        # CLAHE amplifies ANY signal in its tiles, including faint background
-        # noise from WBNS. By zeroing background first, CLAHE tiles at the
-        # tissue boundary see clean zeros and bg_threshold_pct preserves them.
-        print("[Check-in] Applying tissue mask before CLAHE...")
-        img[~tissue_mask] = 0
         t0 = time.time()
         print(f"[Check-in] Applying CLAHE (clip_limit={args.clahe_clip_limit})...")
         img_xz = np.transpose(img, [1, 0, 2])
@@ -858,14 +829,15 @@ def main():
         img = np.transpose(img_xz, [1, 0, 2])
         t1 = time.time()
         print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
-        # Post-CLAHE smoothing to suppress high-frequency noise CLAHE introduces
         if args.clahe_post_smooth > 0:
             print(f"[Check-in] Post-CLAHE Gaussian smoothing (sigma={args.clahe_post_smooth})...")
             img = ndi.gaussian_filter(img, sigma=args.clahe_post_smooth)
         print_resource_usage()
 
-    # Final tissue mask application — safety net for anything that leaked through
-    print("[Check-in] Applying tissue mask (final cleanup)...")
+    # Apply tissue mask ONCE — after all processing is done.
+    # This is the only safe place: WBNS and CLAHE need the natural image
+    # gradients to avoid creating ringing artifacts at mask boundaries.
+    print("[Check-in] Applying tissue mask to suppress background noise...")
     img[~tissue_mask] = 0
     del tissue_mask
 
