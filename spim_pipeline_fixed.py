@@ -754,6 +754,32 @@ def main():
     print(f"[Timer] Post-processing took {t1 - t0:.2f} seconds")
     print_resource_usage()
 
+    # Build tissue mask BEFORE CLAHE — Otsu threshold on the smoothed image
+    # to identify which voxels are actual tissue vs empty background.
+    # This mask will be applied AFTER CLAHE+normalization to zero out noise
+    # that processing steps (shading correction, WBNS residuals, CLAHE)
+    # inadvertently create in empty regions.
+    t0 = time.time()
+    print("[Check-in] Computing tissue mask...")
+    from skimage.filters import threshold_otsu
+    # Use a max-projection-based approach: compute Otsu per-slice, then combine
+    img_for_mask = img.astype(np.float32)
+    # Smooth more aggressively for mask computation to avoid single-pixel noise
+    mask_smooth = ndi.gaussian_filter(img_for_mask, sigma=3.0)
+    try:
+        otsu_val = threshold_otsu(mask_smooth[mask_smooth > 0])
+    except ValueError:
+        otsu_val = 0
+    # Use a fraction of Otsu as the threshold (catches dim tissue edges)
+    tissue_mask = mask_smooth > (otsu_val * 0.1)
+    # Dilate slightly to avoid cutting tissue edges
+    tissue_mask = ndi.binary_dilation(tissue_mask, iterations=3)
+    tissue_pct = 100.0 * np.count_nonzero(tissue_mask) / tissue_mask.size
+    print(f"    Tissue mask: {tissue_pct:.1f}% of volume is tissue (Otsu={otsu_val:.1f})")
+    del img_for_mask, mask_smooth
+    t1 = time.time()
+    print(f"[Timer] Tissue mask took {t1 - t0:.2f} seconds")
+
     if apply_clahe:
         t0 = time.time()
         print("[Check-in] Applying CLAHE...")
@@ -763,6 +789,11 @@ def main():
         t1 = time.time()
         print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
         print_resource_usage()
+
+    # Apply tissue mask: zero out background regions
+    print("[Check-in] Applying tissue mask to suppress background noise...")
+    img[~tissue_mask] = 0
+    del tissue_mask
 
     # Normalization
     if percentiles_source[0] > 0 or percentiles_source[1] < 100:
