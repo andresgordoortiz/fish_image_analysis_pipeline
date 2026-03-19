@@ -734,11 +734,23 @@ def main():
     t1 = time.time()
     print(f"[Timer] Tissue mask computation took {t1 - t0:.2f} seconds")
 
-    # Pre-deconv masking: zero background BEFORE RL gets a chance to amplify it.
-    # This is the single most effective step against deconv-induced noise/smearing.
+    # Pre-deconv masking: instead of a hard zero (which RL rings against),
+    # use a smooth taper at the tissue-mask boundary.  The distance transform
+    # gives us the distance from each background pixel to the nearest tissue
+    # pixel; we invert it for tissue pixels near the boundary.
     if args.niter > 0 or args.niterz > 0:
-        print("[Check-in] Applying tissue mask BEFORE deconvolution to suppress background...")
-        img[~tissue_mask] = 0
+        _taper_width = max(args.edge_taper_width, 30)  # at least 30px taper zone
+        print(f"[Check-in] Applying smooth tissue-boundary taper ({_taper_width}px) before deconvolution...")
+        from scipy.ndimage import distance_transform_edt
+        # Distance from each tissue pixel to the nearest background pixel
+        _dist_inside = distance_transform_edt(tissue_mask).astype(np.float32)
+        # Build taper: 0 at boundary → 1 at _taper_width pixels inside tissue
+        _taper = np.clip(_dist_inside / _taper_width, 0, 1)
+        # Smooth cosine profile instead of linear ramp (gentler transition)
+        _taper = 0.5 * (1 - np.cos(np.pi * _taper))
+        img = img * _taper
+        del _dist_inside, _taper
+        print(f"    Taper applied: background zeroed, tissue edges smoothly faded")
 
     # Recalculate resolution for BG subtraction
     resolution_px = int(args.resolution_px0 / new_physical_pixel_sizeZ)
