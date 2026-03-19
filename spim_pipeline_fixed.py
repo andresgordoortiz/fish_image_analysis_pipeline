@@ -186,8 +186,15 @@ def clahe_3d_stack(
     p_low=0.5,
     p_high=99.5,
     eps=1e-8,
+    bg_threshold_pct=5.0,
 ):
-    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to 3D stack."""
+    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to 3D stack.
+
+    bg_threshold_pct: percentile used to detect background. Pixels below this
+        threshold in the *original* slice are treated as background and forced
+        back to their original (dark) values after CLAHE, preventing CLAHE
+        from amplifying noise in empty/black regions.  Set to 0 to disable.
+    """
     from skimage import exposure
 
     if stack.ndim != 3:
@@ -202,6 +209,12 @@ def clahe_3d_stack(
         if hi <= lo + eps:
             out[i] = 0.0
             continue
+        # Build background mask BEFORE CLAHE modifies values
+        if bg_threshold_pct > 0:
+            bg_val = np.percentile(img, bg_threshold_pct)
+            bg_mask = img <= bg_val
+        else:
+            bg_mask = None
         img01 = np.clip(img, lo, hi)
         img01 = (img01 - lo) / (hi - lo)
         result = exposure.equalize_adapthist(
@@ -209,6 +222,10 @@ def clahe_3d_stack(
         ).astype(np.float32, copy=False)
         # Guard against NaN from skimage internal dtype conversions
         np.nan_to_num(result, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+        # Restore background: force pixels that were originally dark back to
+        # their pre-CLAHE normalized value so CLAHE doesn't brighten empty space
+        if bg_mask is not None:
+            result[bg_mask] = img01[bg_mask]
         out[i] = result
     out = np.moveaxis(out, 0, axis)
     if not preserve_dtype:
