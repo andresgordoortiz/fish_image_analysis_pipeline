@@ -130,6 +130,12 @@ if (!config.preprocessing.deconvolution.containsKey('edge_mask_px')) {
 if (!config.preprocessing.deconvolution.containsKey('edge_taper_width')) {
     config.preprocessing.deconvolution.edge_taper_width = 0
 }
+if (!config.preprocessing.postprocessing.containsKey('clahe_clip_limit')) {
+    config.preprocessing.postprocessing.clahe_clip_limit = 0.01
+}
+if (!config.preprocessing.postprocessing.containsKey('clahe_post_smooth')) {
+    config.preprocessing.postprocessing.clahe_post_smooth = 0.0
+}
 if (!config.segmentation.containsKey('anisotropy')) {
     config.segmentation.anisotropy = null
 }
@@ -773,7 +779,9 @@ cmd = [
     '--padding', str(config['deconvolution']['padding']),
     '--padding_mode', str(config['deconvolution'].get('padding_mode', 'reflect')),
     '--edge_mask_px', str(config['deconvolution'].get('edge_mask_px', 0)),
-    '--edge_taper_width', str(config['deconvolution'].get('edge_taper_width', 0))
+    '--edge_taper_width', str(config['deconvolution'].get('edge_taper_width', 0)),
+    '--clahe_clip_limit', str(config['postprocessing'].get('clahe_clip_limit', 0.01)),
+    '--clahe_post_smooth', str(config['postprocessing'].get('clahe_post_smooth', 0.0))
 ]
 
 # Add optional flags from correction_flags

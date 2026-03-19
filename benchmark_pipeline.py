@@ -158,107 +158,115 @@ def compute_z_frequency_content(img, sample_columns=20):
 def compute_segmentation_metrics(mask):
     """
     Compute all segmentation quality metrics from a label image.
-    Returns a dict with all metrics.
+    Optimised to run in seconds even on large volumes.
     """
     labels = np.unique(mask)
     labels = labels[labels > 0]  # exclude background
     n_cells = len(labels)
 
+    empty = {
+        "seg_n_cells": 0,
+        "seg_mean_volume_px": 0,
+        "seg_std_volume_px": 0,
+        "seg_cv_volume": 0,
+        "seg_median_volume_px": 0,
+        "seg_small_fraction": 0,
+        "seg_large_fraction": 0,
+        "seg_mean_z_extent": 0,
+        "seg_mean_xy_extent": 0,
+        "seg_mean_elongation_z": 0,
+        "seg_z_coverage": 0,
+        "seg_z_density_cv": 0,
+        "seg_mean_sphericity": 0,
+        "seg_touching_fraction": 0,
+    }
     if n_cells == 0:
-        return {
-            "seg_n_cells": 0,
-            "seg_mean_volume_px": 0,
-            "seg_std_volume_px": 0,
-            "seg_cv_volume": 0,
-            "seg_median_volume_px": 0,
-            "seg_small_fraction": 0,
-            "seg_large_fraction": 0,
-            "seg_mean_z_extent": 0,
-            "seg_mean_xy_extent": 0,
-            "seg_mean_elongation_z": 0,
-            "seg_z_coverage": 0,
-            "seg_z_density_cv": 0,
-            "seg_mean_sphericity": 0,
-            "seg_touching_fraction": 0,
-        }
+        return empty
 
-    # --- Volume statistics ---
-    volumes = np.array([np.sum(mask == l) for l in labels], dtype=np.float64)
+    # --- Volume statistics via bincount (single pass over entire array) ---
+    flat = mask.ravel()
+    counts = np.bincount(flat)
+    # counts[0] is background; counts[l] = volume of label l
+    volumes = counts[labels].astype(np.float64)
     mean_vol = np.mean(volumes)
     std_vol = np.std(volumes)
     cv_vol = std_vol / mean_vol if mean_vol > 0 else 0
     median_vol = np.median(volumes)
 
-    # Small objects (potential over-segmentation): < 25% of median volume
     small_thresh = 0.25 * median_vol
     small_fraction = np.sum(volumes < small_thresh) / n_cells
-
-    # Large objects (potential under-segmentation): > 4x median volume
     large_thresh = 4.0 * median_vol
     large_fraction = np.sum(volumes > large_thresh) / n_cells
 
-    # --- Z vs XY extent (the key metric for your Z-depth problem) ---
-    z_extents = []
-    xy_extents = []
-    sphericities = []
-
-    # Sample up to 500 cells to keep runtime manageable
-    sample_labels = labels if n_cells <= 500 else np.random.choice(labels, 500, replace=False)
-
-    for l in sample_labels:
-        coords = np.argwhere(mask == l)  # (N, 3) array of [z, y, x]
-        if len(coords) < 3:
+    # --- Z/XY extents via ndi.find_objects (single O(N) pass) ---
+    slices_list = ndi.find_objects(mask)  # index i → label i+1
+    max_label = int(labels.max())
+    z_min_arr = np.zeros(max_label + 1, dtype=np.int32)
+    z_max_arr = np.zeros(max_label + 1, dtype=np.int32)
+    y_min_arr = np.zeros(max_label + 1, dtype=np.int32)
+    y_max_arr = np.zeros(max_label + 1, dtype=np.int32)
+    x_min_arr = np.zeros(max_label + 1, dtype=np.int32)
+    x_max_arr = np.zeros(max_label + 1, dtype=np.int32)
+    for lab in labels:
+        s = slices_list[lab - 1]
+        if s is None:
             continue
+        z_min_arr[lab] = s[0].start; z_max_arr[lab] = s[0].stop - 1
+        y_min_arr[lab] = s[1].start; y_max_arr[lab] = s[1].stop - 1
+        x_min_arr[lab] = s[2].start; x_max_arr[lab] = s[2].stop - 1
 
-        z_range = coords[:, 0].max() - coords[:, 0].min() + 1
-        y_range = coords[:, 1].max() - coords[:, 1].min() + 1
-        x_range = coords[:, 2].max() - coords[:, 2].min() + 1
+    z_extents = (z_max_arr[labels] - z_min_arr[labels] + 1).astype(np.float64)
+    y_extents = (y_max_arr[labels] - y_min_arr[labels] + 1).astype(np.float64)
+    x_extents = (x_max_arr[labels] - x_min_arr[labels] + 1).astype(np.float64)
+    xy_extents = (y_extents + x_extents) / 2.0
+    bb_vol = z_extents * y_extents * x_extents
 
-        z_extents.append(z_range)
-        xy_extent = (y_range + x_range) / 2.0
-        xy_extents.append(xy_extent)
+    mean_z_extent = float(np.mean(z_extents))
+    mean_xy_extent = float(np.mean(xy_extents))
 
-        # Sphericity proxy: ratio of volume to bounding box volume
-        # 1.0 = fills bounding box, π/6 ≈ 0.524 for perfect sphere
-        bb_vol = z_range * y_range * x_range
-        vol = np.sum(mask == l)
-        sphericities.append(vol / bb_vol if bb_vol > 0 else 0)
+    valid = xy_extents > 0
+    elongation_z = float(np.mean(z_extents[valid] / xy_extents[valid])) if valid.any() else 0
 
-    mean_z_extent = float(np.mean(z_extents)) if z_extents else 0
-    mean_xy_extent = float(np.mean(xy_extents)) if xy_extents else 0
+    # Sphericity proxy: volume / bounding-box volume
+    valid_bb = bb_vol > 0
+    sphericities = np.zeros(n_cells)
+    sphericities[valid_bb] = volumes[valid_bb] / bb_vol[valid_bb]
+    mean_sphericity = float(np.mean(sphericities))
 
-    # Z-elongation: ratio of Z-extent to XY-extent
-    # For isotropic nuclei this should be ~1.0
-    # < 1 means nuclei are flattened in Z (under-segmented in depth)
-    # > 1 means nuclei are elongated in Z
-    elongation_z = float(np.mean(
-        [z / xy for z, xy in zip(z_extents, xy_extents) if xy > 0]
-    )) if z_extents else 0
-
-    # --- Z-coverage: fraction of Z slices containing at least 1 cell ---
-    z_slices_with_cells = len(np.unique(np.argwhere(mask > 0)[:, 0]))
+    # --- Z-coverage ---
+    z_slices_with_cells = np.count_nonzero(np.any(mask > 0, axis=(1, 2)))
     z_coverage = z_slices_with_cells / mask.shape[0]
 
-    # --- Z-density uniformity: how evenly are cells distributed across Z ---
-    cells_per_z = np.zeros(mask.shape[0])
-    for z in range(mask.shape[0]):
-        cells_per_z[z] = len(np.unique(mask[z])) - (1 if 0 in mask[z] else 0)
-    # Only consider slices that have cells
-    active_slices = cells_per_z[cells_per_z > 0]
-    z_density_cv = float(active_slices.std() / active_slices.mean()) if len(active_slices) > 1 and active_slices.mean() > 0 else 0
+    # --- Z-density uniformity ---
+    cells_per_z = np.array([
+        len(np.unique(mask[z][mask[z] > 0])) if np.any(mask[z] > 0) else 0
+        for z in range(mask.shape[0])
+    ])
+    active = cells_per_z[cells_per_z > 0]
+    z_density_cv = float(active.std() / active.mean()) if len(active) > 1 and active.mean() > 0 else 0
 
-    # --- Mean sphericity ---
-    mean_sphericity = float(np.mean(sphericities)) if sphericities else 0
-
-    # --- Touching/merged fraction: cells whose bounding boxes overlap ---
-    # (Fast approximation: count cells that share a face with another label)
+    # --- Touching fraction (fast: check border voxels only) ---
+    # For each label, erode by 1 then check if original minus eroded
+    # overlaps with a different label in the original mask.
+    # Even faster: just check a random sample of labels.
+    n_sample = min(200, n_cells)
+    sample_labels = labels if n_cells <= n_sample else np.random.choice(labels, n_sample, replace=False)
     touching = 0
-    # Dilate each axis by 1 and check overlap — sample-based
-    dilated = ndi.maximum_filter(mask, size=3)
-    for l in sample_labels:
-        region = dilated[mask == l]
-        neighbors = np.unique(region)
-        neighbors = neighbors[(neighbors != l) & (neighbors != 0)]
+    for lab in sample_labels:
+        # Get bounding box for this label (fast crop)
+        zl, zh = int(z_min_arr[lab]), int(z_max_arr[lab])
+        yl, yh = int(y_min_arr[lab]), int(y_max_arr[lab])
+        xl, xh = int(x_min_arr[lab]), int(x_max_arr[lab])
+        # Expand by 1 for neighbor check
+        zl2 = max(0, zl - 1); zh2 = min(mask.shape[0], zh + 2)
+        yl2 = max(0, yl - 1); yh2 = min(mask.shape[1], yh + 2)
+        xl2 = max(0, xl - 1); xh2 = min(mask.shape[2], xh + 2)
+        crop = mask[zl2:zh2, yl2:yh2, xl2:xh2]
+        this_cell = crop == lab
+        dilated = ndi.binary_dilation(this_cell, iterations=1)
+        border = dilated & ~this_cell
+        neighbors = np.unique(crop[border])
+        neighbors = neighbors[(neighbors != lab) & (neighbors != 0)]
         if len(neighbors) > 0:
             touching += 1
     touching_fraction = touching / len(sample_labels) if len(sample_labels) > 0 else 0

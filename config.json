@@ -58,7 +58,9 @@
       "noise_lvl": 2
     },
     "postprocessing": {
-      "sigma": 1.0
+      "sigma": 1.0,
+      "clahe_clip_limit": 0.005,
+      "clahe_post_smooth": 0.7
     },
     "correction_flags": {
       "no_clahe": false,

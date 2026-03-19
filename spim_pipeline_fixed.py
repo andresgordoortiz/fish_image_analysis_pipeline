@@ -490,6 +490,14 @@ def main():
         "--edge_taper_width", type=int, default=0,
         help="Cosine-taper this many border pixels BEFORE deconvolution to prevent edge ringing (0=disabled). Recommended: 16-32."
     )
+    parser.add_argument(
+        "--clahe_clip_limit", type=float, default=0.01,
+        help="CLAHE clip limit (lower = less contrast enhancement, less noise). Default: 0.01"
+    )
+    parser.add_argument(
+        "--clahe_post_smooth", type=float, default=0.0,
+        help="Gaussian sigma applied AFTER CLAHE to suppress high-frequency noise it introduces. 0=disabled. Recommended: 0.5-1.0"
+    )
 
     args = parser.parse_args()
 
@@ -793,12 +801,16 @@ def main():
 
     if apply_clahe:
         t0 = time.time()
-        print("[Check-in] Applying CLAHE...")
+        print(f"[Check-in] Applying CLAHE (clip_limit={args.clahe_clip_limit})...")
         img_xz = np.transpose(img, [1, 0, 2])
-        img_xz = clahe_3d_stack(img_xz, clip_limit=0.01, kernel_size=(64, 64), axis=0)
+        img_xz = clahe_3d_stack(img_xz, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0)
         img = np.transpose(img_xz, [1, 0, 2])
         t1 = time.time()
         print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
+        # Post-CLAHE smoothing to suppress high-frequency noise CLAHE introduces
+        if args.clahe_post_smooth > 0:
+            print(f"[Check-in] Post-CLAHE Gaussian smoothing (sigma={args.clahe_post_smooth})...")
+            img = ndi.gaussian_filter(img, sigma=args.clahe_post_smooth)
         print_resource_usage()
 
     # Apply tissue mask (computed early from resliced image) to zero out
