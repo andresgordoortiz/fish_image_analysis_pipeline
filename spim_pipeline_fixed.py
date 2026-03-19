@@ -498,6 +498,10 @@ def main():
         "--clahe_post_smooth", type=float, default=0.0,
         help="Gaussian sigma applied AFTER CLAHE to suppress high-frequency noise it introduces. 0=disabled. Recommended: 0.5-1.0"
     )
+    parser.add_argument(
+        "--mask_border_px", type=int, default=10,
+        help="Trim tissue mask this many pixels from XY image borders to remove edge artifacts. 0=disabled."
+    )
 
     args = parser.parse_args()
 
@@ -696,6 +700,31 @@ def main():
     tissue_mask = ndi.binary_closing(tissue_mask, structure=struct, iterations=5)
     tissue_mask = ndi.binary_dilation(tissue_mask, structure=struct, iterations=8)
     tissue_mask = binary_fill_holes(tissue_mask)
+
+    # Z-fill: if slices z1..z2 contain tissue, ensure slices in between
+    # are not empty (prevents first/last frames from being zeroed out).
+    _z_has_tissue = np.any(tissue_mask, axis=(1, 2))
+    _z_idx = np.where(_z_has_tissue)[0]
+    if len(_z_idx) > 0:
+        _z_lo, _z_hi = int(_z_idx[0]), int(_z_idx[-1])
+        # Project the 2D XY union of all tissue slices
+        _xy_proj = np.any(tissue_mask[_z_lo:_z_hi + 1], axis=0)
+        for _zi in range(_z_lo, _z_hi + 1):
+            if not _z_has_tissue[_zi]:
+                tissue_mask[_zi] = _xy_proj
+        print(f"    Z-fill: tissue range z={_z_lo}..{_z_hi} (of {tissue_mask.shape[0]} slices)")
+
+    # Trim mask from image XY borders: embryo is centred, edges are background.
+    # Without this, dilation can push the mask to the image edges where
+    # CLAHE/WBNS create artefacts.
+    _bpx = args.mask_border_px
+    if _bpx > 0:
+        tissue_mask[:, :_bpx, :] = False
+        tissue_mask[:, -_bpx:, :] = False
+        tissue_mask[:, :, :_bpx] = False
+        tissue_mask[:, :, -_bpx:] = False
+        print(f"    Border trim: {_bpx}px excluded from XY edges")
+
     tissue_pct = 100.0 * np.count_nonzero(tissue_mask) / tissue_mask.size
     print(f"    Tissue mask: {tissue_pct:.1f}% of volume classified as tissue")
     del _mask_img
