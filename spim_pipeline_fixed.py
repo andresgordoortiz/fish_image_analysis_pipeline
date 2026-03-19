@@ -731,6 +731,12 @@ def main():
     t1 = time.time()
     print(f"[Timer] Tissue mask computation took {t1 - t0:.2f} seconds")
 
+    # Pre-deconv masking: zero background BEFORE RL gets a chance to amplify it.
+    # This is the single most effective step against deconv-induced noise/smearing.
+    if args.niter > 0 or args.niterz > 0:
+        print("[Check-in] Applying tissue mask BEFORE deconvolution to suppress background...")
+        img[~tissue_mask] = 0
+
     # Recalculate resolution for BG subtraction
     resolution_px = int(args.resolution_px0 / new_physical_pixel_sizeZ)
     resolution_pz = int(args.resolution_pz0 / new_physical_pixel_sizeZ)
