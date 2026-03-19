@@ -657,6 +657,43 @@ def main():
     physical_pixel_sizeZ = new_physical_pixel_sizeZ
     print_resource_usage()
 
+    # Build tissue mask from the RESLICED image — before deconv/WBNS/CLAHE
+    # corrupt the tissue-vs-background contrast.  Applied at the very end
+    # to zero-out background voxels where processing steps create noise.
+    t0 = time.time()
+    print("[Check-in] Computing tissue mask from resliced image...")
+    from skimage.filters import threshold_otsu
+    from scipy.ndimage import binary_fill_holes
+    _mask_img = ndi.gaussian_filter(img, sigma=2.0)  # light smooth
+    # Per-slice adaptive Otsu: each Z-slice gets its own threshold so dim
+    # slices at the top/bottom of the embryo aren't lost.
+    tissue_mask = np.zeros(img.shape, dtype=bool)
+    for _zi in range(_mask_img.shape[0]):
+        _sl = _mask_img[_zi]
+        _nonzero = _sl[_sl > 0]
+        if _nonzero.size < 100:
+            continue
+        try:
+            _otsu = threshold_otsu(_nonzero)
+        except ValueError:
+            continue
+        # Very conservative: 3% of Otsu keeps dim nuclei at tissue edges
+        _slice_mask = _sl > (_otsu * 0.03)
+        # Fill holes within each slice (e.g. dark nuclei interior)
+        _slice_mask = binary_fill_holes(_slice_mask)
+        tissue_mask[_zi] = _slice_mask
+    # 3D morphological closing to bridge small gaps between slices, then
+    # generous dilation to ensure no tissue is clipped.
+    struct = ndi.generate_binary_structure(3, 2)  # 18-connectivity
+    tissue_mask = ndi.binary_closing(tissue_mask, structure=struct, iterations=5)
+    tissue_mask = ndi.binary_dilation(tissue_mask, structure=struct, iterations=8)
+    tissue_mask = binary_fill_holes(tissue_mask)
+    tissue_pct = 100.0 * np.count_nonzero(tissue_mask) / tissue_mask.size
+    print(f"    Tissue mask: {tissue_pct:.1f}% of volume classified as tissue")
+    del _mask_img
+    t1 = time.time()
+    print(f"[Timer] Tissue mask computation took {t1 - t0:.2f} seconds")
+
     # Recalculate resolution for BG subtraction
     resolution_px = int(args.resolution_px0 / new_physical_pixel_sizeZ)
     resolution_pz = int(args.resolution_pz0 / new_physical_pixel_sizeZ)
@@ -754,32 +791,6 @@ def main():
     print(f"[Timer] Post-processing took {t1 - t0:.2f} seconds")
     print_resource_usage()
 
-    # Build tissue mask BEFORE CLAHE — Otsu threshold on the smoothed image
-    # to identify which voxels are actual tissue vs empty background.
-    # This mask will be applied AFTER CLAHE+normalization to zero out noise
-    # that processing steps (shading correction, WBNS residuals, CLAHE)
-    # inadvertently create in empty regions.
-    t0 = time.time()
-    print("[Check-in] Computing tissue mask...")
-    from skimage.filters import threshold_otsu
-    # Use a max-projection-based approach: compute Otsu per-slice, then combine
-    img_for_mask = img.astype(np.float32)
-    # Smooth more aggressively for mask computation to avoid single-pixel noise
-    mask_smooth = ndi.gaussian_filter(img_for_mask, sigma=3.0)
-    try:
-        otsu_val = threshold_otsu(mask_smooth[mask_smooth > 0])
-    except ValueError:
-        otsu_val = 0
-    # Use a fraction of Otsu as the threshold (catches dim tissue edges)
-    tissue_mask = mask_smooth > (otsu_val * 0.1)
-    # Dilate slightly to avoid cutting tissue edges
-    tissue_mask = ndi.binary_dilation(tissue_mask, iterations=3)
-    tissue_pct = 100.0 * np.count_nonzero(tissue_mask) / tissue_mask.size
-    print(f"    Tissue mask: {tissue_pct:.1f}% of volume is tissue (Otsu={otsu_val:.1f})")
-    del img_for_mask, mask_smooth
-    t1 = time.time()
-    print(f"[Timer] Tissue mask took {t1 - t0:.2f} seconds")
-
     if apply_clahe:
         t0 = time.time()
         print("[Check-in] Applying CLAHE...")
@@ -790,7 +801,8 @@ def main():
         print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
         print_resource_usage()
 
-    # Apply tissue mask: zero out background regions
+    # Apply tissue mask (computed early from resliced image) to zero out
+    # background noise introduced by shading correction, WBNS, and CLAHE.
     print("[Check-in] Applying tissue mask to suppress background noise...")
     img[~tissue_mask] = 0
     del tissue_mask
