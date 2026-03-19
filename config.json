@@ -60,7 +60,8 @@
     "postprocessing": {
       "sigma": 1.0,
       "clahe_clip_limit": 0.005,
-      "clahe_post_smooth": 0.7
+      "clahe_post_smooth": 0.7,
+      "mask_border_px": 10
     },
     "correction_flags": {
       "no_clahe": false,
