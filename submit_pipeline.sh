@@ -64,8 +64,8 @@ fi
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Setup Seqera Tower (extract token from config)
-TOWER_TOKEN=$(grep -o '"access_token"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_JSON" | sed 's/.*: *"\([^"]*\)"/\1/')
+# Setup Seqera Tower (extract token from config — grep may return 1 if key absent)
+TOWER_TOKEN=$(grep -o '"access_token"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_JSON" 2>/dev/null | sed 's/.*: *"\([^"]*\)"/\1/' || true)
 TOWER_FLAG=""
 if [ -n "$TOWER_TOKEN" ] && [ "$TOWER_TOKEN" != "YOUR_SEQERA_TOWER_TOKEN_HERE" ]; then
     export TOWER_ACCESS_TOKEN="$TOWER_TOKEN"
