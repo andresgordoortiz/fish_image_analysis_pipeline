@@ -927,21 +927,14 @@ def main():
 
     if apply_clahe:
         t0 = time.time()
-        # Pass 1: CLAHE on XZ slices (along Y axis) — corrects depth attenuation
-        print(f"[Check-in] Applying CLAHE pass 1/2: XZ slices (clip_limit={args.clahe_clip_limit})...")
-        img_xz = np.transpose(img, [1, 0, 2])
-        img_xz = clahe_3d_stack(img_xz, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0)
-        img = np.transpose(img_xz, [1, 0, 2])
+        # CLAHE on XY slices (each Z-plane equalized independently).
+        # Depth normalization is already handled by z_intensity_correction.
+        # XZ CLAHE was creating horizontal stripes because each Y-row got
+        # a different equalization — switching to XY avoids that.
+        print(f"[Check-in] Applying CLAHE on XY slices (clip_limit={args.clahe_clip_limit})...")
+        img = clahe_3d_stack(img, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0)
         t1 = time.time()
-        print(f"[Timer] CLAHE XZ pass took {t1 - t0:.2f} seconds")
-
-        # Pass 2: CLAHE on XY slices (along Z axis) — equalizes each Z-plane
-        if not args.no_clahe_xy:
-            t0 = time.time()
-            print(f"[Check-in] Applying CLAHE pass 2/2: XY slices (clip_limit={args.clahe_clip_limit})...")
-            img = clahe_3d_stack(img, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0)
-            t1 = time.time()
-            print(f"[Timer] CLAHE XY pass took {t1 - t0:.2f} seconds")
+        print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
 
         if args.clahe_post_smooth > 0:
             print(f"[Check-in] Post-CLAHE Gaussian smoothing (sigma={args.clahe_post_smooth})...")
