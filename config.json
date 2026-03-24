@@ -7,15 +7,15 @@
   },
 
   "input": {
-    "directory": "/groups/pinheiro/user/guilherme.ventura/2025/processed/M45/2025-05-28/concatenated_v2/stack_concatenation_v2/",
+    "directory": "./subset/",
     "channel": 2
   },
 
   "output": {
-    "directory": "./results/",
+    "directory": "./results_subset/",
     "format": "bdv",
     "correct_y": false,
-    "skip_merge": false
+    "skip_merge": true
   },
 
   "seqera_tower": {
@@ -24,7 +24,7 @@
   },
 
   "roi_cropping": {
-    "enabled": true,
+    "enabled": false,
     "roi_path": "./medaka_spim_crop.roi"
   },
 
@@ -37,9 +37,9 @@
 
   "preprocessing": {
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
-    "image_scaling": 0.5,
+    "image_scaling": 0.33,
     "deconvolution": {
-      "niter": 2,
+      "niter": 0,
       "niterz": 0,
       "padding": 64,
       "padding_mode": "edge",
@@ -55,12 +55,12 @@
     "background_subtraction": {
       "resolution_px0": 10,
       "resolution_pz0": 10,
-      "noise_lvl": 1
+      "noise_lvl": 2
     },
     "postprocessing": {
       "sigma": 1.0,
-      "clahe_clip_limit": 0.015,
-      "clahe_post_smooth": 0.7,
+      "clahe_clip_limit": 0.008,
+      "clahe_post_smooth": 1.0,
       "clahe_dual_axis": true,
       "mask_border_px": 25
     },
@@ -79,7 +79,7 @@
   },
 
   "segmentation": {
-    "enabled": true,
+    "enabled": false,
     "model": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Thomas/cellpose/models/cpsam_Gui_tracking_20250801",
     "diameter": 30,
     "flow_threshold": 0.8,
