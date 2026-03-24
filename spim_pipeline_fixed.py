@@ -740,6 +740,20 @@ def main():
     physical_pixel_sizeZ = new_physical_pixel_sizeZ
     print_resource_usage()
 
+    # Pre-deconvolution destriping: remove light-sheet stripe artifacts BEFORE
+    # deconvolution so RL doesn't amplify them. This is the primary destripe pass.
+    if not args.no_destripe:
+        t0 = time.time()
+        print(f"[Check-in] Pre-deconv destriping (sigma_long={args.destripe_sigma_long}, sigma_short={args.destripe_sigma_short})...")
+        img = destripe_3d(
+            img, axis=0,
+            sigma_long=args.destripe_sigma_long,
+            sigma_short=args.destripe_sigma_short,
+        )
+        t1 = time.time()
+        print(f"[Timer] Pre-deconv destriping took {t1 - t0:.2f} seconds")
+        print_resource_usage()
+
     # Build tissue mask from the RESLICED image — before deconv/WBNS/CLAHE
     # corrupt the tissue-vs-background contrast.  Applied at the very end
     # to zero-out background voxels where processing steps create noise.
@@ -897,18 +911,18 @@ def main():
     print(f"[Timer] Post-processing took {t1 - t0:.2f} seconds")
     print_resource_usage()
 
-    # Destriping: remove light-sheet stripe artifacts BEFORE CLAHE
-    # so CLAHE doesn't amplify them.
+    # Destriping: second pass to catch any residual stripes after WBNS,
+    # before CLAHE amplifies them.
     if not args.no_destripe:
         t0 = time.time()
-        print(f"[Check-in] Destriping (sigma_long={args.destripe_sigma_long}, sigma_short={args.destripe_sigma_short})...")
+        print(f"[Check-in] Post-WBNS destriping (residual pass)...")
         img = destripe_3d(
             img, axis=0,
             sigma_long=args.destripe_sigma_long,
             sigma_short=args.destripe_sigma_short,
         )
         t1 = time.time()
-        print(f"[Timer] Destriping took {t1 - t0:.2f} seconds")
+        print(f"[Timer] Post-WBNS destriping took {t1 - t0:.2f} seconds")
         print_resource_usage()
 
     if apply_clahe:

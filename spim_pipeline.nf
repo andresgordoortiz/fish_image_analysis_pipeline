@@ -797,8 +797,8 @@ cmd = [
     '--clahe_post_smooth', str(config['postprocessing'].get('clahe_post_smooth', 0.0)),
     '--mask_border_px', str(config['postprocessing'].get('mask_border_px', 10)),
     '--z_correction_method', str(config.get('z_correction_method', 'p75')),
-    '--destripe_sigma_long', str(config.get('destripe', [:]).get('sigma_long', 64)),
-    '--destripe_sigma_short', str(config.get('destripe', [:]).get('sigma_short', 2))
+    '--destripe_sigma_long', str(config.get('destripe', {}).get('sigma_long', 64)),
+    '--destripe_sigma_short', str(config.get('destripe', {}).get('sigma_short', 2))
 ]
 
 # Add optional flags from correction_flags
