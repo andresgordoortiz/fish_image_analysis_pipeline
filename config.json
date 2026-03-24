@@ -79,6 +79,7 @@
   },
 
   "segmentation": {
+    "enabled": true,
     "model": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Thomas/cellpose/models/cpsam_Gui_tracking_20250801",
     "diameter": 30,
     "flow_threshold": 0.8,

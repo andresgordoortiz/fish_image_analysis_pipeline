@@ -118,6 +118,7 @@ if (config.roi_cropping.enabled) {
 
 // Set defaults for skip_merge and downscale_labels
 def skip_merge = config.output?.skip_merge ?: false
+def skip_segmentation = config.segmentation?.enabled == false
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
 
 // Set defaults for new optional parameters
@@ -1548,63 +1549,67 @@ workflow {
     )
 
     // 3. Segment each timepoint with Cellpose
-    CELLPOSE_SEGMENT(
-        PREPROCESS_DECONVOLVE.out.processed,
-        shared_metadata,
-        config.segmentation,
-        config.preprocessing.image_scaling
-    )
-
-    // 4. OPTIONAL: Downscale segmented labels using Fiji headless (nearest-neighbor)
-    if (downscale_labels < 1.0) {
-        log.info "Label downscaling enabled: factor=${downscale_labels} (Fiji nearest-neighbor, no interpolation)"
-        DOWNSCALE_SEGMENTATION(
-            CELLPOSE_SEGMENT.out.segmented,
-            downscale_labels
-        )
-    }
-
-    // 5. OPTIONAL: Merge all segmented timepoints into 4D hyperstack
-    if (!skip_merge) {
-        log.info "Hyperstack merging enabled"
-
-        all_segmented = CELLPOSE_SEGMENT.out.segmented
-            .map { timepoint, segmented_file -> segmented_file }
-            .collect()
-
-        MERGE_TO_HYPERSTACK(
-            all_segmented,
+    if (!skip_segmentation) {
+        CELLPOSE_SEGMENT(
+            PREPROCESS_DECONVOLVE.out.processed,
             shared_metadata,
-            merge_script_ch.collect()
+            config.segmentation,
+            config.preprocessing.image_scaling
         )
+
+        // 4. OPTIONAL: Downscale segmented labels using Fiji headless (nearest-neighbor)
+        if (downscale_labels < 1.0) {
+            log.info "Label downscaling enabled: factor=${downscale_labels} (Fiji nearest-neighbor, no interpolation)"
+            DOWNSCALE_SEGMENTATION(
+                CELLPOSE_SEGMENT.out.segmented,
+                downscale_labels
+            )
+        }
+
+        // 5. OPTIONAL: Merge all segmented timepoints into 4D hyperstack
+        if (!skip_merge) {
+            log.info "Hyperstack merging enabled"
+
+            all_segmented = CELLPOSE_SEGMENT.out.segmented
+                .map { timepoint, segmented_file -> segmented_file }
+                .collect()
+
+            MERGE_TO_HYPERSTACK(
+                all_segmented,
+                shared_metadata,
+                merge_script_ch.collect()
+            )
+        } else {
+            log.info "Hyperstack merging SKIPPED (skip_merge=true)"
+        }
+
+        // 6. OPTIONAL: Benchmark pipeline outputs
+        def run_benchmark = config.benchmark?.enabled ?: false
+        if (run_benchmark) {
+            log.info "Benchmarking enabled - will compute quality metrics"
+
+            benchmark_script_ch = Channel.fromPath(params.benchmark_script, checkIfExists: true)
+
+            // Resolve output_dir to absolute path (it may be relative like './results/')
+            def abs_output_dir = file(params.output_dir).toAbsolutePath().toString()
+            log.info "Benchmark will read from: ${abs_output_dir}"
+
+            // Wait for segmentation to finish, then run benchmark on the publishDir directly.
+            // This avoids staging hundreds of GB of TIF files into the benchmark work dir.
+            ready_signal = CELLPOSE_SEGMENT.out.segmented
+                .map { timepoint, segmented_file -> true }
+                .collect()
+
+            BENCHMARK(
+                abs_output_dir,
+                ready_signal,
+                benchmark_script_ch.collect()
+            )
+        } else {
+            log.info "Benchmarking disabled"
+        }
     } else {
-        log.info "Hyperstack merging SKIPPED (skip_merge=true)"
-    }
-
-    // 6. OPTIONAL: Benchmark pipeline outputs
-    def run_benchmark = config.benchmark?.enabled ?: false
-    if (run_benchmark) {
-        log.info "Benchmarking enabled - will compute quality metrics"
-
-        benchmark_script_ch = Channel.fromPath(params.benchmark_script, checkIfExists: true)
-
-        // Resolve output_dir to absolute path (it may be relative like './results/')
-        def abs_output_dir = file(params.output_dir).toAbsolutePath().toString()
-        log.info "Benchmark will read from: ${abs_output_dir}"
-
-        // Wait for segmentation to finish, then run benchmark on the publishDir directly.
-        // This avoids staging hundreds of GB of TIF files into the benchmark work dir.
-        ready_signal = CELLPOSE_SEGMENT.out.segmented
-            .map { timepoint, segmented_file -> true }
-            .collect()
-
-        BENCHMARK(
-            abs_output_dir,
-            ready_signal,
-            benchmark_script_ch.collect()
-        )
-    } else {
-        log.info "Benchmarking disabled"
+        log.info "Segmentation SKIPPED (segmentation.enabled=false)"
     }
 }
 
@@ -1616,6 +1621,7 @@ workflow.onComplete {
     def voxel_mode = config.voxel_size?.auto_detect ? "Auto-detected" : "Manual override"
     def roi_status = config.roi_cropping?.enabled ? "ENABLED" : "DISABLED"
     def merge_status = (config.output?.skip_merge ?: false) ? "SKIPPED" : "ENABLED"
+    def seg_status = (config.segmentation?.enabled == false) ? "SKIPPED" : "ENABLED"
     def ds_factor = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
     def downscale_status = ds_factor < 1.0 ? "ENABLED (${ds_factor})" : "DISABLED"
 
@@ -1629,6 +1635,7 @@ workflow.onComplete {
     Duration     : ${workflow.duration}
     Channel      : ${params.channel}
     ROI cropping : ${roi_status}
+    Segmentation : ${seg_status}
     Voxel mode   : ${voxel_mode}
     Merge        : ${merge_status}
     Downscale    : ${downscale_status}
