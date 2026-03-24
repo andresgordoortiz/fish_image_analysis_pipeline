@@ -139,6 +139,12 @@ if (!config.preprocessing.postprocessing.containsKey('clahe_post_smooth')) {
 if (!config.preprocessing.postprocessing.containsKey('mask_border_px')) {
     config.preprocessing.postprocessing.mask_border_px = 10
 }
+if (!config.preprocessing.containsKey('z_correction_method')) {
+    config.preprocessing.z_correction_method = 'p75'
+}
+if (!config.preprocessing.postprocessing.containsKey('clahe_dual_axis')) {
+    config.preprocessing.postprocessing.clahe_dual_axis = true
+}
 if (!config.segmentation.containsKey('anisotropy')) {
     config.segmentation.anisotropy = null
 }
@@ -785,7 +791,8 @@ cmd = [
     '--edge_taper_width', str(config['deconvolution'].get('edge_taper_width', 0)),
     '--clahe_clip_limit', str(config['postprocessing'].get('clahe_clip_limit', 0.01)),
     '--clahe_post_smooth', str(config['postprocessing'].get('clahe_post_smooth', 0.0)),
-    '--mask_border_px', str(config['postprocessing'].get('mask_border_px', 10))
+    '--mask_border_px', str(config['postprocessing'].get('mask_border_px', 10)),
+    '--z_correction_method', str(config.get('z_correction_method', 'p75'))
 ]
 
 # Add optional flags from correction_flags
@@ -795,6 +802,8 @@ if config['correction_flags'].get('no_z_correction', False):
     cmd.append('--no_z_correction')
 if config['correction_flags'].get('no_shading', False):
     cmd.append('--no_shading')
+if not config['postprocessing'].get('clahe_dual_axis', True):
+    cmd.append('--no_clahe_xy')
 
 print("Preprocessing command:", ' '.join(cmd))
 print("\\n" + "="*60)

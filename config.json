@@ -49,22 +49,25 @@
     "normalization": {
       "min_v": 0,
       "max_v": 65535,
-      "percentile_low": 40.0,
+      "percentile_low": 1.0,
       "percentile_high": 99.99
     },
     "background_subtraction": {
       "resolution_px0": 10,
       "resolution_pz0": 10,
-      "noise_lvl": 2
+      "noise_lvl": 1
     },
     "postprocessing": {
       "sigma": 1.0,
-      "clahe_clip_limit": 0.005,
+      "clahe_clip_limit": 0.015,
       "clahe_post_smooth": 0.7,
-      "mask_border_px": 10
+      "clahe_dual_axis": true,
+      "mask_border_px": 25
     },
+    "z_correction_method": "p75",
     "correction_flags": {
       "no_clahe": false,
+      "no_clahe_xy": false,
       "no_z_correction": false,
       "no_shading": false
     }

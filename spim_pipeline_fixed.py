@@ -435,6 +435,14 @@ def main():
     parser.add_argument(
         "--no_shading", action="store_true", help="Disable Shading correction"
     )
+    parser.add_argument(
+        "--no_clahe_xy", action="store_true",
+        help="Disable the second CLAHE pass on XY slices (keep only XZ pass)"
+    )
+    parser.add_argument(
+        "--z_correction_method", type=str, default="p75",
+        help="Robust statistic for z-intensity correction: 'median', 'p75', 'p95', etc. Lower targets boost dim slices more. Default: p75"
+    )
 
     # Deconvolution Params
     parser.add_argument(
@@ -644,9 +652,9 @@ def main():
 
     if apply_z_intensity_correction:
         t0 = time.time()
-        print("[Check-in] Running z_intensity_correction...")
+        print(f"[Check-in] Running z_intensity_correction (method={args.z_correction_method})...")
         img, scales = z_intensity_correction(
-            img, z_axis=0, method="p95", smooth_window=11
+            img, z_axis=0, method=args.z_correction_method, smooth_window=11
         )
         t1 = time.time()
         print(f"[Timer] Z-intensity correction took {t1 - t0:.2f} seconds")
@@ -831,12 +839,22 @@ def main():
 
     if apply_clahe:
         t0 = time.time()
-        print(f"[Check-in] Applying CLAHE (clip_limit={args.clahe_clip_limit})...")
+        # Pass 1: CLAHE on XZ slices (along Y axis) — corrects depth attenuation
+        print(f"[Check-in] Applying CLAHE pass 1/2: XZ slices (clip_limit={args.clahe_clip_limit})...")
         img_xz = np.transpose(img, [1, 0, 2])
         img_xz = clahe_3d_stack(img_xz, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0)
         img = np.transpose(img_xz, [1, 0, 2])
         t1 = time.time()
-        print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
+        print(f"[Timer] CLAHE XZ pass took {t1 - t0:.2f} seconds")
+
+        # Pass 2: CLAHE on XY slices (along Z axis) — equalizes each Z-plane
+        if not args.no_clahe_xy:
+            t0 = time.time()
+            print(f"[Check-in] Applying CLAHE pass 2/2: XY slices (clip_limit={args.clahe_clip_limit})...")
+            img = clahe_3d_stack(img, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0)
+            t1 = time.time()
+            print(f"[Timer] CLAHE XY pass took {t1 - t0:.2f} seconds")
+
         if args.clahe_post_smooth > 0:
             print(f"[Check-in] Post-CLAHE Gaussian smoothing (sigma={args.clahe_post_smooth})...")
             img = ndi.gaussian_filter(img, sigma=args.clahe_post_smooth)
