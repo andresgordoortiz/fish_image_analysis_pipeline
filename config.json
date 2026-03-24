@@ -59,12 +59,12 @@
     },
     "postprocessing": {
       "sigma": 1.0,
-      "clahe_clip_limit": 0.015,
-      "clahe_post_smooth": 0.7,
+      "clahe_clip_limit": 0.02,
+      "clahe_post_smooth": 0.5,
       "clahe_dual_axis": false,
       "mask_border_px": 25
     },
-    "z_correction_method": "p75",
+    "z_correction_method": "p50",
     "destripe": {
       "enabled": false,
       "sigma_long": 64,
