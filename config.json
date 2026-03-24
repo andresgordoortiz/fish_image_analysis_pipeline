@@ -55,13 +55,13 @@
     "background_subtraction": {
       "resolution_px0": 10,
       "resolution_pz0": 10,
-      "noise_lvl": 2
+      "noise_lvl": 1
     },
     "postprocessing": {
       "sigma": 1.0,
-      "clahe_clip_limit": 0.008,
-      "clahe_post_smooth": 1.0,
-      "clahe_dual_axis": true,
+      "clahe_clip_limit": 0.015,
+      "clahe_post_smooth": 0.7,
+      "clahe_dual_axis": false,
       "mask_border_px": 25
     },
     "z_correction_method": "p75",
