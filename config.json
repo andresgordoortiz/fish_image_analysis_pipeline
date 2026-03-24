@@ -65,6 +65,11 @@
       "mask_border_px": 25
     },
     "z_correction_method": "p75",
+    "destripe": {
+      "enabled": true,
+      "sigma_long": 64,
+      "sigma_short": 2
+    },
     "correction_flags": {
       "no_clahe": false,
       "no_clahe_xy": false,

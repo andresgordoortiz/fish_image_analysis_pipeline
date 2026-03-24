@@ -145,6 +145,9 @@ if (!config.preprocessing.containsKey('z_correction_method')) {
 if (!config.preprocessing.postprocessing.containsKey('clahe_dual_axis')) {
     config.preprocessing.postprocessing.clahe_dual_axis = true
 }
+if (!config.preprocessing.containsKey('destripe')) {
+    config.preprocessing.destripe = [enabled: true, sigma_long: 64, sigma_short: 2]
+}
 if (!config.segmentation.containsKey('anisotropy')) {
     config.segmentation.anisotropy = null
 }
@@ -792,7 +795,9 @@ cmd = [
     '--clahe_clip_limit', str(config['postprocessing'].get('clahe_clip_limit', 0.01)),
     '--clahe_post_smooth', str(config['postprocessing'].get('clahe_post_smooth', 0.0)),
     '--mask_border_px', str(config['postprocessing'].get('mask_border_px', 10)),
-    '--z_correction_method', str(config.get('z_correction_method', 'p75'))
+    '--z_correction_method', str(config.get('z_correction_method', 'p75')),
+    '--destripe_sigma_long', str(config.get('destripe', [:]).get('sigma_long', 64)),
+    '--destripe_sigma_short', str(config.get('destripe', [:]).get('sigma_short', 2))
 ]
 
 # Add optional flags from correction_flags
@@ -804,6 +809,8 @@ if config['correction_flags'].get('no_shading', False):
     cmd.append('--no_shading')
 if not config['postprocessing'].get('clahe_dual_axis', True):
     cmd.append('--no_clahe_xy')
+if not config.get('destripe', {}).get('enabled', True):
+    cmd.append('--no_destripe')
 
 print("Preprocessing command:", ' '.join(cmd))
 print("\\n" + "="*60)

@@ -343,6 +343,54 @@ def image_postprocessing(img, resolution_px, resolution_pz, noise_lvl, sigma):
     return img
 
 
+def destripe_slice(img_2d, sigma_long=64, sigma_short=2):
+    """Remove horizontal stripe artifacts from a single 2D image.
+
+    Stripes in SPIM data run along the light-sheet propagation axis.
+    For each row, the stripe component is estimated by heavy Gaussian
+    smoothing along the stripe direction (sigma_long) and light smoothing
+    perpendicular (sigma_short), then subtracted.
+
+    Args:
+        img_2d: 2D float32 array
+        sigma_long: smoothing along stripe direction (columns). Larger = catches
+            wider stripes but may remove real structure. 64 is a good start.
+        sigma_short: smoothing perpendicular (rows). Keeps it a stripe estimate
+            rather than a broad background. 1-3 is typical.
+    Returns:
+        Destriped 2D array (float32)
+    """
+    # Estimate stripe pattern: heavy blur along X (columns), tight along Y (rows)
+    stripe_estimate = ndi.gaussian_filter(img_2d, sigma=(sigma_short, sigma_long))
+    # The stripe is the row-wise mean of this smoothed field
+    row_mean = np.mean(stripe_estimate, axis=1, keepdims=True)
+    global_mean = np.mean(row_mean)
+    # Stripe component = per-row deviation from the global mean
+    stripe_component = row_mean - global_mean
+    return img_2d - stripe_component
+
+
+def destripe_3d(stack, axis=0, sigma_long=64, sigma_short=2):
+    """Apply destriping to each slice of a 3D stack.
+
+    Args:
+        stack: 3D numpy array (Z, Y, X)
+        axis: axis to iterate over for slicing (0=Z → destripe each XY plane)
+        sigma_long: smoothing along stripe direction
+        sigma_short: smoothing perpendicular to stripes
+    Returns:
+        Destriped stack (float32)
+    """
+    s = np.moveaxis(stack.astype(np.float32, copy=False), axis, 0)
+    out = np.empty_like(s, dtype=np.float32)
+    for i in range(s.shape[0]):
+        out[i] = destripe_slice(s[i], sigma_long=sigma_long, sigma_short=sigma_short)
+    out = np.moveaxis(out, 0, axis)
+    # Clamp negatives from subtraction
+    np.maximum(out, 0, out=out)
+    return out
+
+
 def getNormalizationThresholds(img, percentiles):
     """Calculate intensity thresholds for normalization."""
     if np.ndim(img) > 1:
@@ -512,6 +560,18 @@ def main():
     parser.add_argument(
         "--mask_border_px", type=int, default=10,
         help="Trim tissue mask this many pixels from XY image borders to remove edge artifacts. 0=disabled. Default: 10"
+    )
+    parser.add_argument(
+        "--no_destripe", action="store_true",
+        help="Disable light-sheet stripe removal"
+    )
+    parser.add_argument(
+        "--destripe_sigma_long", type=float, default=64,
+        help="Destriping: smoothing along stripe direction (larger = catches wider stripes). Default: 64"
+    )
+    parser.add_argument(
+        "--destripe_sigma_short", type=float, default=2,
+        help="Destriping: smoothing perpendicular to stripes (1-3 typical). Default: 2"
     )
 
     args = parser.parse_args()
@@ -836,6 +896,20 @@ def main():
     t1 = time.time()
     print(f"[Timer] Post-processing took {t1 - t0:.2f} seconds")
     print_resource_usage()
+
+    # Destriping: remove light-sheet stripe artifacts BEFORE CLAHE
+    # so CLAHE doesn't amplify them.
+    if not args.no_destripe:
+        t0 = time.time()
+        print(f"[Check-in] Destriping (sigma_long={args.destripe_sigma_long}, sigma_short={args.destripe_sigma_short})...")
+        img = destripe_3d(
+            img, axis=0,
+            sigma_long=args.destripe_sigma_long,
+            sigma_short=args.destripe_sigma_short,
+        )
+        t1 = time.time()
+        print(f"[Timer] Destriping took {t1 - t0:.2f} seconds")
+        print_resource_usage()
 
     if apply_clahe:
         t0 = time.time()
