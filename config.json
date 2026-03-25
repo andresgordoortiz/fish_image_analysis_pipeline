@@ -55,12 +55,12 @@
     "background_subtraction": {
       "resolution_px0": 10,
       "resolution_pz0": 10,
-      "noise_lvl": 1
+      "noise_lvl": 2
     },
     "postprocessing": {
-      "sigma": 1.0,
+      "sigma": 1.2,
       "clahe_clip_limit": 0.02,
-      "clahe_post_smooth": 0.5,
+      "clahe_post_smooth": 1.0,
       "clahe_dual_axis": false,
       "mask_border_px": 25
     },
