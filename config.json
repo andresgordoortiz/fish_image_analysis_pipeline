@@ -7,15 +7,15 @@
   },
 
   "input": {
-    "directory": "./subset/",
+    "directory": "/groups/pinheiro/user/guilherme.ventura/2025/processed/M45/2025-11-07/20251107_154113_Experiment_2025-11-07/Position\ 4_Settings\ 1/",
     "channel": 2
   },
 
   "output": {
-    "directory": "./results_subset/",
-    "format": "bdv",
+    "directory": "./results_2025_07_11/",
+    "format": "tiff",
     "correct_y": false,
-    "skip_merge": true
+    "skip_merge": false
   },
 
   "seqera_tower": {
@@ -39,8 +39,8 @@
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
     "image_scaling": 0.33,
     "deconvolution": {
-      "niter": 0,
-      "niterz": 0,
+      "niter": 3,
+      "niterz": 3,
       "padding": 64,
       "padding_mode": "edge",
       "edge_mask_px": 8,
@@ -64,7 +64,7 @@
       "clahe_dual_axis": false,
       "mask_border_px": 25
     },
-    "z_correction_method": "p50",
+    "z_correction_method": "p25",
     "destripe": {
       "enabled": false,
       "sigma_long": 64,
@@ -97,6 +97,18 @@
 
   "benchmark": {
     "enabled": true
+  },
+
+  "tracking": {
+    "enabled": false,
+    "ultrack_container": "/groups/pinheiro/user/andres.gordo/processed_data/M45/ultrack_cuda12_gurobi.sif",
+    "ultrack_config_toml": "/groups/pinheiro/user/andres.gordo/processed_data/M45/medaka_071125/ultrack_config.toml",
+    "prep": {
+      "fg_sigma": 5.0,
+      "raw_sigma": 1.0,
+      "boundary_width": 1,
+      "min_area": 10
+    }
   },
 
   "system": {
