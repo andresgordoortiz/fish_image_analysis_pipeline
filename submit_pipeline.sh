@@ -147,7 +147,8 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "Results:"
     echo "  - Preprocessed : $OUTPUT_DIR/01_preprocessed/"
     echo "  - Segmented    : $OUTPUT_DIR/02_segmented/"
-    echo "  - Hyperstack   : $OUTPUT_DIR/03_hyperstack/ (if merge enabled)"
+    echo "  - Hyperstacks  : in 01_preprocessed/ and 02_segmented/ (if merge enabled)"
+    echo "  - Tracking     : $OUTPUT_DIR/03_tracking/ (if tracking enabled)"
     echo "  - Reports      : $OUTPUT_DIR/reports/"
 else
     echo "✗ Pipeline failed (exit code: $EXIT_CODE)"

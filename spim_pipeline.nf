@@ -19,6 +19,7 @@ params.config_json = null
 params.preprocessing_script = './spim_pipeline_fixed.py'
 params.merge_script = './merge_hyperstack.py'
 params.benchmark_script = './benchmark_pipeline.py'
+params.prep_ultrack_script = './prep_ultrack_cellpose.py'
 params.help = false
 
 if (params.help) {
@@ -89,6 +90,7 @@ params.output_dir = sanitizePath(config.output.directory)
 params.channel = config.input.channel
 params.container = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
 params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
+params.ultrack_container = config.tracking?.ultrack_container ?: null
 
 // Validate input directory (use file() for Nextflow-native path resolution)
 def input_dir_file = file(params.input_dir)
@@ -120,6 +122,53 @@ if (config.roi_cropping.enabled) {
 def skip_merge = config.output?.skip_merge ?: false
 def skip_segmentation = config.segmentation?.enabled == false
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
+
+// Set defaults for tracking (ultrack)
+if (!config.containsKey('tracking')) {
+    config.tracking = [enabled: false]
+}
+if (!config.tracking.containsKey('prep')) {
+    config.tracking.prep = [:]
+}
+if (!config.tracking.prep.containsKey('fg_sigma'))        { config.tracking.prep.fg_sigma = 5.0 }
+if (!config.tracking.prep.containsKey('raw_sigma'))       { config.tracking.prep.raw_sigma = 1.0 }
+if (!config.tracking.prep.containsKey('boundary_width'))  { config.tracking.prep.boundary_width = 1 }
+if (!config.tracking.prep.containsKey('min_area'))        { config.tracking.prep.min_area = 10 }
+def skip_tracking = config.tracking?.enabled != true
+
+// Validate tracking config if enabled
+if (!skip_tracking) {
+    if (!params.ultrack_container) {
+        log.error "Tracking enabled but no ultrack_container specified in config.tracking"
+        exit 1
+    }
+    if (!file(params.ultrack_container).exists()) {
+        log.error "Ultrack container not found: ${params.ultrack_container}"
+        exit 1
+    }
+    def toml_path = config.tracking.ultrack_config_toml ?: './ultrack_config.toml'
+    if (!file(toml_path).exists()) {
+        log.error "Ultrack config TOML not found: ${toml_path}"
+        exit 1
+    }
+    // Tracking requires segmentation + merge
+    if (skip_segmentation) {
+        log.error "Tracking requires segmentation (segmentation.enabled=true)"
+        exit 1
+    }
+    if (skip_merge) {
+        log.error "Tracking requires merge (output.skip_merge=false) to produce hyperstacks"
+        exit 1
+    }
+    // ultrack prep uses tifffile, so TIFF format is required (not BDV-only)
+    def out_format = config.output?.format ?: 'tiff'
+    def has_tiff = (out_format instanceof List) ? out_format.any { it.toLowerCase() in ['tiff', 'tif'] }
+                   : out_format.toLowerCase() in ['tiff', 'tif', 'both', 'all']
+    if (!has_tiff) {
+        log.error "Tracking requires TIFF output format (output.format must include 'tiff'). Current: ${out_format}"
+        exit 1
+    }
+}
 
 // Set defaults for new optional parameters
 if (!config.preprocessing.deconvolution.containsKey('padding_mode')) {
@@ -173,6 +222,7 @@ def downscale_info = downscale_labels < 1.0 ? "${downscale_labels} (Fiji nearest
 def edge_mask_info = config.preprocessing.deconvolution.edge_mask_px > 0 ? "${config.preprocessing.deconvolution.edge_mask_px}px" : "Disabled"
 def edge_taper_info = config.preprocessing.deconvolution.edge_taper_width > 0 ? "${config.preprocessing.deconvolution.edge_taper_width}px" : "Disabled"
 def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stitch_threshold != null ? "2D+Stitch(${config.segmentation.stitch_threshold})" : "2D")
+def tracking_info = skip_tracking ? "SKIPPED" : "Enabled (ultrack)"
 
 log.info """
 ================================================
@@ -189,6 +239,7 @@ Pad mode     : ${config.preprocessing.deconvolution.padding_mode}
 Edge taper   : ${edge_taper_info}
 Edge mask    : ${edge_mask_info}
 Seg mode     : ${seg_mode_info}
+Tracking     : ${tracking_info}
 ================================================
 """.stripIndent()
 
@@ -1144,24 +1195,25 @@ PRESERVE_MASK_META
 // ============================================================================
 
 process MERGE_TO_HYPERSTACK {
-    tag "Creating 4D hyperstack"
+    tag "Merging ${data_type} -> 4D hyperstack"
 
     maxRetries 2
     errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
-    publishDir "${params.output_dir}/03_hyperstack",
+    publishDir "${params.output_dir}/${data_type == 'processed' ? '01_preprocessed' : '02_segmented'}",
         mode: 'copy'
 
     input:
-    path segmented_files
+    tuple val(data_type), path(input_files)
     path metadata_json
     path merge_script
 
     output:
-    path "4D_hyperstack.tif", emit: hyperstack, optional: true
-    path "4D_hyperstack_metadata.json", emit: metadata
-    path "4D_hyperstack.h5", emit: h5, optional: true
-    path "4D_hyperstack.xml", emit: xml, optional: true
+    val data_type, emit: dtype
+    path "4D_hyperstack_${data_type}.tif", emit: hyperstack, optional: true
+    path "4D_hyperstack_${data_type}_metadata.json", emit: metadata
+    path "4D_hyperstack_${data_type}.h5", emit: h5, optional: true
+    path "4D_hyperstack_${data_type}.xml", emit: xml, optional: true
 
     container params.container
 
@@ -1177,7 +1229,7 @@ process MERGE_TO_HYPERSTACK {
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
 
-    echo "=== MERGE_TO_HYPERSTACK: Starting ==="
+    echo "=== MERGE_TO_HYPERSTACK (${data_type}) ==="
     echo "Python version:"
     python3 --version
     echo ""
@@ -1191,6 +1243,7 @@ process MERGE_TO_HYPERSTACK {
     fi
 
     echo "Merge script: ${merge_script_name}"
+    echo "Data type: ${data_type}"
     echo ""
 
     # Ensure required packages
@@ -1228,44 +1281,44 @@ PYTHON_CONFIG
     head -10 config_temp.json
     echo ""
 
-    # Run merge script
-    echo "Running merge script..."
-    python3 "${merge_script_name}" "${metadata_json}" config_temp.json
+    # Run merge script with data_type argument
+    echo "Running merge script for ${data_type} data..."
+    python3 "${merge_script_name}" "${metadata_json}" config_temp.json "${data_type}"
 
     # Check exit status
     if [ \$? -ne 0 ]; then
         echo ""
-        echo "ERROR: Merge script failed"
+        echo "ERROR: Merge script failed for ${data_type}"
         exit 1
     fi
 
     # Verify output files
     echo ""
-    echo "Verifying output file or files..."
+    echo "Verifying output file(s)..."
 
-    if [ ! -f "4D_hyperstack_metadata.json" ]; then
+    if [ ! -f "4D_hyperstack_${data_type}_metadata.json" ]; then
         echo "ERROR: Metadata file not created"
         exit 1
     fi
     echo "✓ Metadata file created"
 
-    # Check for TIFF or HDF5 output based on config
-    if [ -f "4D_hyperstack.tif" ]; then
-        FILE_SIZE=\$(du -h 4D_hyperstack.tif | cut -f1)
+    # Check for TIFF or HDF5 output
+    if [ -f "4D_hyperstack_${data_type}.tif" ]; then
+        FILE_SIZE=\$(du -h "4D_hyperstack_${data_type}.tif" | cut -f1)
         echo "✓ TIFF hyperstack created (size: \$FILE_SIZE)"
-    elif [ -f "4D_hyperstack.h5" ]; then
-        FILE_SIZE=\$(du -h 4D_hyperstack.h5 | cut -f1)
+    elif [ -f "4D_hyperstack_${data_type}.h5" ]; then
+        FILE_SIZE=\$(du -h "4D_hyperstack_${data_type}.h5" | cut -f1)
         echo "✓ HDF5 file created (size: \$FILE_SIZE)"
-        if [ -f "4D_hyperstack.xml" ]; then
+        if [ -f "4D_hyperstack_${data_type}.xml" ]; then
             echo "✓ BDV XML file created"
         fi
     else
-        echo "ERROR: No output file created (expected 4D_hyperstack.tif or 4D_hyperstack.h5)"
+        echo "ERROR: No output file created (expected 4D_hyperstack_${data_type}.tif or .h5)"
         exit 1
     fi
 
     echo ""
-    echo "✓ MERGE_TO_HYPERSTACK completed successfully"
+    echo "✓ MERGE_TO_HYPERSTACK (${data_type}) completed successfully"
     """
 }
 
@@ -1460,6 +1513,140 @@ process BENCHMARK {
 }
 
 // ============================================================================
+// PROCESS: Prepare ultrack input (foreground + contours zarrs)
+// ============================================================================
+
+process PREP_ULTRACK {
+    tag "Preparing ultrack input"
+
+    maxRetries 1
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    input:
+    path raw_hyperstack
+    path labels_hyperstack
+    path prep_script
+    val prep_config
+
+    output:
+    path "ultrack_input/foreground.zarr", emit: foreground
+    path "ultrack_input/contours.zarr", emit: contours
+
+    container params.ultrack_container
+
+    script:
+    def prep_cfg = prep_config
+    def script_name = prep_script.name
+    """
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "============================================"
+    echo "PREP_ULTRACK: Preparing ultrack input"
+    echo "============================================"
+    echo "Raw hyperstack: ${raw_hyperstack}"
+    echo "Labels hyperstack: ${labels_hyperstack}"
+    echo ""
+
+    python3 ${script_name} \\
+        --raw "${raw_hyperstack}" \\
+        --labels "${labels_hyperstack}" \\
+        --output ./ultrack_input \\
+        --fg-sigma ${prep_cfg.fg_sigma} \\
+        --raw-sigma ${prep_cfg.raw_sigma} \\
+        --boundary-width ${prep_cfg.boundary_width} \\
+        --min-area ${prep_cfg.min_area}
+
+    # Verify output
+    if [ ! -d "ultrack_input/foreground.zarr" ] || [ ! -d "ultrack_input/contours.zarr" ]; then
+        echo "ERROR: ultrack_input zarr files not created"
+        ls -lR ultrack_input/ 2>/dev/null || echo "ultrack_input/ not found"
+        exit 1
+    fi
+
+    echo ""
+    echo "✓ ultrack input prepared"
+    echo "  foreground.zarr: \$(du -sh ultrack_input/foreground.zarr | cut -f1)"
+    echo "  contours.zarr:   \$(du -sh ultrack_input/contours.zarr | cut -f1)"
+    """
+}
+
+// ============================================================================
+// PROCESS: Run ultrack tracking (segment → link → solve → export)
+// ============================================================================
+
+process ULTRACK_TRACK {
+    tag "ultrack tracking"
+
+    maxRetries 1
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    publishDir "${params.output_dir}/03_tracking",
+        mode: 'copy'
+
+    input:
+    path foreground_zarr
+    path contours_zarr
+    path ultrack_config_toml
+
+    output:
+    path "results/**", emit: results
+    path "ultrack_tracking.log", emit: log
+
+    container params.ultrack_container
+
+    script:
+    """
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    exec > >(tee ultrack_tracking.log) 2>&1
+
+    echo "============================================"
+    echo "ULTRACK: Segment → Link → Solve → Export"
+    echo "============================================"
+    echo "Foreground: ${foreground_zarr}"
+    echo "Contours:   ${contours_zarr}"
+    echo "Config:     ${ultrack_config_toml}"
+    echo ""
+
+    echo "--- Step 1/4: Segment ---"
+    ultrack segment \\
+        ${foreground_zarr} \\
+        ${contours_zarr} \\
+        --foreground-layer foreground \\
+        --contours-layer contours \\
+        --config ${ultrack_config_toml} \\
+        --overwrite
+
+    echo ""
+    echo "--- Step 2/4: Link ---"
+    ultrack link --config ${ultrack_config_toml}
+
+    echo ""
+    echo "--- Step 3/4: Solve ---"
+    ultrack solve --config ${ultrack_config_toml}
+
+    echo ""
+    echo "--- Step 4/4: Export ---"
+    ultrack export zarr-napari \\
+        --config ${ultrack_config_toml} \\
+        --output-directory results/ \\
+        --overwrite
+
+    # Verify output
+    if [ ! -d "results" ]; then
+        echo "ERROR: results/ directory not created"
+        exit 1
+    fi
+
+    echo ""
+    echo "✓ ultrack tracking complete"
+    echo "  Results: \$(du -sh results/ | cut -f1)"
+    """
+}
+
+// ============================================================================
 // MAIN WORKFLOW
 // ============================================================================
 
@@ -1566,16 +1753,27 @@ workflow {
             )
         }
 
-        // 5. OPTIONAL: Merge all segmented timepoints into 4D hyperstack
+        // 5. OPTIONAL: Merge timepoints into 4D hyperstacks
         if (!skip_merge) {
-            log.info "Hyperstack merging enabled"
+            log.info "Hyperstack merging enabled (processed + segmented)"
 
-            all_segmented = CELLPOSE_SEGMENT.out.segmented
+            // Collect processed files into a merge job tuple: ['processed', [files...]]
+            processed_merge_ch = PREPROCESS_DECONVOLVE.out.processed
+                .map { timepoint, processed_file -> processed_file }
+                .collect()
+                .map { files -> tuple('processed', files) }
+
+            // Collect segmented files into a merge job tuple: ['segmented', [files...]]
+            segmented_merge_ch = CELLPOSE_SEGMENT.out.segmented
                 .map { timepoint, segmented_file -> segmented_file }
                 .collect()
+                .map { files -> tuple('segmented', files) }
+
+            // Mix both merge jobs into a single channel (each emitted item = one process invocation)
+            merge_jobs_ch = processed_merge_ch.mix(segmented_merge_ch)
 
             MERGE_TO_HYPERSTACK(
-                all_segmented,
+                merge_jobs_ch,
                 shared_metadata,
                 merge_script_ch.collect()
             )
@@ -1583,7 +1781,45 @@ workflow {
             log.info "Hyperstack merging SKIPPED (skip_merge=true)"
         }
 
-        // 6. OPTIONAL: Benchmark pipeline outputs
+        // 6. OPTIONAL: ultrack tracking (requires merge to produce hyperstacks)
+        if (!skip_tracking) {
+            log.info "Ultrack tracking enabled"
+
+            // Filter merge outputs: get processed hyperstack (raw) and segmented hyperstack (labels)
+            // The TIFF hyperstack is required for ultrack prep (uses tifffile)
+            // Filenames contain the data type: 4D_hyperstack_processed.tif, 4D_hyperstack_segmented.tif
+            processed_hs = MERGE_TO_HYPERSTACK.out.hyperstack
+                .filter { it.name.contains('processed') }
+
+            segmented_hs = MERGE_TO_HYPERSTACK.out.hyperstack
+                .filter { it.name.contains('segmented') }
+
+            prep_ultrack_script_ch = Channel.fromPath(params.prep_ultrack_script, checkIfExists: true)
+
+            // Step 1: Prepare foreground + contours zarrs (GPU)
+            PREP_ULTRACK(
+                processed_hs,
+                segmented_hs,
+                prep_ultrack_script_ch.collect(),
+                config.tracking.prep
+            )
+
+            // Step 2: Run ultrack segment → link → solve → export (CPU)
+            ultrack_config_ch = Channel.fromPath(
+                config.tracking.ultrack_config_toml ?: './ultrack_config.toml',
+                checkIfExists: true
+            )
+
+            ULTRACK_TRACK(
+                PREP_ULTRACK.out.foreground,
+                PREP_ULTRACK.out.contours,
+                ultrack_config_ch.collect()
+            )
+        } else {
+            log.info "Ultrack tracking SKIPPED (tracking.enabled=false)"
+        }
+
+        // 7. OPTIONAL: Benchmark pipeline outputs
         def run_benchmark = config.benchmark?.enabled ?: false
         if (run_benchmark) {
             log.info "Benchmarking enabled - will compute quality metrics"
@@ -1610,6 +1846,22 @@ workflow {
         }
     } else {
         log.info "Segmentation SKIPPED (segmentation.enabled=false)"
+
+        // Even without segmentation, merge processed images if requested
+        if (!skip_merge) {
+            log.info "Hyperstack merging enabled (processed only, no segmentation)"
+
+            processed_merge_ch = PREPROCESS_DECONVOLVE.out.processed
+                .map { timepoint, processed_file -> processed_file }
+                .collect()
+                .map { files -> tuple('processed', files) }
+
+            MERGE_TO_HYPERSTACK(
+                processed_merge_ch,
+                shared_metadata,
+                merge_script_ch.collect()
+            )
+        }
     }
 }
 
@@ -1626,6 +1878,7 @@ workflow.onComplete {
     def downscale_status = ds_factor < 1.0 ? "ENABLED (${ds_factor})" : "DISABLED"
 
     def benchmark_status = (config.benchmark?.enabled ?: false) ? "ENABLED" : "DISABLED"
+    def tracking_status = (config.tracking?.enabled ?: false) ? "ENABLED (ultrack)" : "DISABLED"
 
     log.info """
     ============================================================================
@@ -1639,6 +1892,7 @@ workflow.onComplete {
     Voxel mode   : ${voxel_mode}
     Merge        : ${merge_status}
     Downscale    : ${downscale_status}
+    Tracking     : ${tracking_status}
     Benchmark    : ${benchmark_status}
     Output dir   : ${params.output_dir}
 
@@ -1647,7 +1901,8 @@ workflow.onComplete {
       - Preprocessed images : ${params.output_dir}/01_preprocessed/
       - Segmented masks     : ${params.output_dir}/02_segmented/
       ${ds_factor < 1.0 ? "- Downscaled labels  : ${params.output_dir}/02_segmented_downscaled/" : ""}
-      ${!(config.output?.skip_merge ?: false) ? "- 4D Hyperstack      : ${params.output_dir}/03_hyperstack/" : ""}
+      ${!(config.output?.skip_merge ?: false) ? "- Hyperstacks        : in 01_preprocessed/ and 02_segmented/" : ""}
+      ${(config.tracking?.enabled ?: false) ? "- Tracking results   : ${params.output_dir}/03_tracking/" : ""}
       ${(config.benchmark?.enabled ?: false) ? "- Benchmark          : ${params.output_dir}/benchmark/" : ""}
       - Logs                : ${params.output_dir}/logs/
 
