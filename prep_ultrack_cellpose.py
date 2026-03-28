@@ -35,6 +35,7 @@ Usage:
       --labels cellpose_labels.tif \
       --preview --preview-t 100 --compare --preview-output ./my_preview
 """
+
 from __future__ import annotations
 
 import argparse
@@ -48,6 +49,7 @@ def _get_available_ram_bytes():
     """Return available RAM in bytes."""
     try:
         import psutil
+
         return psutil.virtual_memory().available
     except ImportError:
         pass
@@ -62,6 +64,48 @@ def _get_available_ram_bytes():
     return None
 
 
+def _open_hyperstack(path):
+    """
+    Open an ImageJ hyperstack TIFF and return (array, tif_handle) with shape (T, Z, Y, X).
+
+    The merge script writes each Z-slice as an individual 2D IFD with ImageJ
+    metadata (frames=T, slices=Z).  tifffile.asarray(out='memmap') returns a
+    flat (T*Z, Y, X) array; we reshape it to (T, Z, Y, X) using the ImageJ
+    metadata.  Falls back to (1, Z, Y, X) for plain 3D stacks.
+    """
+    import tifffile
+
+    tif = tifffile.TiffFile(path)
+    data = tif.asarray(out="memmap")
+
+    if data.ndim == 4:
+        return data, tif
+
+    if data.ndim == 3:
+        n_images, Y, X = data.shape
+        # Try to get T and Z from ImageJ metadata
+        T, Z = 1, n_images
+        if tif.is_imagej:
+            ij = tif.imagej_metadata or {}
+            Z = int(ij.get("slices", n_images))
+            T = int(ij.get("frames", 1))
+        if T * Z != n_images:
+            # Metadata inconsistent; assume single timepoint
+            T, Z = 1, n_images
+        data = data.reshape(T, Z, Y, X)
+        print(
+            f"  Reshaped from (T*Z={n_images}, {Y}, {X}) to ({T}, {Z}, {Y}, {X}) using ImageJ metadata"
+        )
+        return data, tif
+
+    if data.ndim == 2:
+        # Single 2D image
+        data = data[np.newaxis, np.newaxis, ...]
+        return data, tif
+
+    raise ValueError(f"Unexpected ndim={data.ndim} for {path}")
+
+
 def _estimate_frame_memory(Z, Y, X, raw_dtype, lbl_dtype):
     """
     Estimate peak RAM per worker for one timepoint.
@@ -70,12 +114,15 @@ def _estimate_frame_memory(Z, Y, X, raw_dtype, lbl_dtype):
     n_voxels = Z * Y * X
     raw_bytes = n_voxels * np.dtype(raw_dtype).itemsize
     lbl_bytes = n_voxels * np.dtype(lbl_dtype).itemsize
-    fg_bytes = n_voxels * 4        # float32
-    bounds_bytes = n_voxels * 1    # bool
-    cc_bytes = n_voxels * 8        # int64 from ndi_label
-    ct_bytes = n_voxels * 4        # float32
-    overhead_factor = 1.5           # detect_foreground/robust_invert temporaries
-    return int((raw_bytes + lbl_bytes + fg_bytes + bounds_bytes + cc_bytes + ct_bytes) * overhead_factor)
+    fg_bytes = n_voxels * 4  # float32
+    bounds_bytes = n_voxels * 1  # bool
+    cc_bytes = n_voxels * 8  # int64 from ndi_label
+    ct_bytes = n_voxels * 4  # float32
+    overhead_factor = 1.5  # detect_foreground/robust_invert temporaries
+    return int(
+        (raw_bytes + lbl_bytes + fg_bytes + bounds_bytes + cc_bytes + ct_bytes)
+        * overhead_factor
+    )
 
 
 def process_all(args):
@@ -87,12 +134,15 @@ def process_all(args):
 
     try:
         import cupy as cp
+
         HAS_CUPY = True
         # Print GPU info
         dev = cp.cuda.Device()
         gpu_mem_total = dev.mem_info[1]
         gpu_mem_free = dev.mem_info[0]
-        print(f"  GPU: {dev.id} — {gpu_mem_free / 1e9:.1f} / {gpu_mem_total / 1e9:.1f} GB free")
+        print(
+            f"  GPU: {dev.id} — {gpu_mem_free / 1e9:.1f} / {gpu_mem_total / 1e9:.1f} GB free"
+        )
     except ImportError:
         HAS_CUPY = False
 
@@ -101,14 +151,12 @@ def process_all(args):
     from ultrack.imgproc import robust_invert, detect_foreground
 
     print("Opening raw image (lazy loading)...")
-    raw_tif = tifffile.TiffFile(args.raw)
-    raw = raw_tif.asarray(out="memmap")
+    raw, raw_tif = _open_hyperstack(args.raw)
     T, Z, Y, X = raw.shape
     print(f"  Raw shape: {raw.shape}, dtype: {raw.dtype}")
 
     print("Opening cellpose labels (lazy loading)...")
-    lbl_tif = tifffile.TiffFile(args.labels)
-    labels = lbl_tif.asarray(out="memmap")
+    labels, lbl_tif = _open_hyperstack(args.labels)
     assert labels.shape == raw.shape, (
         f"Shape mismatch: raw={raw.shape} labels={labels.shape}"
     )
@@ -117,12 +165,18 @@ def process_all(args):
     os.makedirs(args.output, exist_ok=True)
 
     fg_zarr = zarr.open(
-        os.path.join(args.output, "foreground.zarr"), mode="w",
-        shape=(T, Z, Y, X), dtype=np.float32, chunks=(1, Z, Y, X),
+        os.path.join(args.output, "foreground.zarr"),
+        mode="w",
+        shape=(T, Z, Y, X),
+        dtype=np.float32,
+        chunks=(1, Z, Y, X),
     )
     ct_zarr = zarr.open(
-        os.path.join(args.output, "contours.zarr"), mode="w",
-        shape=(T, Z, Y, X), dtype=np.float32, chunks=(1, Z, Y, X),
+        os.path.join(args.output, "contours.zarr"),
+        mode="w",
+        shape=(T, Z, Y, X),
+        dtype=np.float32,
+        chunks=(1, Z, Y, X),
     )
 
     t_start = args.start_t if args.start_t is not None else 0
@@ -159,9 +213,11 @@ def process_all(args):
 
     print(f"  Per-frame memory estimate: {frame_mem / 1e9:.2f} GB")
     if avail_ram is not None:
-        print(f"  Available RAM: {avail_ram / 1e9:.1f} GB (using 80% = {avail_ram * 0.8 / 1e9:.1f} GB)")
+        print(
+            f"  Available RAM: {avail_ram / 1e9:.1f} GB (using 80% = {avail_ram * 0.8 / 1e9:.1f} GB)"
+        )
     print(f"  Workers: {n_workers} (cpu={cpu_count}, ram-limited={max_by_ram})")
-    print(f"Processing timepoints {t_start}..{t_end-1} ({n_frames} frames)")
+    print(f"Processing timepoints {t_start}..{t_end - 1} ({n_frames} frames)")
 
     def _process_frame(t):
         raw_frame = np.array(raw[t])
@@ -170,10 +226,14 @@ def process_all(args):
         # --- foreground: detect from raw, then cut at cellpose boundaries ---
         if gpu_lock is not None:
             with gpu_lock:
-                fg = np.array(detect_foreground(raw_frame, sigma=args.fg_sigma), dtype=np.float32)
+                fg = np.array(
+                    detect_foreground(raw_frame, sigma=args.fg_sigma), dtype=np.float32
+                )
                 cp.get_default_memory_pool().free_all_blocks()
         else:
-            fg = np.array(detect_foreground(raw_frame, sigma=args.fg_sigma), dtype=np.float32)
+            fg = np.array(
+                detect_foreground(raw_frame, sigma=args.fg_sigma), dtype=np.float32
+            )
 
         # find cellpose boundary pixels (1px wide between labels)
         bounds = find_boundaries(lbl_frame, mode="outer")
@@ -195,10 +255,14 @@ def process_all(args):
         # --- contours: robust_invert of raw (unchanged, full diversity) ---
         if gpu_lock is not None:
             with gpu_lock:
-                ct = np.array(robust_invert(raw_frame, sigma=args.raw_sigma), dtype=np.float32)
+                ct = np.array(
+                    robust_invert(raw_frame, sigma=args.raw_sigma), dtype=np.float32
+                )
                 cp.get_default_memory_pool().free_all_blocks()
         else:
-            ct = np.array(robust_invert(raw_frame, sigma=args.raw_sigma), dtype=np.float32)
+            ct = np.array(
+                robust_invert(raw_frame, sigma=args.raw_sigma), dtype=np.float32
+            )
 
         fg_zarr[t] = fg
         ct_zarr[t] = ct
@@ -209,7 +273,7 @@ def process_all(args):
         # sequential fallback
         for t in range(t_start, t_end):
             t_done, n_removed = _process_frame(t)
-            msg = f"  t={t_done}/{t_end-1}"
+            msg = f"  t={t_done}/{t_end - 1}"
             if n_removed > 0:
                 msg += f"  (removed {n_removed} islands < {args.min_area}v)"
             print(msg)
@@ -256,18 +320,18 @@ def preview(args):
     os.makedirs(out_dir, exist_ok=True)
 
     print("Opening raw image (lazy loading)...")
-    raw_tif = tifffile.TiffFile(args.raw)
-    raw_all = raw_tif.asarray(out="memmap")
+    raw_all, raw_tif = _open_hyperstack(args.raw)
     T = raw_all.shape[0]
+    print(f"  Raw shape: {raw_all.shape}, dtype: {raw_all.dtype}")
 
     print("Opening cellpose labels (lazy loading)...")
-    lbl_tif = tifffile.TiffFile(args.labels)
-    lbl_all = lbl_tif.asarray(out="memmap")
+    lbl_all, lbl_tif = _open_hyperstack(args.labels)
+    print(f"  Labels shape: {lbl_all.shape}, dtype: {lbl_all.dtype}")
 
     timepoints = args.preview_t
     for tp in timepoints:
         if tp < 0 or tp >= T:
-            print(f"WARNING: t={tp} out of range [0, {T-1}], skipping.")
+            print(f"WARNING: t={tp} out of range [0, {T - 1}], skipping.")
             continue
 
         prefix = os.path.join(out_dir, f"preview_t{tp:03d}")
@@ -277,8 +341,12 @@ def preview(args):
         lbl_frame = np.array(lbl_all[tp])
 
         # foreground & contours from raw
-        fg_raw = np.array(detect_foreground(raw_frame, sigma=args.fg_sigma), dtype=np.float32)
-        contours = np.array(robust_invert(raw_frame, sigma=args.raw_sigma), dtype=np.float32)
+        fg_raw = np.array(
+            detect_foreground(raw_frame, sigma=args.fg_sigma), dtype=np.float32
+        )
+        contours = np.array(
+            robust_invert(raw_frame, sigma=args.raw_sigma), dtype=np.float32
+        )
 
         # cellpose boundaries
         bounds = find_boundaries(lbl_frame, mode="outer")
@@ -299,7 +367,9 @@ def preview(args):
             fg_gated[small_mask[cc_labels]] = 0.0
             n_removed = np.sum(small_mask[1:])
             if n_removed > 0:
-                print(f"    Removed {n_removed} foreground islands < {args.min_area} voxels")
+                print(
+                    f"    Removed {n_removed} foreground islands < {args.min_area} voxels"
+                )
 
         # --- save full Z-stacks as TIFFs ---
         tifffile.imwrite(f"{prefix}_raw.tif", raw_frame, imagej=True)
@@ -308,7 +378,9 @@ def preview(args):
         tifffile.imwrite(f"{prefix}_labels.tif", lbl_frame, imagej=True)
         print(f"  {prefix}_labels.tif")
 
-        tifffile.imwrite(f"{prefix}_boundaries.tif", bounds.astype(np.uint8) * 255, imagej=True)
+        tifffile.imwrite(
+            f"{prefix}_boundaries.tif", bounds.astype(np.uint8) * 255, imagej=True
+        )
         print(f"  {prefix}_boundaries.tif")
 
         tifffile.imwrite(f"{prefix}_fg_original.tif", fg_raw, imagej=True)
@@ -325,6 +397,7 @@ def preview(args):
             # incompatibility (ultrack converts to cupy internally, but
             # skimage.find_boundaries does not support cupy arrays).
             from scipy.ndimage import gaussian_filter
+
             lbl_np = np.asarray(lbl_frame)
             fg_l2c = (lbl_np > 0).astype(np.float32)
             ct_l2c = find_boundaries(lbl_np, mode="outer").astype(np.float32)
@@ -345,40 +418,89 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--raw", required=True,
-                    help="Path to raw 4D hyperstack TIFF (T,Z,Y,X)")
-    ap.add_argument("--labels", required=True,
-                    help="Path to cellpose/SAM label stack TIFF (T,Z,Y,X)")
-    ap.add_argument("--output", default="./ultrack_input",
-                    help="Output directory for zarr files (default: ./ultrack_input)")
+    ap.add_argument(
+        "--raw", required=True, help="Path to raw 4D hyperstack TIFF (T,Z,Y,X)"
+    )
+    ap.add_argument(
+        "--labels",
+        required=True,
+        help="Path to cellpose/SAM label stack TIFF (T,Z,Y,X)",
+    )
+    ap.add_argument(
+        "--output",
+        default="./ultrack_input",
+        help="Output directory for zarr files (default: ./ultrack_input)",
+    )
 
     # Processing params
-    ap.add_argument("--fg-sigma", type=float, default=5.0,
-                    help="Gaussian sigma for detect_foreground (default: 5.0, same as original)")
-    ap.add_argument("--raw-sigma", type=float, default=1.0,
-                    help="Gaussian sigma for robust_invert contours (default: 1.0, same as original)")
-    ap.add_argument("--boundary-width", type=int, default=1,
-                    help="Width of the boundary gap in pixels (default: 1). "
-                         "Increase to 2-3 if watershed still leaks across cells.")
-    ap.add_argument("--min-area", type=int, default=10,
-                    help="Remove foreground islands smaller than this (voxels). "
-                         "Must be ≥8 for ultrack's watershed hierarchy (default: 10).")
-    ap.add_argument("--start-t", type=int, default=None,
-                    help="First timepoint to process (inclusive, default: 0)")
-    ap.add_argument("--end-t", type=int, default=None,
-                    help="Last timepoint to process (exclusive, default: all)")
-    ap.add_argument("--workers", type=int, default=None,
-                    help="Max parallel workers (default: auto from available RAM & CPUs)")
+    ap.add_argument(
+        "--fg-sigma",
+        type=float,
+        default=5.0,
+        help="Gaussian sigma for detect_foreground (default: 5.0, same as original)",
+    )
+    ap.add_argument(
+        "--raw-sigma",
+        type=float,
+        default=1.0,
+        help="Gaussian sigma for robust_invert contours (default: 1.0, same as original)",
+    )
+    ap.add_argument(
+        "--boundary-width",
+        type=int,
+        default=1,
+        help="Width of the boundary gap in pixels (default: 1). "
+        "Increase to 2-3 if watershed still leaks across cells.",
+    )
+    ap.add_argument(
+        "--min-area",
+        type=int,
+        default=10,
+        help="Remove foreground islands smaller than this (voxels). "
+        "Must be ≥8 for ultrack's watershed hierarchy (default: 10).",
+    )
+    ap.add_argument(
+        "--start-t",
+        type=int,
+        default=None,
+        help="First timepoint to process (inclusive, default: 0)",
+    )
+    ap.add_argument(
+        "--end-t",
+        type=int,
+        default=None,
+        help="Last timepoint to process (exclusive, default: all)",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Max parallel workers (default: auto from available RAM & CPUs)",
+    )
 
     # Preview mode
-    ap.add_argument("--preview", action="store_true",
-                    help="Preview selected timepoints as full Z-stack TIFFs")
-    ap.add_argument("--preview-t", type=int, nargs="+", default=[0],
-                    help="Timepoint(s) to preview, e.g. --preview-t 0 50 100 (default: 0)")
-    ap.add_argument("--preview-output", default="./preview",
-                    help="Directory to save preview TIFFs (default: ./preview)")
-    ap.add_argument("--compare", action="store_true",
-                    help="Also export labels_to_contours TIFFs for comparison")
+    ap.add_argument(
+        "--preview",
+        action="store_true",
+        help="Preview selected timepoints as full Z-stack TIFFs",
+    )
+    ap.add_argument(
+        "--preview-t",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="Timepoint(s) to preview, e.g. --preview-t 0 50 100 (default: 0)",
+    )
+    ap.add_argument(
+        "--preview-output",
+        default="./preview",
+        help="Directory to save preview TIFFs (default: ./preview)",
+    )
+    ap.add_argument(
+        "--compare",
+        action="store_true",
+        help="Also export labels_to_contours TIFFs for comparison",
+    )
 
     args = ap.parse_args()
 
@@ -390,4 +512,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
