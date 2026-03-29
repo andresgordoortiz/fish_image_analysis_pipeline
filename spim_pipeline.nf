@@ -1572,17 +1572,14 @@ process PREP_ULTRACK {
 }
 
 // ============================================================================
-// PROCESS: Run ultrack tracking (segment → link → solve → export)
+// PROCESS: ultrack Step 1 — Segment (watershed hierarchy from foreground+contours)
 // ============================================================================
 
-process ULTRACK_TRACK {
-    tag "ultrack tracking"
+process ULTRACK_SEGMENT {
+    tag "ultrack segment"
 
-    maxRetries 1
+    maxRetries 2
     errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
-
-    publishDir "${params.output_dir}/03_tracking",
-        mode: 'copy'
 
     input:
     path foreground_zarr
@@ -1590,8 +1587,8 @@ process ULTRACK_TRACK {
     path ultrack_config_toml
 
     output:
-    path "results/**", emit: results
-    path "ultrack_tracking.log", emit: log
+    path ultrack_config_toml, emit: config_toml
+    path "data.db", emit: database
 
     container params.ultrack_container
 
@@ -1600,17 +1597,14 @@ process ULTRACK_TRACK {
     #!/usr/bin/env bash
     set -euo pipefail
 
-    exec > >(tee ultrack_tracking.log) 2>&1
-
     echo "============================================"
-    echo "ULTRACK: Segment → Link → Solve → Export"
+    echo "ULTRACK Step 1/4: Segment"
     echo "============================================"
     echo "Foreground: ${foreground_zarr}"
     echo "Contours:   ${contours_zarr}"
     echo "Config:     ${ultrack_config_toml}"
     echo ""
 
-    echo "--- Step 1/4: Segment ---"
     ultrack segment \\
         ${foreground_zarr} \\
         ${contours_zarr} \\
@@ -1620,15 +1614,124 @@ process ULTRACK_TRACK {
         --overwrite
 
     echo ""
-    echo "--- Step 2/4: Link ---"
+    echo "✓ Segment complete"
+    ls -lh data.db 2>/dev/null || echo "WARNING: data.db not found in workdir"
+    """
+}
+
+// ============================================================================
+// PROCESS: ultrack Step 2 — Link (temporal associations between segments)
+// ============================================================================
+
+process ULTRACK_LINK {
+    tag "ultrack link"
+
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    input:
+    path ultrack_config_toml
+    path database
+
+    output:
+    path ultrack_config_toml, emit: config_toml
+    path "data.db", emit: database
+
+    container params.ultrack_container
+
+    script:
+    """
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "============================================"
+    echo "ULTRACK Step 2/4: Link"
+    echo "============================================"
+    echo ""
+
     ultrack link --config ${ultrack_config_toml}
 
     echo ""
-    echo "--- Step 3/4: Solve ---"
+    echo "✓ Link complete"
+    ls -lh data.db
+    """
+}
+
+// ============================================================================
+// PROCESS: ultrack Step 3 — Solve (ILP optimisation — memory-intensive)
+// ============================================================================
+
+process ULTRACK_SOLVE {
+    tag "ultrack solve"
+
+    maxRetries 3
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    input:
+    path ultrack_config_toml
+    path database
+
+    output:
+    path ultrack_config_toml, emit: config_toml
+    path "data.db", emit: database
+
+    container params.ultrack_container
+
+    script:
+    """
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "============================================"
+    echo "ULTRACK Step 3/4: Solve"
+    echo "============================================"
+    echo "Attempt: ${task.attempt}"
+    echo "Memory:  ${task.memory}"
+    echo ""
+
     ultrack solve --config ${ultrack_config_toml}
 
     echo ""
-    echo "--- Step 4/4: Export ---"
+    echo "✓ Solve complete"
+    ls -lh data.db
+    """
+}
+
+// ============================================================================
+// PROCESS: ultrack Step 4 — Export (write tracking results)
+// ============================================================================
+
+process ULTRACK_EXPORT {
+    tag "ultrack export"
+
+    maxRetries 1
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    publishDir "${params.output_dir}/03_tracking",
+        mode: 'copy'
+
+    input:
+    path ultrack_config_toml
+    path database
+
+    output:
+    path "results/**", emit: results
+    path "ultrack_export.log", emit: log
+
+    container params.ultrack_container
+
+    script:
+    """
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    exec > >(tee ultrack_export.log) 2>&1
+
+    echo "============================================"
+    echo "ULTRACK Step 4/4: Export"
+    echo "============================================"
+    echo ""
+
     ultrack export zarr-napari \\
         --config ${ultrack_config_toml} \\
         --output-directory results/ \\
@@ -1641,7 +1744,7 @@ process ULTRACK_TRACK {
     fi
 
     echo ""
-    echo "✓ ultrack tracking complete"
+    echo "✓ ultrack export complete"
     echo "  Results: \$(du -sh results/ | cut -f1)"
     """
 }
@@ -1804,16 +1907,31 @@ workflow {
                 config.tracking.prep
             )
 
-            // Step 2: Run ultrack segment → link → solve → export (CPU)
+            // Step 2: ultrack segment → link → solve → export (4 separate processes)
             ultrack_config_ch = Channel.fromPath(
                 config.tracking.ultrack_config_toml ?: './ultrack_config.toml',
                 checkIfExists: true
             )
 
-            ULTRACK_TRACK(
+            ULTRACK_SEGMENT(
                 PREP_ULTRACK.out.foreground,
                 PREP_ULTRACK.out.contours,
                 ultrack_config_ch.collect()
+            )
+
+            ULTRACK_LINK(
+                ULTRACK_SEGMENT.out.config_toml,
+                ULTRACK_SEGMENT.out.database
+            )
+
+            ULTRACK_SOLVE(
+                ULTRACK_LINK.out.config_toml,
+                ULTRACK_LINK.out.database
+            )
+
+            ULTRACK_EXPORT(
+                ULTRACK_SOLVE.out.config_toml,
+                ULTRACK_SOLVE.out.database
             )
         } else {
             log.info "Ultrack tracking SKIPPED (tracking.enabled=false)"
