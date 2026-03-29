@@ -124,11 +124,21 @@ echo "Log          : $LOG_FILE"
 echo "================================================"
 echo ""
 
+# Parse resume flag from config (default: true)
+RESUME_FLAG="-resume"
+RESUME_VAL=$(python3 -c "import json; print(json.load(open('$CONFIG_JSON')).get('system',{}).get('resume',True))" 2>/dev/null || echo "True")
+if [ "$RESUME_VAL" = "False" ]; then
+    RESUME_FLAG=""
+    echo "Resume: disabled (config)"
+else
+    echo "Resume: enabled"
+fi
+
 # Run the pipeline (Nextflow reads all params from config.json)
 nextflow run ./spim_pipeline.nf \
     --config_json "$CONFIG_JSON" \
     -c ./nextflow.config \
-    -resume \
+    $RESUME_FLAG \
     -with-report "$OUTPUT_DIR/reports/report_${TIMESTAMP}.html" \
     -with-timeline "$OUTPUT_DIR/reports/timeline_${TIMESTAMP}.html" \
     -with-trace "$OUTPUT_DIR/reports/trace_${TIMESTAMP}.txt" \
