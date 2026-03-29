@@ -1587,7 +1587,7 @@ process ULTRACK_SEGMENT {
     path ultrack_config_toml
 
     output:
-    path ultrack_config_toml, emit: config_toml
+    path "local_ultrack_config.toml", emit: config_toml
     path "data.db", emit: database
 
     container params.ultrack_container
@@ -1597,12 +1597,26 @@ process ULTRACK_SEGMENT {
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Override database path in config to force writing into workdir
+    python3 -c "
+import re, pathlib
+cfg = pathlib.Path('${ultrack_config_toml}').read_text()
+db_url = 'sqlite:///./data.db'
+if re.search(r'^\\s*database\\s*=', cfg, re.M):
+    cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 \"' + db_url + '\"', cfg, flags=re.M)
+elif '[data_config]' in cfg:
+    cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = \"' + db_url + '\"')
+else:
+    cfg += '\\n[data_config]\\ndatabase = \"' + db_url + '\"\\n'
+pathlib.Path('local_ultrack_config.toml').write_text(cfg)
+print('Database path overridden to: ' + db_url)
+"
+
     echo "============================================"
     echo "ULTRACK Step 1/4: Segment"
     echo "============================================"
     echo "Foreground: ${foreground_zarr}"
     echo "Contours:   ${contours_zarr}"
-    echo "Config:     ${ultrack_config_toml}"
     echo ""
 
     ultrack segment \\
@@ -1610,12 +1624,12 @@ process ULTRACK_SEGMENT {
         ${contours_zarr} \\
         --foreground-layer foreground \\
         --contours-layer contours \\
-        --config ${ultrack_config_toml} \\
+        --config local_ultrack_config.toml \\
         --overwrite
 
     echo ""
     echo "✓ Segment complete"
-    ls -lh data.db 2>/dev/null || echo "WARNING: data.db not found in workdir"
+    ls -lh data.db
     """
 }
 
@@ -1634,7 +1648,7 @@ process ULTRACK_LINK {
     path database
 
     output:
-    path ultrack_config_toml, emit: config_toml
+    path "local_ultrack_config.toml", emit: config_toml
     path "data.db", emit: database
 
     container params.ultrack_container
@@ -1644,12 +1658,21 @@ process ULTRACK_LINK {
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Re-patch database path to point to the local workdir copy
+    python3 -c "
+import re, pathlib
+cfg = pathlib.Path('${ultrack_config_toml}').read_text()
+db_url = 'sqlite:///./data.db'
+cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 \"' + db_url + '\"', cfg, flags=re.M)
+pathlib.Path('local_ultrack_config.toml').write_text(cfg)
+"
+
     echo "============================================"
     echo "ULTRACK Step 2/4: Link"
     echo "============================================"
     echo ""
 
-    ultrack link --config ${ultrack_config_toml}
+    ultrack link --config local_ultrack_config.toml
 
     echo ""
     echo "✓ Link complete"
@@ -1672,7 +1695,7 @@ process ULTRACK_SOLVE {
     path database
 
     output:
-    path ultrack_config_toml, emit: config_toml
+    path "local_ultrack_config.toml", emit: config_toml
     path "data.db", emit: database
 
     container params.ultrack_container
@@ -1682,6 +1705,15 @@ process ULTRACK_SOLVE {
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Re-patch database path to point to the local workdir copy
+    python3 -c "
+import re, pathlib
+cfg = pathlib.Path('${ultrack_config_toml}').read_text()
+db_url = 'sqlite:///./data.db'
+cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 \"' + db_url + '\"', cfg, flags=re.M)
+pathlib.Path('local_ultrack_config.toml').write_text(cfg)
+"
+
     echo "============================================"
     echo "ULTRACK Step 3/4: Solve"
     echo "============================================"
@@ -1689,7 +1721,7 @@ process ULTRACK_SOLVE {
     echo "Memory:  ${task.memory}"
     echo ""
 
-    ultrack solve --config ${ultrack_config_toml}
+    ultrack solve --config local_ultrack_config.toml
 
     echo ""
     echo "✓ Solve complete"
@@ -1727,13 +1759,22 @@ process ULTRACK_EXPORT {
 
     exec > >(tee ultrack_export.log) 2>&1
 
+    # Re-patch database path to point to the local workdir copy
+    python3 -c "
+import re, pathlib
+cfg = pathlib.Path('${ultrack_config_toml}').read_text()
+db_url = 'sqlite:///./data.db'
+cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 \"' + db_url + '\"', cfg, flags=re.M)
+pathlib.Path('local_ultrack_config.toml').write_text(cfg)
+"
+
     echo "============================================"
     echo "ULTRACK Step 4/4: Export"
     echo "============================================"
     echo ""
 
     ultrack export zarr-napari \\
-        --config ${ultrack_config_toml} \\
+        --config local_ultrack_config.toml \\
         --output-directory results/ \\
         --overwrite
 
