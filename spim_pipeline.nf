@@ -1718,8 +1718,8 @@ process ULTRACK_SOLVE {
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-cfg = re.sub(r'^\s*database\s*=.*$', '', cfg, flags=re.M)
-cfg = re.sub(r'^\s*address\s*=.*$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
 if '[data_config]' in cfg:
     cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
 else:
@@ -1776,8 +1776,8 @@ process ULTRACK_EXPORT {
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-cfg = re.sub(r'^\s*database\s*=.*$', '', cfg, flags=re.M)
-cfg = re.sub(r'^\s*address\s*=.*$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
 if '[data_config]' in cfg:
     cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
 else:
