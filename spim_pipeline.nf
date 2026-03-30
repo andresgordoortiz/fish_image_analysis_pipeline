@@ -1598,19 +1598,19 @@ process ULTRACK_SEGMENT {
     set -euo pipefail
 
     # Override database path in config to force writing into workdir
-    python3 -c "
+    python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
 db_url = 'sqlite:///./data.db'
 if re.search(r'^\\s*database\\s*=', cfg, re.M):
-    cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 \"' + db_url + '\"', cfg, flags=re.M)
+    cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 "' + db_url + '"', cfg, flags=re.M)
 elif '[data_config]' in cfg:
-    cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = \"' + db_url + '\"')
+    cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "' + db_url + '"')
 else:
-    cfg += '\\n[data_config]\\ndatabase = \"' + db_url + '\"\\n'
+    cfg += '\\n[data_config]\\ndatabase = "' + db_url + '"\\n'
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
 print('Database path overridden to: ' + db_url)
-"
+PYEOF
 
     echo "============================================"
     echo "ULTRACK Step 1/4: Segment"
@@ -1659,13 +1659,13 @@ process ULTRACK_LINK {
     set -euo pipefail
 
     # Re-patch database path to point to the local workdir copy
-    python3 -c "
+    python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
 db_url = 'sqlite:///./data.db'
-cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 \"' + db_url + '\"', cfg, flags=re.M)
+cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 "' + db_url + '"', cfg, flags=re.M)
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
-"
+PYEOF
 
     echo "============================================"
     echo "ULTRACK Step 2/4: Link"
@@ -1706,13 +1706,13 @@ process ULTRACK_SOLVE {
     set -euo pipefail
 
     # Re-patch database path to point to the local workdir copy
-    python3 -c "
+    python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
 db_url = 'sqlite:///./data.db'
-cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 \"' + db_url + '\"', cfg, flags=re.M)
+cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 "' + db_url + '"', cfg, flags=re.M)
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
-"
+PYEOF
 
     echo "============================================"
     echo "ULTRACK Step 3/4: Solve"
@@ -1760,13 +1760,13 @@ process ULTRACK_EXPORT {
     exec > >(tee ultrack_export.log) 2>&1
 
     # Re-patch database path to point to the local workdir copy
-    python3 -c "
+    python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
 db_url = 'sqlite:///./data.db'
-cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 \"' + db_url + '\"', cfg, flags=re.M)
+cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 "' + db_url + '"', cfg, flags=re.M)
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
-"
+PYEOF
 
     echo "============================================"
     echo "ULTRACK Step 4/4: Export"
