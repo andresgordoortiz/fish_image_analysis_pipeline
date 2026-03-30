@@ -1604,8 +1604,8 @@ cfg = pathlib.Path('${ultrack_config_toml}').read_text()
 
 # ultrack DataConfig expects: database = "sqlite" (enum) + address = "path"
 # Remove any existing database/address lines
-cfg = re.sub(r'^\s*database\s*=.*\$', '', cfg, flags=re.M)
-cfg = re.sub(r'^\s*address\s*=.*\$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
 
 # Insert correct fields under [data_config]
 if '[data_config]' in cfg:
