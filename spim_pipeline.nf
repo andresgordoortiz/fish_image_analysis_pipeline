@@ -1601,15 +1601,20 @@ process ULTRACK_SEGMENT {
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-db_url = 'sqlite:///./data.db'
-if re.search(r'^\\s*database\\s*=', cfg, re.M):
-    cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 "' + db_url + '"', cfg, flags=re.M)
-elif '[data_config]' in cfg:
-    cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "' + db_url + '"')
+
+# ultrack DataConfig expects: database = "sqlite" (enum) + address = "path"
+# Remove any existing database/address lines
+cfg = re.sub(r'^\s*database\s*=.*$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\s*address\s*=.*$', '', cfg, flags=re.M)
+
+# Insert correct fields under [data_config]
+if '[data_config]' in cfg:
+    cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
 else:
-    cfg += '\\n[data_config]\\ndatabase = "' + db_url + '"\\n'
+    cfg += '\n[data_config]\ndatabase = "sqlite"\naddress = "./data.db"\n'
+
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
-print('Database path overridden to: ' + db_url)
+print('Database overridden: sqlite @ ./data.db')
 PYEOF
 
     echo "============================================"
@@ -1662,8 +1667,12 @@ process ULTRACK_LINK {
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-db_url = 'sqlite:///./data.db'
-cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 "' + db_url + '"', cfg, flags=re.M)
+cfg = re.sub(r'^\s*database\s*=.*$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\s*address\s*=.*$', '', cfg, flags=re.M)
+if '[data_config]' in cfg:
+    cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
+else:
+    cfg += '\n[data_config]\ndatabase = "sqlite"\naddress = "./data.db"\n'
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
 PYEOF
 
@@ -1709,8 +1718,12 @@ process ULTRACK_SOLVE {
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-db_url = 'sqlite:///./data.db'
-cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 "' + db_url + '"', cfg, flags=re.M)
+cfg = re.sub(r'^\s*database\s*=.*$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\s*address\s*=.*$', '', cfg, flags=re.M)
+if '[data_config]' in cfg:
+    cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
+else:
+    cfg += '\n[data_config]\ndatabase = "sqlite"\naddress = "./data.db"\n'
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
 PYEOF
 
@@ -1763,8 +1776,12 @@ process ULTRACK_EXPORT {
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-db_url = 'sqlite:///./data.db'
-cfg = re.sub(r'^(\\s*database\\s*=).*', r'\\1 "' + db_url + '"', cfg, flags=re.M)
+cfg = re.sub(r'^\s*database\s*=.*$', '', cfg, flags=re.M)
+cfg = re.sub(r'^\s*address\s*=.*$', '', cfg, flags=re.M)
+if '[data_config]' in cfg:
+    cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
+else:
+    cfg += '\n[data_config]\ndatabase = "sqlite"\naddress = "./data.db"\n'
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
 PYEOF
 
