@@ -1609,7 +1609,7 @@ cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
 
 # Insert correct fields under [data_config]
 if '[data_config]' in cfg:
-cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"')
+    cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
 else:
     cfg += '\n[data_config]\ndatabase = "sqlite"\naddress = "./data.db"\n'
 
@@ -1670,7 +1670,7 @@ cfg = pathlib.Path('${ultrack_config_toml}').read_text()
 cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
 cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
 if '[data_config]' in cfg:
-cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"')
+    cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
 else:
     cfg += '\n[data_config]\ndatabase = "sqlite"\naddress = "./data.db"\n'
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
@@ -1721,7 +1721,7 @@ cfg = pathlib.Path('${ultrack_config_toml}').read_text()
 cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
 cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
 if '[data_config]' in cfg:
-cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"')
+    cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
 else:
     cfg += '\n[data_config]\ndatabase = "sqlite"\naddress = "./data.db"\n'
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
@@ -1779,7 +1779,7 @@ cfg = pathlib.Path('${ultrack_config_toml}').read_text()
 cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
 cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
 if '[data_config]' in cfg:
-cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"')
+    cfg = cfg.replace('[data_config]', '[data_config]\ndatabase = "sqlite"\naddress = "./data.db"')
 else:
     cfg += '\n[data_config]\ndatabase = "sqlite"\naddress = "./data.db"\n'
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
