@@ -187,14 +187,8 @@ def clahe_3d_stack(
     p_high=99.5,
     eps=1e-8,
     bg_threshold_pct=5.0,
+    min_signal_pct=2.0,   # NEW: slices below this signal fraction → skip CLAHE
 ):
-    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to 3D stack.
-
-    bg_threshold_pct: percentile used to detect background. Pixels below this
-        threshold in the *original* slice are treated as background and forced
-        back to their original (dark) values after CLAHE, preventing CLAHE
-        from amplifying noise in empty/black regions.  Set to 0 to disable.
-    """
     from skimage import exposure
 
     if stack.ndim != 3:
@@ -202,31 +196,54 @@ def clahe_3d_stack(
     in_dtype = stack.dtype
     s = np.moveaxis(stack, axis, 0).astype(np.float32, copy=False)
     out = np.empty_like(s, dtype=np.float32)
+
+    # Compute a global signal reference from the full stack
+    # (median of per-slice medians, only on non-zero voxels)
+    slice_medians = []
+    for i in range(s.shape[0]):
+        nz = s[i][s[i] > 0]
+        if nz.size > 0:
+            slice_medians.append(np.median(nz))
+    global_median = np.median(slice_medians) if slice_medians else 1.0
+
+    skipped = 0
     for i in range(s.shape[0]):
         img = s[i]
+
+        # Signal gate: if this slice's median is < min_signal_pct% of the
+        # global median, it's a noise-dominated slice — skip CLAHE entirely
+        nz = img[img > 0]
+        slice_signal = np.median(nz) if nz.size > 100 else 0.0
+        if slice_signal < (global_median * min_signal_pct / 100.0):
+            out[i] = img  # pass-through unchanged
+            skipped += 1
+            continue
+
         lo = np.percentile(img, p_low)
         hi = np.percentile(img, p_high)
         if hi <= lo + eps:
             out[i] = 0.0
             continue
-        # Build background mask BEFORE CLAHE modifies values
+
         if bg_threshold_pct > 0:
             bg_val = np.percentile(img, bg_threshold_pct)
             bg_mask = img <= bg_val
         else:
             bg_mask = None
+
         img01 = np.clip(img, lo, hi)
         img01 = (img01 - lo) / (hi - lo)
         result = exposure.equalize_adapthist(
             img01, kernel_size=kernel_size, clip_limit=clip_limit
         ).astype(np.float32, copy=False)
-        # Guard against NaN from skimage internal dtype conversions
         np.nan_to_num(result, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
-        # Restore background: force pixels that were originally dark back to
-        # their pre-CLAHE normalized value so CLAHE doesn't brighten empty space
         if bg_mask is not None:
             result[bg_mask] = img01[bg_mask]
         out[i] = result
+
+    if skipped > 0:
+        print(f"    CLAHE: skipped {skipped}/{s.shape[0]} low-signal slices (threshold: {min_signal_pct}% of global median)")
+
     out = np.moveaxis(out, 0, axis)
     if not preserve_dtype:
         return out
@@ -235,7 +252,6 @@ def clahe_3d_stack(
         out = np.clip(out * info.max, 0, info.max).astype(in_dtype)
         return out
     return out.astype(in_dtype, copy=False)
-
 
 def reslice(img, position, x_res, z_res):
     """Reslice image to isotropic voxels."""
@@ -572,6 +588,12 @@ def main():
     parser.add_argument(
         "--destripe_sigma_short", type=float, default=2,
         help="Destriping: smoothing perpendicular to stripes (1-3 typical). Default: 2"
+    )
+    parser.add_argument(
+        "--clahe_min_signal_pct", type=float, default=2.0,
+        help="Slices whose median signal is below this %% of the stack global median "
+        "are skipped in CLAHE (pass-through). Prevents CLAHE from amplifying "
+        "noise in entry/exit slices. Default: 2.0"
     )
 
     args = parser.parse_args()
@@ -932,7 +954,7 @@ def main():
         # XZ CLAHE was creating horizontal stripes because each Y-row got
         # a different equalization — switching to XY avoids that.
         print(f"[Check-in] Applying CLAHE on XY slices (clip_limit={args.clahe_clip_limit})...")
-        img = clahe_3d_stack(img, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0)
+        img = clahe_3d_stack(img, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0,min_signal_pct=args.clahe_min_signal_pct)
         t1 = time.time()
         print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
 
