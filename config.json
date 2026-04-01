@@ -67,6 +67,7 @@
     "z_correction_method": "p50",
     "z_correction_max_scale": 5.0,
     "z_correction_signal_floor_pct": 10.0,
+    "dim_slice_threshold_pct": 30.0,
     "destripe": {
       "enabled": false,
       "sigma_long": 64,
