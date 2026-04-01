@@ -784,10 +784,11 @@ def main():
     # the MEDIAN of all slices is dominated by camera background (~100 counts)
     # and is nearly identical between noise-only and tissue-containing slices.
     # The real discriminator is the SPREAD of intensity: tissue slices have
-    # bright nuclei that push std and high percentiles far above the background,
-    # while pure-noise slices have std ≈ 20-30.  We use p95 as the signal
-    # metric because it captures sparse bright objects without being skewed
-    # by a single hot pixel.
+    # bright nuclei that push std far above the background, while pure-noise
+    # slices have std ≈ 20-40.  Camera background (~100 counts) inflates p95
+    # uniformly across ALL slices so p95 cannot distinguish noise from tissue.
+    # We use std alone: it directly measures signal variation and is unaffected
+    # by the DC offset of the camera background.
     _dim_threshold = args.dim_slice_threshold_pct
     _n_dim = 0
     _dim_mask_z = np.zeros(img.shape[0], dtype=bool)
@@ -795,33 +796,26 @@ def main():
         t0 = time.time()
         print(f"[Check-in] Early dim-slice detection (threshold={_dim_threshold}%)...")
         _raw_f32 = img.astype(np.float32)
-        _slice_p95 = []
         _slice_std = []
         for _zi in range(_raw_f32.shape[0]):
-            _sl = _raw_f32[_zi]
-            _slice_p95.append(float(np.percentile(_sl, 95)))
-            _slice_std.append(float(np.std(_sl)))
-        _slice_p95 = np.array(_slice_p95)
+            _slice_std.append(float(np.std(_raw_f32[_zi])))
         _slice_std = np.array(_slice_std)
 
-        _global_p95 = float(np.median(_slice_p95))
         _global_std = float(np.median(_slice_std))
-        _dim_floor_p95 = (_dim_threshold / 100.0) * _global_p95
         _dim_floor_std = (_dim_threshold / 100.0) * _global_std
 
-        # A slice is noise-dominated if BOTH p95 and std are below their floors.
-        _dim_mask_z = (_slice_p95 < _dim_floor_p95) & (_slice_std < _dim_floor_std)
+        # A slice is noise-dominated if its std is below the floor.
+        _dim_mask_z = _slice_std < _dim_floor_std
         _n_dim = int(np.sum(_dim_mask_z))
 
-        print(f"    Signal metrics — p95: global={_global_p95:.1f}, floor={_dim_floor_p95:.1f} | "
-              f"std: global={_global_std:.1f}, floor={_dim_floor_std:.1f}")
+        print(f"    Signal metric — std: global={_global_std:.1f}, floor={_dim_floor_std:.1f}")
         if _n_dim > 0:
             print(f"    Dim-slice blanking: {_n_dim}/{len(_dim_mask_z)} slices detected as noise-dominated — zeroing")
             for _zi in range(img.shape[0]):
                 if _dim_mask_z[_zi]:
                     img[_zi] = 0
         else:
-            print(f"    No dim slices detected (0/{len(_dim_mask_z)} below both thresholds)")
+            print(f"    No dim slices detected (0/{len(_dim_mask_z)} below threshold)")
         del _raw_f32
         t1 = time.time()
         print(f"[Timer] Early dim-slice detection took {t1 - t0:.2f} seconds")
