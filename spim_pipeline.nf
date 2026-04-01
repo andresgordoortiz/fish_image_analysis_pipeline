@@ -192,6 +192,12 @@ if (!config.preprocessing.postprocessing.containsKey('mask_border_px')) {
 if (!config.preprocessing.containsKey('z_correction_method')) {
     config.preprocessing.z_correction_method = 'p75'
 }
+if (!config.preprocessing.containsKey('z_correction_max_scale')) {
+    config.preprocessing.z_correction_max_scale = 5.0
+}
+if (!config.preprocessing.containsKey('z_correction_signal_floor_pct')) {
+    config.preprocessing.z_correction_signal_floor_pct = 10.0
+}
 if (!config.preprocessing.postprocessing.containsKey('clahe_dual_axis')) {
     config.preprocessing.postprocessing.clahe_dual_axis = true
 }
@@ -848,6 +854,8 @@ cmd = [
     '--clahe_post_smooth', str(config['postprocessing'].get('clahe_post_smooth', 0.0)),
     '--mask_border_px', str(config['postprocessing'].get('mask_border_px', 10)),
     '--z_correction_method', str(config.get('z_correction_method', 'p75')),
+    '--z_correction_max_scale', str(config.get('z_correction_max_scale', 5.0)),
+    '--z_correction_signal_floor_pct', str(config.get('z_correction_signal_floor_pct', 10.0)),
     '--destripe_sigma_long', str(config.get('destripe', {}).get('sigma_long', 64)),
     '--destripe_sigma_short', str(config.get('destripe', {}).get('sigma_short', 2))
 ]

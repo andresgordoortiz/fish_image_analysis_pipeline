@@ -105,9 +105,21 @@ def read_nd2_voxel_size(image):
 
 
 def z_intensity_correction(
-    stack, z_axis=0, method="p95", smooth_window=9, eps=1e-8, preserve_dtype=True
+    stack, z_axis=0, method="p95", smooth_window=9, eps=1e-8, preserve_dtype=True,
+    max_scale=5.0, signal_floor_pct=10.0,
 ):
-    """Correct intensity variation along Z axis."""
+    """Correct intensity variation along Z axis.
+
+    Args:
+        max_scale: Maximum allowed correction factor per slice.  Prevents
+            extreme amplification of noise in near-empty slices (e.g. the
+            first/last slices of an embryo where only camera noise exists).
+            Set to 0 to disable clamping.
+        signal_floor_pct: Slices whose measured level is below this
+            percentage of the target level are considered noise-dominated.
+            Their correction is smoothly tapered toward 1.0 (no correction)
+            so noise is not amplified.  0 disables tapering.
+    """
     if stack.ndim != 3:
         raise ValueError(f"Expected 3D stack, got {stack.shape}")
     x = np.moveaxis(stack, z_axis, 0).astype(np.float32, copy=False)
@@ -130,6 +142,29 @@ def z_intensity_correction(
         levels_s = levels
     target = np.median(levels_s)
     scales = target / levels_s
+
+    # --- Signal-gated dampening ---
+    # Slices whose level is far below the target are noise-dominated.
+    # Taper their correction factor smoothly toward 1.0 (no correction)
+    # so camera noise is not amplified into false detections.
+    if signal_floor_pct > 0:
+        floor = (signal_floor_pct / 100.0) * target
+        dim_mask = levels_s < floor
+        if np.any(dim_mask):
+            # Linear taper: 0 at level=0 -> 1 at level=floor
+            frac = np.where(dim_mask, levels_s / (floor + eps), 1.0)
+            scales = np.where(dim_mask, 1.0 + (scales - 1.0) * frac, scales)
+            n_dim = int(np.sum(dim_mask))
+            print(f"    Z-correction: {n_dim}/{len(scales)} slices below signal floor "
+                  f"({signal_floor_pct}% of target) — correction dampened")
+
+    # Hard-clamp maximum correction factor
+    if max_scale > 0:
+        n_clamped = int(np.sum(scales > max_scale))
+        if n_clamped > 0:
+            print(f"    Z-correction: {n_clamped}/{len(scales)} slices clamped to max_scale={max_scale}")
+        scales = np.minimum(scales, max_scale)
+
     y = x * scales[:, None, None]
     y = np.moveaxis(y, 0, z_axis)
     if not preserve_dtype:
@@ -507,6 +542,17 @@ def main():
         "--z_correction_method", type=str, default="p75",
         help="Robust statistic for z-intensity correction: 'median', 'p75', 'p95', etc. Lower targets boost dim slices more. Default: p75"
     )
+    parser.add_argument(
+        "--z_correction_max_scale", type=float, default=5.0,
+        help="Maximum allowed Z-correction factor per slice. Prevents noise "
+        "amplification in near-empty slices (e.g. embryo entry slices). 0=unlimited. Default: 5.0"
+    )
+    parser.add_argument(
+        "--z_correction_signal_floor_pct", type=float, default=10.0,
+        help="Slices whose signal level is below this %% of the target are "
+        "considered noise-dominated; their correction is tapered toward 1.0 "
+        "(no correction). Prevents noise amplification. 0=disabled. Default: 10.0"
+    )
 
     # Deconvolution Params
     parser.add_argument(
@@ -734,9 +780,12 @@ def main():
 
     if apply_z_intensity_correction:
         t0 = time.time()
-        print(f"[Check-in] Running z_intensity_correction (method={args.z_correction_method})...")
+        print(f"[Check-in] Running z_intensity_correction (method={args.z_correction_method}, "
+              f"max_scale={args.z_correction_max_scale}, signal_floor={args.z_correction_signal_floor_pct}%)...")
         img, scales = z_intensity_correction(
-            img, z_axis=0, method=args.z_correction_method, smooth_window=11
+            img, z_axis=0, method=args.z_correction_method, smooth_window=11,
+            max_scale=args.z_correction_max_scale,
+            signal_floor_pct=args.z_correction_signal_floor_pct,
         )
         t1 = time.time()
         print(f"[Timer] Z-intensity correction took {t1 - t0:.2f} seconds")

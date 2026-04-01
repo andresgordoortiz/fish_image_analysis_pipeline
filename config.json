@@ -7,15 +7,15 @@
   },
 
   "input": {
-    "directory": "/groups/pinheiro/user/guilherme.ventura/2025/processed/M45/2025-11-07/20251107_154113_Experiment_2025-11-07/Position\ 4_Settings\ 1/",
+    "directory": "./subset/",
     "channel": 2
   },
 
   "output": {
-    "directory": "./results_2025_07_11/",
+    "directory": "./subset_results/",
     "format": "tiff",
     "correct_y": false,
-    "skip_merge": false
+    "skip_merge": true
   },
 
   "seqera_tower": {
@@ -64,7 +64,9 @@
       "clahe_dual_axis": false,
       "mask_border_px": 25
     },
-    "z_correction_method": "p25",
+    "z_correction_method": "p50",
+    "z_correction_max_scale": 5.0,
+    "z_correction_signal_floor_pct": 10.0,
     "destripe": {
       "enabled": false,
       "sigma_long": 64,
