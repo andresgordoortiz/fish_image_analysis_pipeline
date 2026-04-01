@@ -193,13 +193,16 @@ if (!config.preprocessing.containsKey('z_correction_method')) {
     config.preprocessing.z_correction_method = 'p75'
 }
 if (!config.preprocessing.containsKey('z_correction_max_scale')) {
-    config.preprocessing.z_correction_max_scale = 5.0
+    config.preprocessing.z_correction_max_scale = 2.0
 }
 if (!config.preprocessing.containsKey('z_correction_signal_floor_pct')) {
-    config.preprocessing.z_correction_signal_floor_pct = 10.0
+    config.preprocessing.z_correction_signal_floor_pct = 25.0
 }
 if (!config.preprocessing.containsKey('dim_slice_threshold_pct')) {
     config.preprocessing.dim_slice_threshold_pct = 30.0
+}
+if (!config.preprocessing.containsKey('camera_bg_percentile')) {
+    config.preprocessing.camera_bg_percentile = 2.0
 }
 if (!config.preprocessing.postprocessing.containsKey('clahe_dual_axis')) {
     config.preprocessing.postprocessing.clahe_dual_axis = true
@@ -854,12 +857,14 @@ cmd = [
     '--edge_mask_px', str(config['deconvolution'].get('edge_mask_px', 0)),
     '--edge_taper_width', str(config['deconvolution'].get('edge_taper_width', 0)),
     '--clahe_clip_limit', str(config['postprocessing'].get('clahe_clip_limit', 0.01)),
+    '--clahe_min_signal_pct', str(config['postprocessing'].get('clahe_min_signal_pct', 15.0)),
     '--clahe_post_smooth', str(config['postprocessing'].get('clahe_post_smooth', 0.0)),
     '--mask_border_px', str(config['postprocessing'].get('mask_border_px', 10)),
     '--z_correction_method', str(config.get('z_correction_method', 'p75')),
-    '--z_correction_max_scale', str(config.get('z_correction_max_scale', 5.0)),
-    '--z_correction_signal_floor_pct', str(config.get('z_correction_signal_floor_pct', 10.0)),
+    '--z_correction_max_scale', str(config.get('z_correction_max_scale', 2.0)),
+    '--z_correction_signal_floor_pct', str(config.get('z_correction_signal_floor_pct', 25.0)),
     '--dim_slice_threshold_pct', str(config.get('dim_slice_threshold_pct', 30.0)),
+    '--camera_bg_percentile', str(config.get('camera_bg_percentile', 2.0)),
     '--destripe_sigma_long', str(config.get('destripe', {}).get('sigma_long', 64)),
     '--destripe_sigma_short', str(config.get('destripe', {}).get('sigma_short', 2))
 ]

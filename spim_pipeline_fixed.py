@@ -543,22 +543,29 @@ def main():
         help="Robust statistic for z-intensity correction: 'median', 'p75', 'p95', etc. Lower targets boost dim slices more. Default: p75"
     )
     parser.add_argument(
-        "--z_correction_max_scale", type=float, default=5.0,
+        "--z_correction_max_scale", type=float, default=2.0,
         help="Maximum allowed Z-correction factor per slice. Prevents noise "
-        "amplification in near-empty slices (e.g. embryo entry slices). 0=unlimited. Default: 5.0"
+        "amplification in near-empty slices (e.g. embryo entry slices). 0=unlimited. Default: 2.0"
     )
     parser.add_argument(
-        "--z_correction_signal_floor_pct", type=float, default=10.0,
+        "--z_correction_signal_floor_pct", type=float, default=25.0,
         help="Slices whose signal level is below this %% of the target are "
         "considered noise-dominated; their correction is tapered toward 1.0 "
-        "(no correction). Prevents noise amplification. 0=disabled. Default: 10.0"
+        "(no correction). Prevents noise amplification. 0=disabled. Default: 25.0"
+    )
+    parser.add_argument(
+        "--camera_bg_percentile", type=float, default=2.0,
+        help="Percentile used for per-slice camera background subtraction. "
+        "Removes the sCMOS camera dark-current offset (~100 counts) before "
+        "any processing so that background noise is not amplified by "
+        "z-correction and deconvolution. 0=disabled. Default: 2.0"
     )
     parser.add_argument(
         "--dim_slice_threshold_pct", type=float, default=30.0,
-        help="Slices whose p95 AND std are below this %% of the stack-wide median "
-        "are considered noise-dominated and zeroed BEFORE any corrections. "
-        "Critical for SPIM data where the first/last slices have no tissue. "
-        "Higher = more aggressive blanking. 0=disabled. Default: 30.0"
+        help="Slices whose std is below this %% of the stack-wide median std "
+        "are attenuated (not zeroed) proportionally to their signal quality. "
+        "Preserves real signal in dim entry slices while suppressing noise. "
+        "0=disabled. Default: 30.0"
     )
 
     # Deconvolution Params
@@ -643,10 +650,10 @@ def main():
         help="Destriping: smoothing perpendicular to stripes (1-3 typical). Default: 2"
     )
     parser.add_argument(
-        "--clahe_min_signal_pct", type=float, default=2.0,
+        "--clahe_min_signal_pct", type=float, default=15.0,
         help="Slices whose median signal is below this %% of the stack global median "
         "are skipped in CLAHE (pass-through). Prevents CLAHE from amplifying "
-        "noise in entry/exit slices. Default: 2.0"
+        "noise in entry/exit slices. Default: 15.0"
     )
 
     args = parser.parse_args()
@@ -774,53 +781,75 @@ def main():
 
     scale = physical_pixel_sizeX / physical_pixel_sizeZ
 
-    # --- Early dim-slice blanking ---
-    # Detect noise-dominated slices on the RAW data, BEFORE any corrections.
-    # This is critical: z_intensity_correction boosts noise slices toward the
-    # signal floor, which would make them undetectable later.  By blanking
-    # here we prevent all downstream steps from amplifying camera noise.
-    #
-    # Detection strategy: in sparse fluorescence data (labelled nuclei in SPIM),
-    # the MEDIAN of all slices is dominated by camera background (~100 counts)
-    # and is nearly identical between noise-only and tissue-containing slices.
-    # The real discriminator is the SPREAD of intensity: tissue slices have
-    # bright nuclei that push std far above the background, while pure-noise
-    # slices have std ≈ 20-40.  Camera background (~100 counts) inflates p95
-    # uniformly across ALL slices so p95 cannot distinguish noise from tissue.
-    # We use std alone: it directly measures signal variation and is unaffected
-    # by the DC offset of the camera background.
-    _dim_threshold = args.dim_slice_threshold_pct
+    # --- Camera background subtraction ---
+    # sCMOS cameras have a per-pixel offset (~100-110 counts in raw data).
+    # This DC floor dominates dim slices — when z-correction multiplies a
+    # noise slice by 3-5×, the 100-count floor becomes 300-500 and then
+    # deconvolution + CLAHE amplify it further into strong false signal.
+    # Subtracting the per-slice low percentile removes this floor so that
+    # background pixels are near zero and only real signal gets amplified.
     _n_dim = 0
     _dim_mask_z = np.zeros(img.shape[0], dtype=bool)
+    if args.camera_bg_percentile > 0:
+        t0 = time.time()
+        _bg_pct = args.camera_bg_percentile
+        print(f"[Check-in] Camera background subtraction (p{_bg_pct:.0f} per slice)...")
+        img_f = img.astype(np.float32)
+        for _zi in range(img_f.shape[0]):
+            _sl = img_f[_zi]
+            _bg = float(np.percentile(_sl, _bg_pct))
+            img_f[_zi] = np.maximum(_sl - _bg, 0.0)
+        # Convert back to original dtype
+        if np.issubdtype(img.dtype, np.integer):
+            info = np.iinfo(img.dtype)
+            img = np.clip(img_f, 0, info.max).astype(img.dtype)
+        else:
+            img = img_f
+        del img_f
+        t1 = time.time()
+        print(f"[Timer] Camera background subtraction took {t1 - t0:.2f} seconds")
+        print_resource_usage()
+    else:
+        print("[Check-in] Camera background subtraction disabled")
+
+    # --- Dim-slice soft attenuation ---
+    # Instead of blanking (zeroing) noise-dominated slices (which loses real
+    # signal like the embryo tip), scale them DOWN proportionally to their
+    # signal quality. Slices with std close to 0 get scaled to ~0; slices
+    # near the threshold keep most of their signal. This preserves the embryo
+    # tip's bright nuclei in dim slices while suppressing background noise.
+    _dim_threshold = args.dim_slice_threshold_pct
     if _dim_threshold > 0:
         t0 = time.time()
-        print(f"[Check-in] Early dim-slice detection (threshold={_dim_threshold}%)...")
+        print(f"[Check-in] Dim-slice soft attenuation (threshold={_dim_threshold}%)...")
         _raw_f32 = img.astype(np.float32)
-        _slice_std = []
-        for _zi in range(_raw_f32.shape[0]):
-            _slice_std.append(float(np.std(_raw_f32[_zi])))
-        _slice_std = np.array(_slice_std)
-
+        _slice_std = np.array([float(np.std(_raw_f32[_zi]))
+                               for _zi in range(_raw_f32.shape[0])])
         _global_std = float(np.median(_slice_std))
         _dim_floor_std = (_dim_threshold / 100.0) * _global_std
 
-        # A slice is noise-dominated if its std is below the floor.
-        _dim_mask_z = _slice_std < _dim_floor_std
-        _n_dim = int(np.sum(_dim_mask_z))
+        # Per-slice attenuation factor: 0 at std=0, linearly ramps to 1 at
+        # std=floor. Slices above the floor are untouched.
+        _atten = np.clip(_slice_std / (_dim_floor_std + 1e-8), 0.0, 1.0)
+        _n_attenuated = int(np.sum(_atten < 1.0))
+        _dim_mask_z = _atten < 1.0  # track which slices were attenuated
 
         print(f"    Signal metric — std: global={_global_std:.1f}, floor={_dim_floor_std:.1f}")
-        if _n_dim > 0:
-            print(f"    Dim-slice blanking: {_n_dim}/{len(_dim_mask_z)} slices detected as noise-dominated — zeroing")
+        if _n_attenuated > 0:
+            print(f"    Soft attenuation: {_n_attenuated}/{len(_atten)} slices below floor")
             for _zi in range(img.shape[0]):
-                if _dim_mask_z[_zi]:
-                    img[_zi] = 0
+                if _atten[_zi] < 1.0:
+                    _factor = _atten[_zi]
+                    print(f"      slice {_zi}: std={_slice_std[_zi]:.1f}, attenuation={_factor:.3f}")
+                    img[_zi] = (img[_zi].astype(np.float32) * _factor).astype(img.dtype)
         else:
-            print(f"    No dim slices detected (0/{len(_dim_mask_z)} below threshold)")
+            print(f"    No dim slices found (0/{len(_atten)} below floor)")
+        _n_dim = _n_attenuated
         del _raw_f32
         t1 = time.time()
-        print(f"[Timer] Early dim-slice detection took {t1 - t0:.2f} seconds")
+        print(f"[Timer] Dim-slice soft attenuation took {t1 - t0:.2f} seconds")
     else:
-        print("[Check-in] Dim-slice blanking disabled (threshold=0%)")
+        print("[Check-in] Dim-slice attenuation disabled (threshold=0%)")
 
     # Pre-processing
     if apply_shading_correct:
@@ -888,24 +917,26 @@ def main():
     from skimage.filters import threshold_otsu
     from scipy.ndimage import binary_fill_holes
 
-    # Re-apply dim-slice blanking after reslicing: cubic interpolation during
-    # reslice bleeds signal from bright slices into adjacent blanked slices.
-    # Map original dim-slice mask → new (resliced) Z indices via interpolation.
+    # Re-apply dim-slice attenuation after reslicing: cubic interpolation
+    # during reslice bleeds signal from bright slices into attenuated slices.
+    # Map original attenuation factors → new (resliced) Z indices.
     if _n_dim > 0 and img.shape[0] != len(_dim_mask_z):
         from scipy.ndimage import zoom
         _z_ratio = img.shape[0] / len(_dim_mask_z)
-        # Nearest-neighbor upscale of the boolean mask to new Z count
-        _dim_mask_z_resliced = zoom(_dim_mask_z.astype(np.float32), _z_ratio, order=0) > 0.5
-        _n_reblanked = int(np.sum(_dim_mask_z_resliced))
-        print(f"    Post-reslice re-blanking: {_n_reblanked}/{img.shape[0]} slices zeroed")
-        for _zi in range(img.shape[0]):
-            if _zi < len(_dim_mask_z_resliced) and _dim_mask_z_resliced[_zi]:
-                img[_zi] = 0
+        # Linear interpolation of attenuation factors to new Z count
+        _atten_resliced = zoom(_atten, _z_ratio, order=1)
+        _atten_resliced = np.clip(_atten_resliced, 0.0, 1.0)
+        _n_re_atten = int(np.sum(_atten_resliced < 1.0))
+        if _n_re_atten > 0:
+            print(f"    Post-reslice re-attenuation: {_n_re_atten}/{img.shape[0]} slices attenuated")
+            for _zi in range(min(img.shape[0], len(_atten_resliced))):
+                if _atten_resliced[_zi] < 1.0:
+                    img[_zi] = img[_zi] * _atten_resliced[_zi]
     elif _n_dim > 0:
-        # Same Z count (no reslice happened)
+        # Same Z count (no reslice happened) — re-apply original attenuation
         for _zi in range(img.shape[0]):
-            if _dim_mask_z[_zi]:
-                img[_zi] = 0
+            if _zi < len(_atten) and _atten[_zi] < 1.0:
+                img[_zi] = img[_zi] * _atten[_zi]
 
     # Smooth for mask computation (after re-blanking)
     _mask_img = ndi.gaussian_filter(img, sigma=2.0)

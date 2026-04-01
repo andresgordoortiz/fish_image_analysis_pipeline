@@ -65,8 +65,9 @@
       "mask_border_px": 25
     },
     "z_correction_method": "p50",
-    "z_correction_max_scale": 5.0,
-    "z_correction_signal_floor_pct": 10.0,
+    "z_correction_max_scale": 2.0,
+    "z_correction_signal_floor_pct": 25.0,
+    "camera_bg_percentile": 2.0,
     "dim_slice_threshold_pct": 30.0,
     "destripe": {
       "enabled": false,
