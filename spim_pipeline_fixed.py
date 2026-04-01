@@ -833,8 +833,34 @@ def main():
     from skimage.filters import threshold_otsu
     from scipy.ndimage import binary_fill_holes
     _mask_img = ndi.gaussian_filter(img, sigma=2.0)  # light smooth
+
+    # --- Dim-slice detection: identify slices that are noise-dominated ---
+    # Use the same signal-floor concept as z_intensity_correction: slices whose
+    # mean non-zero intensity is far below the global median are camera noise.
+    # These slices must be blanked BEFORE deconvolution (not just masked after),
+    # because R-L will amplify any noise into sharp point-like artifacts.
+    _slice_means = []
+    for _zi in range(_mask_img.shape[0]):
+        _sl = _mask_img[_zi]
+        _nz = _sl[_sl > 0]
+        _slice_means.append(float(np.median(_nz)) if _nz.size > 100 else 0.0)
+    _slice_means = np.array(_slice_means)
+    _global_signal = np.median(_slice_means[_slice_means > 0]) if np.any(_slice_means > 0) else 1.0
+    _dim_floor = (args.z_correction_signal_floor_pct / 100.0) * _global_signal
+    _dim_slices = _slice_means < _dim_floor
+    _n_dim = int(np.sum(_dim_slices))
+    if _n_dim > 0:
+        print(f"    Dim-slice blanking: {_n_dim}/{len(_dim_slices)} slices below "
+              f"{args.z_correction_signal_floor_pct}% of global signal ({_dim_floor:.1f}) — "
+              f"zeroing before deconvolution")
+        for _zi in range(img.shape[0]):
+            if _dim_slices[_zi]:
+                img[_zi] = 0
+
     # Per-slice adaptive Otsu: each Z-slice gets its own threshold so dim
     # slices at the top/bottom of the embryo aren't lost.
+    # Re-smooth after blanking so the mask reflects the blanked state.
+    _mask_img = ndi.gaussian_filter(img, sigma=2.0)
     tissue_mask = np.zeros(img.shape, dtype=bool)
     for _zi in range(_mask_img.shape[0]):
         _sl = _mask_img[_zi]
