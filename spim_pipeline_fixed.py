@@ -223,6 +223,7 @@ def clahe_3d_stack(
     eps=1e-8,
     bg_threshold_pct=5.0,
     min_signal_pct=2.0,   # NEW: slices below this signal fraction → skip CLAHE
+    dim_skip_mask=None,    # boolean array (length=Z): True → skip CLAHE on that slice
 ):
     from skimage import exposure
 
@@ -231,6 +232,11 @@ def clahe_3d_stack(
     in_dtype = stack.dtype
     s = np.moveaxis(stack, axis, 0).astype(np.float32, copy=False)
     out = np.empty_like(s, dtype=np.float32)
+
+    # Validate dim_skip_mask
+    if dim_skip_mask is not None and len(dim_skip_mask) != s.shape[0]:
+        print(f"    [Warning] dim_skip_mask length {len(dim_skip_mask)} != Z {s.shape[0]}, ignoring")
+        dim_skip_mask = None
 
     # Compute a global signal reference from the full stack
     # (median of per-slice medians, only on non-zero voxels)
@@ -244,6 +250,12 @@ def clahe_3d_stack(
     skipped = 0
     for i in range(s.shape[0]):
         img = s[i]
+
+        # Dim-slice skip: raw-data-based mask takes priority over signal gate
+        if dim_skip_mask is not None and dim_skip_mask[i]:
+            out[i] = img  # pass-through unchanged
+            skipped += 1
+            continue
 
         # Signal gate: if this slice's median is < min_signal_pct% of the
         # global median, it's a noise-dominated slice — skip CLAHE entirely
@@ -918,29 +930,21 @@ def main():
     from skimage.filters import threshold_otsu
     from scipy.ndimage import binary_fill_holes
 
-    # Re-apply dim-slice attenuation after reslicing: cubic interpolation
-    # during reslice bleeds signal from bright slices into attenuated slices.
-    # Map original attenuation factors → new (resliced) Z indices.
-    # Also store the resliced factors for post-deconvolution re-attenuation.
-    _final_atten_z = _atten  # default: original factors
+    # Map dim-slice mask to resliced Z indices for use by CLAHE.
+    # Instead of re-attenuating (which over-suppresses), we pass a boolean
+    # mask to CLAHE so it SKIPS those slices entirely.  This prevents CLAHE
+    # from amplifying residual noise in dim slices while letting all other
+    # processing (deconv, WBNS) run normally to preserve the embryo tip.
+    _dim_skip_resliced = np.zeros(img.shape[0], dtype=bool)
     if _n_dim > 0 and img.shape[0] != len(_dim_mask_z):
         from scipy.ndimage import zoom
         _z_ratio = img.shape[0] / len(_dim_mask_z)
-        # Linear interpolation of attenuation factors to new Z count
-        _atten_resliced = zoom(_atten, _z_ratio, order=1)
-        _atten_resliced = np.clip(_atten_resliced, 0.0, 1.0)
-        _final_atten_z = _atten_resliced
-        _n_re_atten = int(np.sum(_atten_resliced < 1.0))
-        if _n_re_atten > 0:
-            print(f"    Post-reslice re-attenuation: {_n_re_atten}/{img.shape[0]} slices attenuated")
-            for _zi in range(min(img.shape[0], len(_atten_resliced))):
-                if _atten_resliced[_zi] < 1.0:
-                    img[_zi] = img[_zi] * _atten_resliced[_zi]
+        _dim_skip_resliced = zoom(_dim_mask_z.astype(np.float32), _z_ratio, order=0) > 0.5
+        _n_skip = int(np.sum(_dim_skip_resliced))
+        print(f"    Dim-slice CLAHE skip mask: {_n_skip}/{img.shape[0]} slices will skip CLAHE")
     elif _n_dim > 0:
-        # Same Z count (no reslice happened) — re-apply original attenuation
-        for _zi in range(img.shape[0]):
-            if _zi < len(_atten) and _atten[_zi] < 1.0:
-                img[_zi] = img[_zi] * _atten[_zi]
+        _dim_skip_resliced = _dim_mask_z.copy()
+        print(f"    Dim-slice CLAHE skip mask: {_n_dim}/{img.shape[0]} slices will skip CLAHE")
 
     # Smooth for mask computation (after re-blanking)
     _mask_img = ndi.gaussian_filter(img, sigma=2.0)
@@ -1081,21 +1085,6 @@ def main():
         print(f"[Check-in] Post-deconv border taper ({_post_taper}px on Y,X)...")
         img = edge_taper_3d(img, _post_taper, skip_axes=(0,))
 
-    # Post-deconvolution re-attenuation: RL deconvolution amplifies noise in
-    # dim slices by "deblurring" camera noise as if it were real structure.
-    # Re-apply the original raw-data-based attenuation factors to undo this.
-    # This ensures dim-slice noise stays proportional to their raw signal level
-    # regardless of how much deconv amplified it.
-    _n_post_atten = int(np.sum(_final_atten_z[:min(len(_final_atten_z), img.shape[0])] < 1.0))
-    if _n_post_atten > 0:
-        t0 = time.time()
-        print(f"[Check-in] Post-deconv re-attenuation: {_n_post_atten}/{img.shape[0]} slices...")
-        for _zi in range(min(img.shape[0], len(_final_atten_z))):
-            if _final_atten_z[_zi] < 1.0:
-                img[_zi] = img[_zi] * _final_atten_z[_zi]
-        t1 = time.time()
-        print(f"[Timer] Post-deconv re-attenuation took {t1 - t0:.2f} seconds")
-
     # Post-processing (WBNS + Gaussian smoothing)
     # DO NOT apply tissue mask before WBNS — a hard zero boundary causes
     # wavelet ringing inside the tissue that CLAHE then amplifies.
@@ -1130,7 +1119,9 @@ def main():
         # XZ CLAHE was creating horizontal stripes because each Y-row got
         # a different equalization — switching to XY avoids that.
         print(f"[Check-in] Applying CLAHE on XY slices (clip_limit={args.clahe_clip_limit})...")
-        img = clahe_3d_stack(img, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0,min_signal_pct=args.clahe_min_signal_pct)
+        img = clahe_3d_stack(img, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0,
+                             min_signal_pct=args.clahe_min_signal_pct,
+                             dim_skip_mask=_dim_skip_resliced)
         t1 = time.time()
         print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
 
