@@ -1034,18 +1034,6 @@ def main():
         print(f"  [Info] Edge taper active → overriding padding_mode '{args.padding_mode}' with 'constant'")
         effective_padding_mode = 'constant'
 
-    # Pre-deconv noise filtering on dim slices: RL deconvolution amplifies
-    # isolated noisy pixels into bright "raindrop" artifacts at corners/edges.
-    # A 2D median filter removes these 1-2px specks while preserving larger
-    # structures (nuclei are >=30px diameter).  Only applied to dim slices.
-    if (args.niter > 0 or args.niterz > 0) and np.any(_dim_skip_resliced):
-        from scipy.ndimage import median_filter as _medfilt
-        _n_filt = int(np.sum(_dim_skip_resliced))
-        print(f"[Check-in] Pre-deconv median filter (5x5) on {_n_filt} dim slices...")
-        for _zi in range(img.shape[0]):
-            if _dim_skip_resliced[_zi]:
-                img[_zi] = _medfilt(img[_zi], size=5)
-
     if args.niter > 0:
         t0 = time.time()
         print("[Check-in] Running 3D deconvolution...")
@@ -1155,31 +1143,39 @@ def main():
 
     if apply_clahe:
         t0 = time.time()
+        # Pre-CLAHE tissue masking: zero out background so CLAHE can't
+        # amplify sensor noise in tiles outside the embryo.  Without this,
+        # ~70% of each slice is background where per-tile equalization
+        # stretches residual noise into bright artifacts that bleed into
+        # the tissue boundary through tile interpolation.
+        _mz, _my, _mx = tissue_mask.shape
+        if img.shape != tissue_mask.shape:
+            print(f"    [Info] Pre-CLAHE crop: img {img.shape} → mask {tissue_mask.shape}")
+            img = img[:_mz, :_my, :_mx]
+        print("[Check-in] Pre-CLAHE tissue masking (zeroing background)...")
+        img[~tissue_mask] = 0
+
         # CLAHE on XY slices (each Z-plane equalized independently).
         # Depth normalization is already handled by z_intensity_correction.
-        # XZ CLAHE was creating horizontal stripes because each Y-row got
-        # a different equalization — switching to XY avoids that.
         print(f"[Check-in] Applying CLAHE on XY slices (clip_limit={args.clahe_clip_limit})...")
         img = clahe_3d_stack(img, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0,
                              min_signal_pct=args.clahe_min_signal_pct,
                              dim_skip_mask=_dim_skip_resliced)
         t1 = time.time()
-        print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
+        print(f"[Timer] CLAHE (incl. pre-masking) took {t1 - t0:.2f} seconds")
 
         if args.clahe_post_smooth > 0:
             print(f"[Check-in] Post-CLAHE Gaussian smoothing (sigma={args.clahe_post_smooth})...")
             img = ndi.gaussian_filter(img, sigma=args.clahe_post_smooth)
         print_resource_usage()
 
-    # Apply tissue mask ONCE — after all processing is done.
-    # This is the only safe place: WBNS and CLAHE need the natural image
-    # gradients to avoid creating ringing artifacts at mask boundaries.
-    # WBNS (wavelet) may pad dimensions to even numbers, so crop first.
+    # Final tissue mask application — safety pass to catch any residual
+    # background signal created by CLAHE tile interpolation at boundaries.
     mz, my, mx = tissue_mask.shape
     if img.shape != tissue_mask.shape:
         print(f"    [Info] Shape mismatch: img {img.shape} vs mask {tissue_mask.shape} — cropping to match")
         img = img[:mz, :my, :mx]
-    print("[Check-in] Applying tissue mask to suppress background noise...")
+    print("[Check-in] Final tissue mask cleanup...")
     img[~tissue_mask] = 0
     del tissue_mask
 
