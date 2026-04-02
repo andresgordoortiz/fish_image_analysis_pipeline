@@ -267,10 +267,15 @@ def clahe_3d_stack(
     for i in range(s.shape[0]):
         img = s[i]
 
-        # Dim-slice skip: normalise to [0,1] on tissue scale (no equalisation)
+        # Dim-slice skip: clip per-slice outliers, then normalise to [0,1]
+        # on the tissue scale (no histogram equalisation).  The percentile
+        # clip removes deconv hot-pixels that would otherwise map to full
+        # brightness during the linear normalisation.
         if dim_skip_mask is not None and dim_skip_mask[i]:
+            _sl_hi = np.percentile(img, p_high)
+            img_c = np.minimum(img, _sl_hi)
             if _global_hi > _global_lo + eps:
-                out[i] = np.clip((img - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0)
+                out[i] = np.clip((img_c - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0)
             else:
                 out[i] = 0.0
             skipped += 1
@@ -281,8 +286,10 @@ def clahe_3d_stack(
         nz = img[img > 0]
         slice_signal = np.median(nz) if nz.size > 100 else 0.0
         if slice_signal < (global_median * min_signal_pct / 100.0):
+            _sl_hi = np.percentile(img, p_high)
+            img_c = np.minimum(img, _sl_hi)
             if _global_hi > _global_lo + eps:
-                out[i] = np.clip((img - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0)
+                out[i] = np.clip((img_c - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0)
             else:
                 out[i] = 0.0
             skipped += 1
@@ -1026,6 +1033,18 @@ def main():
     if args.edge_taper_width > 0 and args.padding_mode != 'constant':
         print(f"  [Info] Edge taper active → overriding padding_mode '{args.padding_mode}' with 'constant'")
         effective_padding_mode = 'constant'
+
+    # Pre-deconv noise filtering on dim slices: RL deconvolution amplifies
+    # isolated noisy pixels into bright "raindrop" artifacts at corners/edges.
+    # A 2D median filter removes these 1-2px specks while preserving larger
+    # structures (nuclei are >=30px diameter).  Only applied to dim slices.
+    if (args.niter > 0 or args.niterz > 0) and np.any(_dim_skip_resliced):
+        from scipy.ndimage import median_filter as _medfilt
+        _n_filt = int(np.sum(_dim_skip_resliced))
+        print(f"[Check-in] Pre-deconv median filter (5x5) on {_n_filt} dim slices...")
+        for _zi in range(img.shape[0]):
+            if _dim_skip_resliced[_zi]:
+                img[_zi] = _medfilt(img[_zi], size=5)
 
     if args.niter > 0:
         t0 = time.time()
