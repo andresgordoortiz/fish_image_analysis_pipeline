@@ -849,6 +849,7 @@ def main():
         t1 = time.time()
         print(f"[Timer] Dim-slice soft attenuation took {t1 - t0:.2f} seconds")
     else:
+        _atten = np.ones(img.shape[0], dtype=np.float32)
         print("[Check-in] Dim-slice attenuation disabled (threshold=0%)")
 
     # Pre-processing
