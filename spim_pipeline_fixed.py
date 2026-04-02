@@ -247,13 +247,32 @@ def clahe_3d_stack(
             slice_medians.append(np.median(nz))
     global_median = np.median(slice_medians) if slice_medians else 1.0
 
+    # Global percentile reference for pass-through normalisation.
+    # Slices that skip CLAHE (dim-skip or signal-gate) are normalised to
+    # [0, 1] on the tissue scale to avoid a scale mismatch that would
+    # crush CLAHE'd tissue slices during final intensity normalisation.
+    _ref_idx = list(range(s.shape[0]))
+    if dim_skip_mask is not None and np.any(dim_skip_mask):
+        _ref_idx = list(np.where(~dim_skip_mask)[0])
+    if _ref_idx:
+        _sample = _ref_idx[::max(1, len(_ref_idx) // 20)]
+        _ref_los = [float(np.percentile(s[j], p_low)) for j in _sample]
+        _ref_his = [float(np.percentile(s[j], p_high)) for j in _sample]
+        _global_lo = float(np.median(_ref_los))
+        _global_hi = float(np.median(_ref_his))
+    else:
+        _global_lo, _global_hi = 0.0, 1.0
+
     skipped = 0
     for i in range(s.shape[0]):
         img = s[i]
 
-        # Dim-slice skip: raw-data-based mask takes priority over signal gate
+        # Dim-slice skip: normalise to [0,1] on tissue scale (no equalisation)
         if dim_skip_mask is not None and dim_skip_mask[i]:
-            out[i] = img  # pass-through unchanged
+            if _global_hi > _global_lo + eps:
+                out[i] = np.clip((img - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0)
+            else:
+                out[i] = 0.0
             skipped += 1
             continue
 
@@ -262,7 +281,10 @@ def clahe_3d_stack(
         nz = img[img > 0]
         slice_signal = np.median(nz) if nz.size > 100 else 0.0
         if slice_signal < (global_median * min_signal_pct / 100.0):
-            out[i] = img  # pass-through unchanged
+            if _global_hi > _global_lo + eps:
+                out[i] = np.clip((img - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0)
+            else:
+                out[i] = 0.0
             skipped += 1
             continue
 
