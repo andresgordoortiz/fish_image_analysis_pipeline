@@ -410,6 +410,33 @@ def edge_taper_3d(img, width, skip_axes=()):
     return out
 
 
+def remove_deconv_hot_pixels(img, size=5, threshold=5.0):
+    """Remove isolated bright pixels created by RL deconvolution.
+
+    For each 2D slice, pixels exceeding threshold × their local median
+    (in a size×size neighbourhood) are replaced with the local median.
+    This targets 1-2 px deconvolution spikes while preserving larger
+    structures (nuclei are typically >=15 px diameter after downscaling).
+    """
+    from scipy.ndimage import median_filter
+    out = img.astype(np.float32, copy=True)
+    n_fixed = 0
+    for zi in range(out.shape[0]):
+        sl = out[zi]
+        local_med = median_filter(sl, size=size)
+        hot = sl > threshold * np.maximum(local_med, 1.0)
+        n_hot = int(np.sum(hot))
+        if n_hot > 0:
+            sl[hot] = local_med[hot]
+            n_fixed += n_hot
+    print(f"    Hot-pixel filter: clipped {n_fixed} pixels "
+          f"(window={size}, threshold={threshold}×)")
+    if np.issubdtype(img.dtype, np.integer):
+        return np.clip(out, np.iinfo(img.dtype).min,
+                       np.iinfo(img.dtype).max).astype(img.dtype)
+    return out
+
+
 def image_postprocessing(img, resolution_px, resolution_pz, noise_lvl, sigma):
     """Apply background subtraction and Gaussian smoothing."""
     steps = []
@@ -1113,6 +1140,17 @@ def main():
         _post_taper = max(args.mask_border_px, 40)
         print(f"[Check-in] Post-deconv border taper ({_post_taper}px on Y,X)...")
         img = edge_taper_3d(img, _post_taper, skip_axes=(0,))
+
+    # Post-deconv hot-pixel removal: RL deconvolution iteratively sharpens
+    # noise pixels into bright isolated dots ("raindrops").  A targeted
+    # filter clips pixels that exceed 5× their local 5×5 median.
+    if args.niter > 0 or args.niterz > 0:
+        t0 = time.time()
+        print("[Check-in] Post-deconv hot-pixel removal...")
+        img = remove_deconv_hot_pixels(img, size=5, threshold=5.0)
+        t1 = time.time()
+        print(f"[Timer] Hot-pixel removal took {t1 - t0:.2f} seconds")
+        print_resource_usage()
 
     # Post-processing (WBNS + Gaussian smoothing)
     # DO NOT apply tissue mask before WBNS — a hard zero boundary causes
