@@ -921,12 +921,15 @@ def main():
     # Re-apply dim-slice attenuation after reslicing: cubic interpolation
     # during reslice bleeds signal from bright slices into attenuated slices.
     # Map original attenuation factors → new (resliced) Z indices.
+    # Also store the resliced factors for post-deconvolution re-attenuation.
+    _final_atten_z = _atten  # default: original factors
     if _n_dim > 0 and img.shape[0] != len(_dim_mask_z):
         from scipy.ndimage import zoom
         _z_ratio = img.shape[0] / len(_dim_mask_z)
         # Linear interpolation of attenuation factors to new Z count
         _atten_resliced = zoom(_atten, _z_ratio, order=1)
         _atten_resliced = np.clip(_atten_resliced, 0.0, 1.0)
+        _final_atten_z = _atten_resliced
         _n_re_atten = int(np.sum(_atten_resliced < 1.0))
         if _n_re_atten > 0:
             print(f"    Post-reslice re-attenuation: {_n_re_atten}/{img.shape[0]} slices attenuated")
@@ -1077,6 +1080,21 @@ def main():
         _post_taper = max(args.mask_border_px, 40)
         print(f"[Check-in] Post-deconv border taper ({_post_taper}px on Y,X)...")
         img = edge_taper_3d(img, _post_taper, skip_axes=(0,))
+
+    # Post-deconvolution re-attenuation: RL deconvolution amplifies noise in
+    # dim slices by "deblurring" camera noise as if it were real structure.
+    # Re-apply the original raw-data-based attenuation factors to undo this.
+    # This ensures dim-slice noise stays proportional to their raw signal level
+    # regardless of how much deconv amplified it.
+    _n_post_atten = int(np.sum(_final_atten_z[:min(len(_final_atten_z), img.shape[0])] < 1.0))
+    if _n_post_atten > 0:
+        t0 = time.time()
+        print(f"[Check-in] Post-deconv re-attenuation: {_n_post_atten}/{img.shape[0]} slices...")
+        for _zi in range(min(img.shape[0], len(_final_atten_z))):
+            if _final_atten_z[_zi] < 1.0:
+                img[_zi] = img[_zi] * _final_atten_z[_zi]
+        t1 = time.time()
+        print(f"[Timer] Post-deconv re-attenuation took {t1 - t0:.2f} seconds")
 
     # Post-processing (WBNS + Gaussian smoothing)
     # DO NOT apply tissue mask before WBNS — a hard zero boundary causes

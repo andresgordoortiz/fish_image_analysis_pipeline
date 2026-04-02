@@ -68,7 +68,7 @@
     "z_correction_max_scale": 2.0,
     "z_correction_signal_floor_pct": 25.0,
     "camera_bg_percentile": 2.0,
-    "dim_slice_threshold_pct": 30.0,
+    "dim_slice_threshold_pct": 50.0,
     "destripe": {
       "enabled": false,
       "sigma_long": 64,
