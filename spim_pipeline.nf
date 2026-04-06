@@ -766,6 +766,11 @@ process PREPROCESS_DECONVOLVE {
         mode: 'copy',
         pattern: "*.log"
 
+    publishDir "${params.output_dir}/intermediates/t${String.format('%04d', timepoint)}",
+        mode: 'copy',
+        pattern: "intermediates/*.tif",
+        enabled: preprocess_config.save_intermediates ?: false
+
     container params.container
 
     input:
@@ -777,6 +782,7 @@ process PREPROCESS_DECONVOLVE {
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_processed.tif"), emit: processed
     path "t${String.format('%04d', timepoint)}_preprocess.log", emit: log
+    path "intermediates/*.tif", optional: true, emit: intermediates
 
     script:
     def cfg = preprocess_config
