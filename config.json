@@ -49,7 +49,7 @@
     "normalization": {
       "min_v": 0,
       "max_v": 65535,
-      "percentile_low": 1.0,
+      "percentile_low": 5.0,
       "percentile_high": 99.99
     },
     "background_subtraction": {
@@ -67,7 +67,7 @@
     "z_correction_method": "p50",
     "z_correction_max_scale": 2.0,
     "z_correction_signal_floor_pct": 25.0,
-    "camera_bg_percentile": 2.0,
+    "camera_bg_percentile": 5.0,
     "dim_slice_threshold_pct": 30.0,
     "destripe": {
       "enabled": false,

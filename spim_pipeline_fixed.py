@@ -105,8 +105,14 @@ def read_nd2_voxel_size(image):
 
 
 def z_intensity_correction(
-    stack, z_axis=0, method="p95", smooth_window=9, eps=1e-8, preserve_dtype=True,
-    max_scale=5.0, signal_floor_pct=10.0,
+    stack,
+    z_axis=0,
+    method="p95",
+    smooth_window=9,
+    eps=1e-8,
+    preserve_dtype=True,
+    max_scale=5.0,
+    signal_floor_pct=10.0,
 ):
     """Correct intensity variation along Z axis.
 
@@ -155,14 +161,18 @@ def z_intensity_correction(
             frac = np.where(dim_mask, levels_s / (floor + eps), 1.0)
             scales = np.where(dim_mask, 1.0 + (scales - 1.0) * frac, scales)
             n_dim = int(np.sum(dim_mask))
-            print(f"    Z-correction: {n_dim}/{len(scales)} slices below signal floor "
-                  f"({signal_floor_pct}% of target) — correction dampened")
+            print(
+                f"    Z-correction: {n_dim}/{len(scales)} slices below signal floor "
+                f"({signal_floor_pct}% of target) — correction dampened"
+            )
 
     # Hard-clamp maximum correction factor
     if max_scale > 0:
         n_clamped = int(np.sum(scales > max_scale))
         if n_clamped > 0:
-            print(f"    Z-correction: {n_clamped}/{len(scales)} slices clamped to max_scale={max_scale}")
+            print(
+                f"    Z-correction: {n_clamped}/{len(scales)} slices clamped to max_scale={max_scale}"
+            )
         scales = np.minimum(scales, max_scale)
 
     y = x * scales[:, None, None]
@@ -222,8 +232,8 @@ def clahe_3d_stack(
     p_high=99.5,
     eps=1e-8,
     bg_threshold_pct=5.0,
-    min_signal_pct=2.0,   # NEW: slices below this signal fraction → skip CLAHE
-    dim_skip_mask=None,    # boolean array (length=Z): True → skip CLAHE on that slice
+    min_signal_pct=2.0,  # NEW: slices below this signal fraction → skip CLAHE
+    dim_skip_mask=None,  # boolean array (length=Z): True → skip CLAHE on that slice
 ):
     from skimage import exposure
 
@@ -235,7 +245,9 @@ def clahe_3d_stack(
 
     # Validate dim_skip_mask
     if dim_skip_mask is not None and len(dim_skip_mask) != s.shape[0]:
-        print(f"    [Warning] dim_skip_mask length {len(dim_skip_mask)} != Z {s.shape[0]}, ignoring")
+        print(
+            f"    [Warning] dim_skip_mask length {len(dim_skip_mask)} != Z {s.shape[0]}, ignoring"
+        )
         dim_skip_mask = None
 
     # Compute a global signal reference from the full stack
@@ -255,7 +267,7 @@ def clahe_3d_stack(
     if dim_skip_mask is not None and np.any(dim_skip_mask):
         _ref_idx = list(np.where(~dim_skip_mask)[0])
     if _ref_idx:
-        _sample = _ref_idx[::max(1, len(_ref_idx) // 20)]
+        _sample = _ref_idx[:: max(1, len(_ref_idx) // 20)]
         _ref_los = [float(np.percentile(s[j], p_low)) for j in _sample]
         _ref_his = [float(np.percentile(s[j], p_high)) for j in _sample]
         _global_lo = float(np.median(_ref_los))
@@ -275,7 +287,9 @@ def clahe_3d_stack(
             _sl_hi = np.percentile(img, p_high)
             img_c = np.minimum(img, _sl_hi)
             if _global_hi > _global_lo + eps:
-                out[i] = np.clip((img_c - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0)
+                out[i] = np.clip(
+                    (img_c - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0
+                )
             else:
                 out[i] = 0.0
             skipped += 1
@@ -289,7 +303,9 @@ def clahe_3d_stack(
             _sl_hi = np.percentile(img, p_high)
             img_c = np.minimum(img, _sl_hi)
             if _global_hi > _global_lo + eps:
-                out[i] = np.clip((img_c - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0)
+                out[i] = np.clip(
+                    (img_c - _global_lo) / (_global_hi - _global_lo), 0.0, 1.0
+                )
             else:
                 out[i] = 0.0
             skipped += 1
@@ -318,7 +334,9 @@ def clahe_3d_stack(
         out[i] = result
 
     if skipped > 0:
-        print(f"    CLAHE: skipped {skipped}/{s.shape[0]} low-signal slices (threshold: {min_signal_pct}% of global median)")
+        print(
+            f"    CLAHE: skipped {skipped}/{s.shape[0]} low-signal slices (threshold: {min_signal_pct}% of global median)"
+        )
 
     out = np.moveaxis(out, 0, axis)
     if not preserve_dtype:
@@ -328,6 +346,7 @@ def clahe_3d_stack(
         out = np.clip(out * info.max, 0, info.max).astype(in_dtype)
         return out
     return out.astype(in_dtype, copy=False)
+
 
 def reslice(img, position, x_res, z_res):
     """Reslice image to isotropic voxels."""
@@ -419,6 +438,7 @@ def remove_deconv_hot_pixels(img, size=5, threshold=5.0):
     structures (nuclei are typically >=15 px diameter after downscaling).
     """
     from scipy.ndimage import median_filter
+
     out = img.astype(np.float32, copy=True)
     n_fixed = 0
     for zi in range(out.shape[0]):
@@ -429,11 +449,14 @@ def remove_deconv_hot_pixels(img, size=5, threshold=5.0):
         if n_hot > 0:
             sl[hot] = local_med[hot]
             n_fixed += n_hot
-    print(f"    Hot-pixel filter: clipped {n_fixed} pixels "
-          f"(window={size}, threshold={threshold}×)")
+    print(
+        f"    Hot-pixel filter: clipped {n_fixed} pixels "
+        f"(window={size}, threshold={threshold}×)"
+    )
     if np.issubdtype(img.dtype, np.integer):
-        return np.clip(out, np.iinfo(img.dtype).min,
-                       np.iinfo(img.dtype).max).astype(img.dtype)
+        return np.clip(out, np.iinfo(img.dtype).min, np.iinfo(img.dtype).max).astype(
+            img.dtype
+        )
     return out
 
 
@@ -603,37 +626,48 @@ def main():
         "--no_shading", action="store_true", help="Disable Shading correction"
     )
     parser.add_argument(
-        "--no_clahe_xy", action="store_true",
-        help="Disable the second CLAHE pass on XY slices (keep only XZ pass)"
+        "--no_clahe_xy",
+        action="store_true",
+        help="Disable the second CLAHE pass on XY slices (keep only XZ pass)",
     )
     parser.add_argument(
-        "--z_correction_method", type=str, default="p75",
-        help="Robust statistic for z-intensity correction: 'median', 'p75', 'p95', etc. Lower targets boost dim slices more. Default: p75"
+        "--z_correction_method",
+        type=str,
+        default="p75",
+        help="Robust statistic for z-intensity correction: 'median', 'p75', 'p95', etc. Lower targets boost dim slices more. Default: p75",
     )
     parser.add_argument(
-        "--z_correction_max_scale", type=float, default=2.0,
+        "--z_correction_max_scale",
+        type=float,
+        default=2.0,
         help="Maximum allowed Z-correction factor per slice. Prevents noise "
-        "amplification in near-empty slices (e.g. embryo entry slices). 0=unlimited. Default: 2.0"
+        "amplification in near-empty slices (e.g. embryo entry slices). 0=unlimited. Default: 2.0",
     )
     parser.add_argument(
-        "--z_correction_signal_floor_pct", type=float, default=25.0,
+        "--z_correction_signal_floor_pct",
+        type=float,
+        default=25.0,
         help="Slices whose signal level is below this %% of the target are "
         "considered noise-dominated; their correction is tapered toward 1.0 "
-        "(no correction). Prevents noise amplification. 0=disabled. Default: 25.0"
+        "(no correction). Prevents noise amplification. 0=disabled. Default: 25.0",
     )
     parser.add_argument(
-        "--camera_bg_percentile", type=float, default=2.0,
+        "--camera_bg_percentile",
+        type=float,
+        default=2.0,
         help="Percentile used for per-slice camera background subtraction. "
         "Removes the sCMOS camera dark-current offset (~100 counts) before "
         "any processing so that background noise is not amplified by "
-        "z-correction and deconvolution. 0=disabled. Default: 2.0"
+        "z-correction and deconvolution. 0=disabled. Default: 2.0",
     )
     parser.add_argument(
-        "--dim_slice_threshold_pct", type=float, default=30.0,
+        "--dim_slice_threshold_pct",
+        type=float,
+        default=30.0,
         help="Slices whose std is below this %% of the stack-wide median std "
         "are attenuated (not zeroed) proportionally to their signal quality. "
         "Preserves real signal in dim entry slices while suppressing noise. "
-        "0=disabled. Default: 30.0"
+        "0=disabled. Default: 30.0",
     )
 
     # Deconvolution Params
@@ -681,47 +715,64 @@ def main():
         "--sigma", type=float, default=1.0, help="Gaussian smoothing sigma"
     )
     parser.add_argument(
-        "--padding_mode", type=str, default="reflect",
+        "--padding_mode",
+        type=str,
+        default="reflect",
         choices=["reflect", "edge", "constant", "symmetric", "wrap"],
-        help="Padding mode for deconvolution (default: reflect)"
+        help="Padding mode for deconvolution (default: reflect)",
     )
     parser.add_argument(
-        "--edge_mask_px", type=int, default=0,
-        help="Zero out this many border pixels after deconvolution to remove edge artifacts (0=disabled)"
+        "--edge_mask_px",
+        type=int,
+        default=0,
+        help="Zero out this many border pixels after deconvolution to remove edge artifacts (0=disabled)",
     )
     parser.add_argument(
-        "--edge_taper_width", type=int, default=0,
-        help="Cosine-taper this many border pixels BEFORE deconvolution to prevent edge ringing (0=disabled). Recommended: 16-32."
+        "--edge_taper_width",
+        type=int,
+        default=0,
+        help="Cosine-taper this many border pixels BEFORE deconvolution to prevent edge ringing (0=disabled). Recommended: 16-32.",
     )
     parser.add_argument(
-        "--clahe_clip_limit", type=float, default=0.01,
-        help="CLAHE clip limit (lower = less contrast enhancement, less noise). Default: 0.01"
+        "--clahe_clip_limit",
+        type=float,
+        default=0.01,
+        help="CLAHE clip limit (lower = less contrast enhancement, less noise). Default: 0.01",
     )
     parser.add_argument(
-        "--clahe_post_smooth", type=float, default=0.0,
-        help="Gaussian sigma applied AFTER CLAHE to suppress high-frequency noise it introduces. 0=disabled. Recommended: 0.5-1.0"
+        "--clahe_post_smooth",
+        type=float,
+        default=0.0,
+        help="Gaussian sigma applied AFTER CLAHE to suppress high-frequency noise it introduces. 0=disabled. Recommended: 0.5-1.0",
     )
     parser.add_argument(
-        "--mask_border_px", type=int, default=10,
-        help="Trim tissue mask this many pixels from XY image borders to remove edge artifacts. 0=disabled. Default: 10"
+        "--mask_border_px",
+        type=int,
+        default=10,
+        help="Trim tissue mask this many pixels from XY image borders to remove edge artifacts. 0=disabled. Default: 10",
     )
     parser.add_argument(
-        "--no_destripe", action="store_true",
-        help="Disable light-sheet stripe removal"
+        "--no_destripe", action="store_true", help="Disable light-sheet stripe removal"
     )
     parser.add_argument(
-        "--destripe_sigma_long", type=float, default=64,
-        help="Destriping: smoothing along stripe direction (larger = catches wider stripes). Default: 64"
+        "--destripe_sigma_long",
+        type=float,
+        default=64,
+        help="Destriping: smoothing along stripe direction (larger = catches wider stripes). Default: 64",
     )
     parser.add_argument(
-        "--destripe_sigma_short", type=float, default=2,
-        help="Destriping: smoothing perpendicular to stripes (1-3 typical). Default: 2"
+        "--destripe_sigma_short",
+        type=float,
+        default=2,
+        help="Destriping: smoothing perpendicular to stripes (1-3 typical). Default: 2",
     )
     parser.add_argument(
-        "--clahe_min_signal_pct", type=float, default=15.0,
+        "--clahe_min_signal_pct",
+        type=float,
+        default=15.0,
         help="Slices whose median signal is below this %% of the stack global median "
         "are skipped in CLAHE (pass-through). Prevents CLAHE from amplifying "
-        "noise in entry/exit slices. Default: 15.0"
+        "noise in entry/exit slices. Default: 15.0",
     )
 
     args = parser.parse_args()
@@ -854,19 +905,43 @@ def main():
     # This DC floor dominates dim slices — when z-correction multiplies a
     # noise slice by 3-5×, the 100-count floor becomes 300-500 and then
     # deconvolution + CLAHE amplify it further into strong false signal.
-    # Subtracting the per-slice low percentile removes this floor so that
-    # background pixels are near zero and only real signal gets amplified.
+    #
+    # FIX: Use robust mode estimation (histogram peak) per slice instead of
+    # a simple percentile. The mode captures the camera offset peak directly
+    # and subtracts it fully. We also subtract an additional margin (2σ of
+    # the noise) to push background pixels firmly to zero.
     _n_dim = 0
     _dim_mask_z = np.zeros(img.shape[0], dtype=bool)
     if args.camera_bg_percentile > 0:
         t0 = time.time()
         _bg_pct = args.camera_bg_percentile
-        print(f"[Check-in] Camera background subtraction (p{_bg_pct:.0f} per slice)...")
+        print(
+            f"[Check-in] Camera background subtraction (mode-based, fallback p{_bg_pct:.0f})..."
+        )
         img_f = img.astype(np.float32)
+        _bg_values = []
         for _zi in range(img_f.shape[0]):
             _sl = img_f[_zi]
-            _bg = float(np.percentile(_sl, _bg_pct))
+            # Estimate mode (peak of background distribution) via histogram
+            _lo, _hi = float(np.percentile(_sl, 0.5)), float(np.percentile(_sl, 30))
+            if _hi > _lo + 1:
+                _bins = np.linspace(_lo, _hi, 100)
+                _hist, _edges = np.histogram(_sl.ravel(), bins=_bins)
+                _peak_idx = np.argmax(_hist)
+                _mode = 0.5 * (_edges[_peak_idx] + _edges[_peak_idx + 1])
+                # Estimate noise σ from the half-width of the mode peak
+                _bg_pixels = _sl[_sl < _mode + (_hi - _lo) * 0.15]
+                _bg_sigma = float(np.std(_bg_pixels)) if _bg_pixels.size > 100 else 0
+                # Subtract mode + 1σ to push background firmly to zero
+                _bg = _mode + _bg_sigma
+            else:
+                _bg = float(np.percentile(_sl, _bg_pct))
+            _bg_values.append(_bg)
             img_f[_zi] = np.maximum(_sl - _bg, 0.0)
+        print(
+            f"    Background per slice: min={min(_bg_values):.1f}, "
+            f"max={max(_bg_values):.1f}, median={np.median(_bg_values):.1f}"
+        )
         # Convert back to original dtype
         if np.issubdtype(img.dtype, np.integer):
             info = np.iinfo(img.dtype)
@@ -891,8 +966,9 @@ def main():
         t0 = time.time()
         print(f"[Check-in] Dim-slice soft attenuation (threshold={_dim_threshold}%)...")
         _raw_f32 = img.astype(np.float32)
-        _slice_std = np.array([float(np.std(_raw_f32[_zi]))
-                               for _zi in range(_raw_f32.shape[0])])
+        _slice_std = np.array(
+            [float(np.std(_raw_f32[_zi])) for _zi in range(_raw_f32.shape[0])]
+        )
         _global_std = float(np.median(_slice_std))
         _dim_floor_std = (_dim_threshold / 100.0) * _global_std
 
@@ -902,13 +978,19 @@ def main():
         _n_attenuated = int(np.sum(_atten < 1.0))
         _dim_mask_z = _atten < 1.0  # track which slices were attenuated
 
-        print(f"    Signal metric — std: global={_global_std:.1f}, floor={_dim_floor_std:.1f}")
+        print(
+            f"    Signal metric — std: global={_global_std:.1f}, floor={_dim_floor_std:.1f}"
+        )
         if _n_attenuated > 0:
-            print(f"    Soft attenuation: {_n_attenuated}/{len(_atten)} slices below floor")
+            print(
+                f"    Soft attenuation: {_n_attenuated}/{len(_atten)} slices below floor"
+            )
             for _zi in range(img.shape[0]):
                 if _atten[_zi] < 1.0:
                     _factor = _atten[_zi]
-                    print(f"      slice {_zi}: std={_slice_std[_zi]:.1f}, attenuation={_factor:.3f}")
+                    print(
+                        f"      slice {_zi}: std={_slice_std[_zi]:.1f}, attenuation={_factor:.3f}"
+                    )
                     img[_zi] = (img[_zi].astype(np.float32) * _factor).astype(img.dtype)
         else:
             print(f"    No dim slices found (0/{len(_atten)} below floor)")
@@ -933,10 +1015,15 @@ def main():
 
     if apply_z_intensity_correction:
         t0 = time.time()
-        print(f"[Check-in] Running z_intensity_correction (method={args.z_correction_method}, "
-              f"max_scale={args.z_correction_max_scale}, signal_floor={args.z_correction_signal_floor_pct}%)...")
+        print(
+            f"[Check-in] Running z_intensity_correction (method={args.z_correction_method}, "
+            f"max_scale={args.z_correction_max_scale}, signal_floor={args.z_correction_signal_floor_pct}%)..."
+        )
         img, scales = z_intensity_correction(
-            img, z_axis=0, method=args.z_correction_method, smooth_window=11,
+            img,
+            z_axis=0,
+            method=args.z_correction_method,
+            smooth_window=11,
             max_scale=args.z_correction_max_scale,
             signal_floor_pct=args.z_correction_signal_floor_pct,
         )
@@ -968,9 +1055,12 @@ def main():
     # deconvolution so RL doesn't amplify them. This is the primary destripe pass.
     if not args.no_destripe:
         t0 = time.time()
-        print(f"[Check-in] Pre-deconv destriping (sigma_long={args.destripe_sigma_long}, sigma_short={args.destripe_sigma_short})...")
+        print(
+            f"[Check-in] Pre-deconv destriping (sigma_long={args.destripe_sigma_long}, sigma_short={args.destripe_sigma_short})..."
+        )
         img = destripe_3d(
-            img, axis=0,
+            img,
+            axis=0,
             sigma_long=args.destripe_sigma_long,
             sigma_short=args.destripe_sigma_short,
         )
@@ -994,13 +1084,20 @@ def main():
     _dim_skip_resliced = np.zeros(img.shape[0], dtype=bool)
     if _n_dim > 0 and img.shape[0] != len(_dim_mask_z):
         from scipy.ndimage import zoom
+
         _z_ratio = img.shape[0] / len(_dim_mask_z)
-        _dim_skip_resliced = zoom(_dim_mask_z.astype(np.float32), _z_ratio, order=0) > 0.5
+        _dim_skip_resliced = (
+            zoom(_dim_mask_z.astype(np.float32), _z_ratio, order=0) > 0.5
+        )
         _n_skip = int(np.sum(_dim_skip_resliced))
-        print(f"    Dim-slice CLAHE skip mask: {_n_skip}/{img.shape[0]} slices will skip CLAHE")
+        print(
+            f"    Dim-slice CLAHE skip mask: {_n_skip}/{img.shape[0]} slices will skip CLAHE"
+        )
     elif _n_dim > 0:
         _dim_skip_resliced = _dim_mask_z.copy()
-        print(f"    Dim-slice CLAHE skip mask: {_n_dim}/{img.shape[0]} slices will skip CLAHE")
+        print(
+            f"    Dim-slice CLAHE skip mask: {_n_dim}/{img.shape[0]} slices will skip CLAHE"
+        )
 
     # Smooth for mask computation (after re-blanking)
     _mask_img = ndi.gaussian_filter(img, sigma=2.0)
@@ -1057,17 +1154,30 @@ def main():
     # values and create a dark frame that RL rings against.  Use 'constant'
     # (zero-pad) instead so the padded region matches the tapered border.
     effective_padding_mode = args.padding_mode
-    if args.edge_taper_width > 0 and args.padding_mode != 'constant':
-        print(f"  [Info] Edge taper active → overriding padding_mode '{args.padding_mode}' with 'constant'")
-        effective_padding_mode = 'constant'
+    if args.edge_taper_width > 0 and args.padding_mode != "constant":
+        print(
+            f"  [Info] Edge taper active → overriding padding_mode '{args.padding_mode}' with 'constant'"
+        )
+        effective_padding_mode = "constant"
+
+    # --- FIX: Do NOT stretch intensity to [0, 65535] before deconvolution ---
+    # The old code called image_scaling_intens(img, 0, 65535) here, which
+    # maps the camera noise floor (e.g. ~100 counts) to ~1300+ counts.
+    # RL deconvolution then iteratively sharpens this amplified noise into
+    # bright dots ("raindrops"). Instead, feed RL the natural float32 data.
+    # RL works on relative intensity ratios; absolute scale doesn't matter.
 
     if args.niter > 0:
         t0 = time.time()
-        print("[Check-in] Running 3D deconvolution...")
-        img = image_scaling_intens(img, args.min_v, args.max_v, True)
+        print(
+            "[Check-in] Running 3D deconvolution (natural float32, NO pre-stretch)..."
+        )
+        img = img.astype(np.float32, copy=False)
         # Pre-deconvolution edge taper: fade borders to zero so RL can't amplify them
         if args.edge_taper_width > 0:
-            print(f"    Applying edge taper (width={args.edge_taper_width}px, skip Z) before 3D deconv...")
+            print(
+                f"    Applying edge taper (width={args.edge_taper_width}px, skip Z) before 3D deconv..."
+            )
             img = edge_taper_3d(img, args.edge_taper_width, skip_axes=(0,))
         img = np.pad(img, args.padding, mode=effective_padding_mode)
         imgSizeGB = img.nbytes / (1024**3)
@@ -1083,7 +1193,9 @@ def main():
         ]
         nan_count = np.count_nonzero(~np.isfinite(img))
         if nan_count > 0:
-            print(f"    [Warning] 3D deconvolution produced {nan_count} NaN/Inf voxels — replacing with 0")
+            print(
+                f"    [Warning] 3D deconvolution produced {nan_count} NaN/Inf voxels — replacing with 0"
+            )
             np.nan_to_num(img, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         t1 = time.time()
         print(f"[Timer] 3D deconvolution took {t1 - t0:.2f} seconds")
@@ -1091,16 +1203,18 @@ def main():
 
     if args.niterz > 0:
         t0 = time.time()
-        print("[Check-in] Running 2D (XZ) deconvolution...")
-        # Skip re-normalization if 3D deconv just ran — preserves dynamic range
-        if args.niter == 0:
-            img = image_scaling_intens(img, args.min_v, args.max_v, True)
+        print(
+            "[Check-in] Running 2D (XZ) deconvolution (natural float32, NO pre-stretch)..."
+        )
+        img = img.astype(np.float32, copy=False)
         # Transpose to XZ view FIRST, then taper in the space RL will operate on
         img_xz = np.transpose(img, [1, 0, 2])
         psf_xz = np.transpose(psf, [1, 0, 2])
         if args.edge_taper_width > 0:
             # img_xz is (Y, Z, X) — skip Y (axis 0) and Z (axis 1), taper only X edges
-            print(f"    Applying edge taper (width={args.edge_taper_width}px, X-only) before XZ deconv...")
+            print(
+                f"    Applying edge taper (width={args.edge_taper_width}px, X-only) before XZ deconv..."
+            )
             img_xz = edge_taper_3d(img_xz, args.edge_taper_width, skip_axes=(0, 1))
         img_xz = np.pad(img_xz, args.padding, mode=effective_padding_mode)
         imgSizeGB = img_xz.nbytes / (1024**3)
@@ -1116,7 +1230,9 @@ def main():
         ]
         nan_count = np.count_nonzero(~np.isfinite(img_xz))
         if nan_count > 0:
-            print(f"    [Warning] XZ deconvolution produced {nan_count} NaN/Inf voxels — replacing with 0")
+            print(
+                f"    [Warning] XZ deconvolution produced {nan_count} NaN/Inf voxels — replacing with 0"
+            )
             np.nan_to_num(img_xz, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         img = np.transpose(img_xz, [1, 0, 2])
         t1 = time.time()
@@ -1152,6 +1268,42 @@ def main():
         print(f"[Timer] Hot-pixel removal took {t1 - t0:.2f} seconds")
         print_resource_usage()
 
+    # --- Post-deconv noise floor subtraction ---
+    # Even without the pre-deconv stretch, RL deconvolution raises the
+    # baseline in low-signal regions. Estimate and subtract the residual
+    # noise floor per slice so WBNS/CLAHE downstream see clean background.
+    if args.niter > 0 or args.niterz > 0:
+        t0 = time.time()
+        print("[Check-in] Post-deconv noise floor subtraction...")
+        img_f = img.astype(np.float32, copy=False)
+        _floors = []
+        for _zi in range(img_f.shape[0]):
+            _sl = img_f[_zi]
+            # Noise floor = mode of the bottom 25% of non-zero pixels
+            _nonzero = _sl[_sl > 0]
+            if _nonzero.size < 100:
+                continue
+            _p25 = float(np.percentile(_nonzero, 25))
+            _bg_region = _nonzero[_nonzero <= _p25]
+            if _bg_region.size < 50:
+                continue
+            _floor = float(np.median(_bg_region))
+            _floor_sigma = float(np.std(_bg_region))
+            # Subtract floor + 0.5σ — gentler than camera BG but catches
+            # the deconv-raised baseline
+            _sub = max(0.0, _floor + 0.5 * _floor_sigma)
+            _floors.append(_sub)
+            img_f[_zi] = np.maximum(_sl - _sub, 0.0)
+        img = img_f
+        if _floors:
+            print(
+                f"    Post-deconv floor: median={np.median(_floors):.1f}, "
+                f"max={max(_floors):.1f}"
+            )
+        t1 = time.time()
+        print(f"[Timer] Post-deconv noise floor subtraction took {t1 - t0:.2f} seconds")
+        print_resource_usage()
+
     # Post-processing (WBNS + Gaussian smoothing)
     # DO NOT apply tissue mask before WBNS — a hard zero boundary causes
     # wavelet ringing inside the tissue that CLAHE then amplifies.
@@ -1171,7 +1323,8 @@ def main():
         t0 = time.time()
         print(f"[Check-in] Post-WBNS destriping (residual pass)...")
         img = destripe_3d(
-            img, axis=0,
+            img,
+            axis=0,
             sigma_long=args.destripe_sigma_long,
             sigma_short=args.destripe_sigma_short,
         )
@@ -1188,22 +1341,33 @@ def main():
         # the tissue boundary through tile interpolation.
         _mz, _my, _mx = tissue_mask.shape
         if img.shape != tissue_mask.shape:
-            print(f"    [Info] Pre-CLAHE crop: img {img.shape} → mask {tissue_mask.shape}")
+            print(
+                f"    [Info] Pre-CLAHE crop: img {img.shape} → mask {tissue_mask.shape}"
+            )
             img = img[:_mz, :_my, :_mx]
         print("[Check-in] Pre-CLAHE tissue masking (zeroing background)...")
         img[~tissue_mask] = 0
 
         # CLAHE on XY slices (each Z-plane equalized independently).
         # Depth normalization is already handled by z_intensity_correction.
-        print(f"[Check-in] Applying CLAHE on XY slices (clip_limit={args.clahe_clip_limit})...")
-        img = clahe_3d_stack(img, clip_limit=args.clahe_clip_limit, kernel_size=(64, 64), axis=0,
-                             min_signal_pct=args.clahe_min_signal_pct,
-                             dim_skip_mask=_dim_skip_resliced)
+        print(
+            f"[Check-in] Applying CLAHE on XY slices (clip_limit={args.clahe_clip_limit})..."
+        )
+        img = clahe_3d_stack(
+            img,
+            clip_limit=args.clahe_clip_limit,
+            kernel_size=(64, 64),
+            axis=0,
+            min_signal_pct=args.clahe_min_signal_pct,
+            dim_skip_mask=_dim_skip_resliced,
+        )
         t1 = time.time()
         print(f"[Timer] CLAHE (incl. pre-masking) took {t1 - t0:.2f} seconds")
 
         if args.clahe_post_smooth > 0:
-            print(f"[Check-in] Post-CLAHE Gaussian smoothing (sigma={args.clahe_post_smooth})...")
+            print(
+                f"[Check-in] Post-CLAHE Gaussian smoothing (sigma={args.clahe_post_smooth})..."
+            )
             img = ndi.gaussian_filter(img, sigma=args.clahe_post_smooth)
         print_resource_usage()
 
@@ -1211,7 +1375,9 @@ def main():
     # background signal created by CLAHE tile interpolation at boundaries.
     mz, my, mx = tissue_mask.shape
     if img.shape != tissue_mask.shape:
-        print(f"    [Info] Shape mismatch: img {img.shape} vs mask {tissue_mask.shape} — cropping to match")
+        print(
+            f"    [Info] Shape mismatch: img {img.shape} vs mask {tissue_mask.shape} — cropping to match"
+        )
         img = img[:mz, :my, :mx]
     print("[Check-in] Final tissue mask cleanup...")
     img[~tissue_mask] = 0
