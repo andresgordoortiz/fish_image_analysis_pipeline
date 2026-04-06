@@ -1115,6 +1115,18 @@ def main():
         f.write("5. Lower CLAHE clip_limit (0.008-0.01) to reduce over-equalization\n")
         f.write("   that compresses dynamic range and contributes to saturation.\n\n")
 
+        f.write("\nIMPORTANT NOTE\n")
+        f.write("-" * 40 + "\n\n")
+        f.write("This diagnostic analyses PRE-DECONVOLUTION stages only.\n")
+        f.write("It CANNOT simulate GPU deconvolution, CLAHE, WBNS, or tissue\n")
+        f.write("masking — those run in the actual pipeline and require GPU.\n\n")
+        f.write("To diagnose post-deconvolution issues, run the pipeline with\n")
+        f.write("  --save_intermediates\n")
+        f.write("which saves a TIFF at every stage in <outdir>/intermediates/.\n")
+        f.write(
+            "Open those in Fiji/napari to see exactly where the problem starts.\n\n"
+        )
+
     print(f"  Saved: {report_path}")
 
     print(f"\n{'=' * 60}")

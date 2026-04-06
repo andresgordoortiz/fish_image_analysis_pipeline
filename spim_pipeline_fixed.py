@@ -599,6 +599,12 @@ def main():
     )
     parser.add_argument("--outdir", type=str, required=True, help="Output directory")
     parser.add_argument("--psf_path", type=str, required=True, help="Path to PSF model")
+    parser.add_argument(
+        "--save_intermediates",
+        action="store_true",
+        help="Save intermediate TIFFs after each major pipeline stage for debugging. "
+        "Files are saved to <outdir>/intermediates/",
+    )
 
     # Image Parameters
     parser.add_argument(
@@ -842,6 +848,38 @@ def main():
 
     start_time_total = time.time()
 
+    # --- Intermediate saving helper ---
+    _inter_dir = None
+    if args.save_intermediates:
+        _inter_dir = os.path.join(args.outdir, "intermediates")
+        os.makedirs(_inter_dir, exist_ok=True)
+        print(f"[Info] Saving intermediates to {_inter_dir}")
+
+    def _save_inter(tag, data):
+        """Save a stage snapshot + print key statistics."""
+        _flat = data.ravel().astype(np.float64)
+        _nz = _flat[_flat > 0]
+        _frac_zero = np.sum(_flat == 0) / _flat.size
+        _p01 = np.percentile(_flat, 1) if _flat.size else 0
+        _p50 = np.percentile(_flat, 50) if _flat.size else 0
+        _p99 = np.percentile(_flat, 99) if _flat.size else 0
+        _p999 = np.percentile(_flat, 99.9) if _flat.size else 0
+        _nz_p10 = np.percentile(_nz, 10) if _nz.size > 100 else 0
+        _nz_p99 = np.percentile(_nz, 99.9) if _nz.size > 100 else 0
+        print(
+            f"    [{tag}] shape={data.shape}, dtype={data.dtype}, "
+            f"range=[{_flat.min():.1f}, {_flat.max():.1f}], "
+            f"p1={_p01:.1f}, p50={_p50:.1f}, p99={_p99:.1f}, p99.9={_p999:.1f}, "
+            f"zeros={_frac_zero:.1%}, nz_p10={_nz_p10:.1f}, nz_p99.9={_nz_p99:.1f}"
+        )
+        if _inter_dir is not None:
+            _out = data
+            if np.issubdtype(data.dtype, np.floating) and data.max() <= 1.0:
+                _out = np.clip(data * 65535, 0, 65535).astype(np.uint16)
+            elif np.issubdtype(data.dtype, np.floating):
+                _out = np.clip(data, 0, 65535).astype(np.uint16)
+            tifffile.imwrite(os.path.join(_inter_dir, f"{tag}.tif"), _out)
+
     # Load Image
     t0 = time.time()
     ext = os.path.splitext(image_name)[1].lower()
@@ -952,6 +990,7 @@ def main():
         t1 = time.time()
         print(f"[Timer] Camera background subtraction took {t1 - t0:.2f} seconds")
         print_resource_usage()
+        _save_inter("01_after_camera_bg", img)
     else:
         print("[Check-in] Camera background subtraction disabled")
 
@@ -1012,6 +1051,7 @@ def main():
         t1 = time.time()
         print(f"[Timer] Shading correction took {t1 - t0:.2f} seconds")
         print_resource_usage()
+        _save_inter("02_after_shading", img)
 
     if apply_z_intensity_correction:
         t0 = time.time()
@@ -1030,6 +1070,7 @@ def main():
         t1 = time.time()
         print(f"[Timer] Z-intensity correction took {t1 - t0:.2f} seconds")
         print_resource_usage()
+        _save_inter("03_after_z_correction", img)
 
     # Isotropic Reslicing
     if abs(1.0 - scale) > 1e-4:
@@ -1200,6 +1241,7 @@ def main():
         t1 = time.time()
         print(f"[Timer] 3D deconvolution took {t1 - t0:.2f} seconds")
         print_resource_usage()
+        _save_inter("04_after_deconv3d", img)
 
     if args.niterz > 0:
         t0 = time.time()
@@ -1238,6 +1280,7 @@ def main():
         t1 = time.time()
         print(f"[Timer] 2D (XZ) deconvolution took {t1 - t0:.2f} seconds")
         print_resource_usage()
+        _save_inter("05_after_deconvXZ", img)
 
     # Edge masking: zero out border pixels to remove deconvolution edge artifacts
     # Only mask Y and X edges — embryo extends to Z boundaries
@@ -1303,6 +1346,7 @@ def main():
         t1 = time.time()
         print(f"[Timer] Post-deconv noise floor subtraction took {t1 - t0:.2f} seconds")
         print_resource_usage()
+        _save_inter("06_after_hotpix_floor", img)
 
     # Post-processing (WBNS + Gaussian smoothing)
     # DO NOT apply tissue mask before WBNS — a hard zero boundary causes
@@ -1316,6 +1360,7 @@ def main():
     t1 = time.time()
     print(f"[Timer] Post-processing took {t1 - t0:.2f} seconds")
     print_resource_usage()
+    _save_inter("07_after_wbns", img)
 
     # Destriping: second pass to catch any residual stripes after WBNS,
     # before CLAHE amplifies them.
@@ -1347,6 +1392,7 @@ def main():
             img = img[:_mz, :_my, :_mx]
         print("[Check-in] Pre-CLAHE tissue masking (zeroing background)...")
         img[~tissue_mask] = 0
+        _save_inter("08_pre_clahe_masked", img)
 
         # CLAHE on XY slices (each Z-plane equalized independently).
         # Depth normalization is already handled by z_intensity_correction.
@@ -1363,6 +1409,7 @@ def main():
         )
         t1 = time.time()
         print(f"[Timer] CLAHE (incl. pre-masking) took {t1 - t0:.2f} seconds")
+        _save_inter("09_after_clahe", img)
 
         if args.clahe_post_smooth > 0:
             print(
@@ -1382,6 +1429,7 @@ def main():
     print("[Check-in] Final tissue mask cleanup...")
     img[~tissue_mask] = 0
     del tissue_mask
+    _save_inter("10_final_masked", img)
 
     # Normalization
     # FIX: compute percentiles on TISSUE-ONLY pixels (non-zero), not the
@@ -1409,6 +1457,7 @@ def main():
             low_thres, high_thres = getNormalizationThresholds(img, percentiles_source)
         del _tissue_pixels
         img = remove_outliers_image(img, low_thres, high_thres)
+        _save_inter("11_after_percentile_clip", img)
         t1 = time.time()
         print(f"[Timer] Outlier removal and normalization took {t1 - t0:.2f} seconds")
         print_resource_usage()

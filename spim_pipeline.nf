@@ -880,6 +880,8 @@ if not config['postprocessing'].get('clahe_dual_axis', True):
     cmd.append('--no_clahe_xy')
 if not config.get('destripe', {}).get('enabled', True):
     cmd.append('--no_destripe')
+if config.get('save_intermediates', False):
+    cmd.append('--save_intermediates')
 
 print("Preprocessing command:", ' '.join(cmd))
 print("\\n" + "="*60)
