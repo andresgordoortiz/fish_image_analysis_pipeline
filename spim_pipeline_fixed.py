@@ -1384,10 +1384,30 @@ def main():
     del tissue_mask
 
     # Normalization
+    # FIX: compute percentiles on TISSUE-ONLY pixels (non-zero), not the
+    # full image. After tissue masking, ~60% of the image is zero. Computing
+    # percentiles on the full image gives p_low=0, making the low-end clip
+    # completely ineffective. By using tissue-only pixels:
+    #   - p_low clips the dim noise WITHIN the tissue (deconv residuals)
+    #   - p_high clips the outlier bright voxels (prevents saturation)
+    #   - The final stretch then maps [tissue_p_low, tissue_p_high] → [0, 65535]
     if percentiles_source[0] > 0 or percentiles_source[1] < 100:
         t0 = time.time()
         print("[Check-in] Removing outliers and normalizing intensities...")
-        low_thres, high_thres = getNormalizationThresholds(img, percentiles_source)
+        # Extract tissue-only pixels for percentile computation
+        _tissue_pixels = img[img > 0]
+        if _tissue_pixels.size > 0:
+            low_thres = float(np.percentile(_tissue_pixels, percentiles_source[0]))
+            high_thres = float(np.percentile(_tissue_pixels, percentiles_source[1]))
+            print(
+                f"    Tissue-only percentiles: p{percentiles_source[0]}={low_thres:.1f}, "
+                f"p{percentiles_source[1]}={high_thres:.1f} "
+                f"(from {_tissue_pixels.size} non-zero voxels, "
+                f"{100 * _tissue_pixels.size / img.size:.1f}% of volume)"
+            )
+        else:
+            low_thres, high_thres = getNormalizationThresholds(img, percentiles_source)
+        del _tissue_pixels
         img = remove_outliers_image(img, low_thres, high_thres)
         t1 = time.time()
         print(f"[Timer] Outlier removal and normalization took {t1 - t0:.2f} seconds")

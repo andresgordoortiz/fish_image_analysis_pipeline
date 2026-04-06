@@ -845,15 +845,38 @@ def main():
     print(f"    RL will iteratively SHARPEN this noise — each iteration amplifies it")
 
     # -----------------------------------------------------------------------
-    # Stage 7: Final stretch (simulate)
+    # Stage 7: Final stretch (simulate) — shows the tissue-mask bug
     # -----------------------------------------------------------------------
-    print(f"\n--- Stage 7: Final Outlier Removal + Stretch ---")
-    img_final_sim = img.copy()
-    lo, hi = np.percentile(img_final_sim, [p_low, p_high])
-    img_final_sim = np.clip(img_final_sim, lo, hi) - lo
-    img_final_sim[img_final_sim < 0] = 0
-    img_final_sim = step_intensity_stretch(img_final_sim, 0, 65535)
-    record_stage("07_final_stretch_sim", img_final_sim)
+    print(f"\n--- Stage 7a: Final Stretch (OLD: full-image percentiles) ---")
+    img_final_old = img.copy()
+    lo_old, hi_old = np.percentile(img_final_old, [p_low, p_high])
+    print(f"  Full-image percentiles: p{p_low}={lo_old:.1f}, p{p_high}={hi_old:.1f}")
+    print(f"  → p{p_low} ≈ 0 because tissue mask zeroed ~60% of image")
+    print(
+        f"  → No noise clipping at all! Just stretches [0, {hi_old:.0f}] → [0, 65535]"
+    )
+    img_final_old = np.clip(img_final_old, lo_old, hi_old) - lo_old
+    img_final_old[img_final_old < 0] = 0
+    img_final_old = step_intensity_stretch(img_final_old, 0, 65535)
+    record_stage("07a_old_full_pct", img_final_old)
+
+    print(f"\n--- Stage 7b: Final Stretch (FIXED: tissue-only percentiles) ---")
+    img_final_new = img.copy()
+    tissue_pixels = img_final_new[img_final_new > 0]
+    if tissue_pixels.size > 0:
+        lo_new = float(np.percentile(tissue_pixels, p_low))
+        hi_new = float(np.percentile(tissue_pixels, p_high))
+    else:
+        lo_new, hi_new = lo_old, hi_old
+    print(f"  Tissue-only percentiles: p{p_low}={lo_new:.1f}, p{p_high}={hi_new:.1f}")
+    print(f"  → p{p_low} actually clips dim noise within tissue")
+    print(f"  → p{p_high} soft-clips brightest voxels → prevents saturation")
+    img_final_new = (
+        np.clip(img_final_new, 0, hi_new) - lo_new
+    )  # don't clip below 0 for background
+    img_final_new[img_final_new < 0] = 0
+    img_final_new = step_intensity_stretch(img_final_new, 0, 65535)
+    record_stage("07b_fixed_tissue_pct", img_final_new)
 
     # -----------------------------------------------------------------------
     # Load processed result if available
@@ -1029,36 +1052,68 @@ def main():
         )
         f.write("\n")
 
-        # Percentile analysis
+        # Percentile analysis — show the tissue-mask bug
         f.write(f"4. FINAL NORMALIZATION:\n")
         f.write(f"   percentile_low={p_low}, percentile_high={p_high}\n")
-        if p_low < 10:
+        # Show full-image vs tissue-only percentiles
+        _all_flat = img.ravel()
+        _tissue_flat = _all_flat[_all_flat > 0]
+        _frac_zero = float(np.sum(_all_flat == 0) / _all_flat.size)
+        _full_plow = float(np.percentile(_all_flat, p_low)) if _all_flat.size > 0 else 0
+        _tissue_plow = (
+            float(np.percentile(_tissue_flat, p_low)) if _tissue_flat.size > 100 else 0
+        )
+        _full_phigh = (
+            float(np.percentile(_all_flat, p_high)) if _all_flat.size > 0 else 0
+        )
+        _tissue_phigh = (
+            float(np.percentile(_tissue_flat, p_high)) if _tissue_flat.size > 100 else 0
+        )
+        f.write(f"   Fraction of zeros (from tissue mask): {_frac_zero:.1%}\n")
+        f.write(
+            f"   Full-image p{p_low}: {_full_plow:.1f}  (BUG: =0 because of tissue mask zeros)\n"
+        )
+        f.write(
+            f"   Tissue-only p{p_low}: {_tissue_plow:.1f}  (FIX: actually clips dim noise)\n"
+        )
+        f.write(f"   Full-image p{p_high}: {_full_phigh:.1f}\n")
+        f.write(
+            f"   Tissue-only p{p_high}: {_tissue_phigh:.1f}  (FIX: clips bright outliers)\n"
+        )
+        if _tissue_plow > _full_plow + 1:
             f.write(
-                f"   ⚠ percentile_low={p_low} is very low — most background noise is preserved\n"
+                f"   ⚠ SATURATION BUG: full-image p{p_low}=0 means no noise clipping.\n"
             )
             f.write(
-                f"   → The original notebook used percentile_low=40, which removes much more noise\n"
+                f"     Stretching [0, max] → [0, 65535] saturates the bright signal.\n"
+            )
+            f.write(
+                f"     FIX: use tissue-only percentiles → clip [{_tissue_plow:.0f}, {_tissue_phigh:.0f}]\n"
             )
         f.write("\n")
 
         # Recommendations
         f.write("RECOMMENDATIONS\n")
         f.write("-" * 40 + "\n\n")
-        f.write(
-            "1. INCREASE camera_bg_percentile to ~5-10 (or use per-slice mode estimation)\n"
-        )
-        f.write("   to fully remove the camera offset before any processing.\n\n")
+        f.write("1. Camera BG: use mode-based estimation (mode + 1σ) to fully\n")
+        f.write("   remove the sCMOS offset before any processing.\n\n")
         f.write("2. REMOVE the pre-deconvolution image_scaling_intens() call.\n")
         f.write(
             "   Feed RL deconvolution the natural float32 data. RL doesn't need 16-bit range.\n"
         )
-        f.write("   This alone prevents the biggest noise amplification.\n\n")
-        f.write("3. TIGHTEN z_correction: use max_scale=1.5, signal_floor_pct=30-40.\n")
+        f.write(
+            f"   This alone prevents the {noise_amplification:.0f}× noise amplification.\n\n"
+        )
+        f.write("3. TIGHTEN z_correction: max_scale=1.3, signal_floor_pct=40.\n")
         f.write("   Slices with little tissue should NOT be boosted aggressively.\n\n")
-        f.write("4. INCREASE percentile_low to 5-15 for final normalization.\n")
-        f.write("   This clips the noise floor from the final image.\n\n")
-        f.write("5. Consider a gentle median filter (3×3) as the very last step\n")
-        f.write("   to catch residual salt-and-pepper from deconvolution.\n\n")
+        f.write("4. TISSUE-ONLY PERCENTILES for final normalization.\n")
+        f.write("   After tissue masking, ~60% of pixels are zero. Computing\n")
+        f.write("   percentiles on the full image gives p_low=0, making the\n")
+        f.write(
+            "   noise clip ineffective and causing saturation of bright signal.\n\n"
+        )
+        f.write("5. Lower CLAHE clip_limit (0.008-0.01) to reduce over-equalization\n")
+        f.write("   that compresses dynamic range and contributes to saturation.\n\n")
 
     print(f"  Saved: {report_path}")
 
