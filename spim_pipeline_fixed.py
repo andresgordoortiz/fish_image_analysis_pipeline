@@ -210,7 +210,13 @@ def shading_correct_xy_estimated(
         field = ndi.gaussian_filter(proj, sigma=sigma_xy)
         field = np.maximum(field, eps)
         norm = float(np.mean(field))
-        corrected = x * (norm / field)
+        # Clamp correction ratio to avoid amplifying noise in dark corners.
+        # Without this, regions where the flat field is very low get divided
+        # by tiny values → granular noise amplification.
+        ratio = norm / field
+        max_ratio = 2.0  # never amplify more than 2×
+        ratio = np.minimum(ratio, max_ratio)
+        corrected = x * ratio
     corrected = np.moveaxis(corrected, 0, z_axis)
     if not preserve_dtype:
         return corrected.astype(np.float32, copy=False), field
@@ -1331,10 +1337,10 @@ def main():
             if _bg_region.size < 50:
                 continue
             _floor = float(np.median(_bg_region))
-            _floor_sigma = float(np.std(_bg_region))
-            # Subtract floor + 0.5σ — gentler than camera BG but catches
-            # the deconv-raised baseline
-            _sub = max(0.0, _floor + 0.5 * _floor_sigma)
+            # Subtract only the floor median — no sigma margin.
+            # The previous +0.5σ was eating into real signal and
+            # reducing crispness of deconvolved features.
+            _sub = max(0.0, _floor)
             _floors.append(_sub)
             img_f[_zi] = np.maximum(_sl - _sub, 0.0)
         img = img_f

@@ -76,8 +76,8 @@
       "sigma_short": 2
     },
     "correction_flags": {
-      "no_clahe": false,
-      "no_clahe_xy": false,
+      "no_clahe": true,
+      "no_clahe_xy": true,
       "no_z_correction": false,
       "no_shading": false
     }
