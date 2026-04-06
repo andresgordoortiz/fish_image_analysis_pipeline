@@ -768,8 +768,7 @@ process PREPROCESS_DECONVOLVE {
 
     publishDir "${params.output_dir}/intermediates/t${String.format('%04d', timepoint)}",
         mode: 'copy',
-        pattern: "intermediates/*.tif",
-        enabled: preprocess_config.save_intermediates ?: false
+        pattern: "intermediates/*.tif"
 
     container params.container
 
