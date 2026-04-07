@@ -61,8 +61,8 @@
     "postprocessing": {
       "sigma": 1.2,
       "clahe_clip_limit": 0.008,
-      "clahe_post_smooth": 1.0,
-      "clahe_dual_axis": false,
+      "clahe_post_smooth": 0.8,
+      "clahe_dual_axis": true,
       "mask_border_px": 25
     },
     "z_correction_method": "p50",
@@ -76,8 +76,8 @@
       "sigma_short": 2
     },
     "correction_flags": {
-      "no_clahe": true,
-      "no_clahe_xy": true,
+      "no_clahe": false,
+      "no_clahe_xy": false,
       "no_z_correction": false,
       "no_shading": false
     }
