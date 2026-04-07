@@ -258,6 +258,8 @@ def run_cellpose(image, model_path, diameter, do_3d, use_gpu, flow_threshold,
         "min_size": min_size,
         "do_3D": do_3d,
     }
+    if do_3d and image.ndim == 3:
+        kwargs["z_axis"] = 0
     if anisotropy is not None:
         kwargs["anisotropy"] = anisotropy
 
