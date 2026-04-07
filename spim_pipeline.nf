@@ -1921,10 +1921,10 @@ process DEBUG_PREPROCESS_NUCLEI {
     echo "============================================"
 
     python3 ${debug_script} \\
-        --input "${stage_tif}" \\
+        --input_file "${stage_tif}" \\
         --stage_name "${stage_name}" \\
         --outdir . \\
-        --model "${model}" \\
+        --cellpose_model "${model}" \\
         --diameter ${cfg.cellpose_diameter} \\
         --flow_threshold ${cfg.cellpose_flow_threshold} \\
         --cellprob_threshold ${cfg.cellpose_cellprob_threshold} \\
