@@ -1622,20 +1622,22 @@ process ULTRACK_SEGMENT {
     set -euo pipefail
 
     # Override database path in config to force writing into workdir
+    # ultrack sqlite uses working_dir + database_file_name (NOT address)
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
 
-# ultrack DataConfig expects: database = "sqlite" (enum) + address = "path"
-# Remove any existing database/address lines
-cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
-cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
+# Remove any existing data_config fields we need to override
+for key in ('database', 'address', 'working_dir', 'database_file_name'):
+    cfg = re.sub(rf'^\\s*{key}\\s*=.*\$', '', cfg, flags=re.M)
 
 # Insert correct fields under [data_config]
+NL = chr(10)
+new_fields = f'database = "sqlite"{NL}working_dir = "."{NL}database_file_name = "data.db"'
 if '[data_config]' in cfg:
-    cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"')
+    cfg = cfg.replace('[data_config]', '[data_config]' + NL + new_fields)
 else:
-    cfg += '\\n[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"\\n'
+    cfg += NL + '[data_config]' + NL + new_fields + NL
 
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
 print('Database overridden: sqlite @ ./data.db')
@@ -1691,12 +1693,14 @@ process ULTRACK_LINK {
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
-cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
+for key in ('database', 'address', 'working_dir', 'database_file_name'):
+    cfg = re.sub(rf'^\\s*{key}\\s*=.*\$', '', cfg, flags=re.M)
+NL = chr(10)
+new_fields = f'database = "sqlite"{NL}working_dir = "."{NL}database_file_name = "data.db"'
 if '[data_config]' in cfg:
-    cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"')
+    cfg = cfg.replace('[data_config]', '[data_config]' + NL + new_fields)
 else:
-    cfg += '\\n[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"\\n'
+    cfg += NL + '[data_config]' + NL + new_fields + NL
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
 PYEOF
 
@@ -1742,12 +1746,14 @@ process ULTRACK_SOLVE {
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
-cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
+for key in ('database', 'address', 'working_dir', 'database_file_name'):
+    cfg = re.sub(rf'^\\s*{key}\\s*=.*\$', '', cfg, flags=re.M)
+NL = chr(10)
+new_fields = f'database = "sqlite"{NL}working_dir = "."{NL}database_file_name = "data.db"'
 if '[data_config]' in cfg:
-    cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"')
+    cfg = cfg.replace('[data_config]', '[data_config]' + NL + new_fields)
 else:
-    cfg += '\\n[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"\\n'
+    cfg += NL + '[data_config]' + NL + new_fields + NL
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
 PYEOF
 
@@ -1800,12 +1806,14 @@ process ULTRACK_EXPORT {
     python3 << 'PYEOF'
 import re, pathlib
 cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-cfg = re.sub(r'^\\s*database\\s*=.*\$', '', cfg, flags=re.M)
-cfg = re.sub(r'^\\s*address\\s*=.*\$', '', cfg, flags=re.M)
+for key in ('database', 'address', 'working_dir', 'database_file_name'):
+    cfg = re.sub(rf'^\\s*{key}\\s*=.*\$', '', cfg, flags=re.M)
+NL = chr(10)
+new_fields = f'database = "sqlite"{NL}working_dir = "."{NL}database_file_name = "data.db"'
 if '[data_config]' in cfg:
-    cfg = cfg.replace('[data_config]', '[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"')
+    cfg = cfg.replace('[data_config]', '[data_config]' + NL + new_fields)
 else:
-    cfg += '\\n[data_config]\\ndatabase = "sqlite"\\naddress = "./data.db"\\n'
+    cfg += NL + '[data_config]' + NL + new_fields + NL
 pathlib.Path('local_ultrack_config.toml').write_text(cfg)
 PYEOF
 
