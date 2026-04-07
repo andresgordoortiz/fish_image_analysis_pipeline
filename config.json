@@ -80,6 +80,12 @@
       "no_clahe_xy": false,
       "no_z_correction": false,
       "no_shading": false
+    },
+
+    "debug_preprocessing": {
+      "enabled": true,
+      "save_masks": false,
+      "_comment": "Cellpose params are inherited from the 'segmentation' section. Override here only if needed."
     }
   },
 

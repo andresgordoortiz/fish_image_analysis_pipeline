@@ -20,6 +20,8 @@ params.preprocessing_script = './spim_pipeline_fixed.py'
 params.merge_script = './merge_hyperstack.py'
 params.benchmark_script = './benchmark_pipeline.py'
 params.prep_ultrack_script = './prep_ultrack_cellpose.py'
+params.debug_nuclei_script = './debug_nuclei_tracking.py'
+params.debug_report_script = './debug_nuclei_report.py'
 params.help = false
 
 if (params.help) {
@@ -136,6 +138,28 @@ if (!config.tracking.prep.containsKey('boundary_width'))  { config.tracking.prep
 if (!config.tracking.prep.containsKey('min_area'))        { config.tracking.prep.min_area = 10 }
 def skip_tracking = config.tracking?.enabled != true
 
+// Set defaults for debug_preprocessing (lives inside preprocessing section)
+if (!config.preprocessing.containsKey('debug_preprocessing')) {
+    config.preprocessing.debug_preprocessing = [enabled: false]
+}
+def dbg = config.preprocessing.debug_preprocessing
+if (!dbg.containsKey('save_masks')) { dbg.save_masks = false }
+// Always inherit cellpose params from segmentation section so the debug
+// analysis uses the exact same model & thresholds as the real segmentation.
+dbg.cellpose_model              = dbg.cellpose_model              ?: config.segmentation?.model              ?: 'cyto3'
+dbg.cellpose_diameter           = dbg.cellpose_diameter           ?: config.segmentation?.diameter           ?: 30
+dbg.cellpose_flow_threshold     = dbg.cellpose_flow_threshold     ?: config.segmentation?.flow_threshold     ?: 0.8
+dbg.cellpose_cellprob_threshold = dbg.cellpose_cellprob_threshold ?: config.segmentation?.cellprob_threshold ?: 0.0
+dbg.cellpose_do_3d              = dbg.cellpose_do_3d              ?: config.segmentation?.do_3d              ?: true
+dbg.cellpose_min_size           = dbg.cellpose_min_size           ?: config.segmentation?.min_size           ?: 15
+def run_debug_preprocessing = dbg.enabled ?: false
+
+// Debug preprocessing requires save_intermediates — force it on
+if (run_debug_preprocessing && !config.preprocessing.save_intermediates) {
+    log.warn "debug_preprocessing.enabled=true requires save_intermediates=true — forcing save_intermediates on"
+    config.preprocessing.save_intermediates = true
+}
+
 // Validate tracking config if enabled
 if (!skip_tracking) {
     if (!params.ultrack_container) {
@@ -235,6 +259,7 @@ def edge_mask_info = config.preprocessing.deconvolution.edge_mask_px > 0 ? "${co
 def edge_taper_info = config.preprocessing.deconvolution.edge_taper_width > 0 ? "${config.preprocessing.deconvolution.edge_taper_width}px" : "Disabled"
 def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stitch_threshold != null ? "2D+Stitch(${config.segmentation.stitch_threshold})" : "2D")
 def tracking_info = skip_tracking ? "SKIPPED" : "Enabled (ultrack)"
+def debug_info = run_debug_preprocessing ? "ENABLED (nuclei tracking per stage)" : "Disabled"
 
 log.info """
 ================================================
@@ -252,6 +277,7 @@ Edge taper   : ${edge_taper_info}
 Edge mask    : ${edge_mask_info}
 Seg mode     : ${seg_mode_info}
 Tracking     : ${tracking_info}
+Debug preproc: ${debug_info}
 ================================================
 """.stripIndent()
 
@@ -1840,6 +1866,132 @@ PYEOF
 }
 
 // ============================================================================
+// PROCESS: Debug Preprocessing — Nuclei Tracking per Stage (GPU)
+// ============================================================================
+
+process DEBUG_PREPROCESS_NUCLEI {
+    tag "t${String.format('%04d', timepoint)}_${stage_name}"
+
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    publishDir "${params.output_dir}/debug_preprocessing/t${String.format('%04d', timepoint)}",
+        mode: 'copy',
+        pattern: "*.json"
+
+    publishDir "${params.output_dir}/debug_preprocessing/t${String.format('%04d', timepoint)}/masks",
+        mode: 'copy',
+        pattern: "*_mask.tif"
+
+    publishDir "${params.output_dir}/logs/debug_preprocessing",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    tuple val(timepoint), val(stage_name), path(stage_tif)
+    path debug_script
+    val debug_config
+
+    output:
+    tuple val(timepoint), path("${stage_name}_nuclei_stats.json"), emit: metrics
+    path "*_mask.tif", optional: true, emit: masks
+    path "debug_nuclei_${stage_name}.log", emit: log
+
+    script:
+    def cfg = debug_config
+    def t_formatted = String.format('%04d', timepoint)
+    def model = cfg.cellpose_model ?: 'cyto3'
+    def save_mask_flag = cfg.save_masks ? '--save_mask' : ''
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    exec > >(tee debug_nuclei_${stage_name}.log) 2>&1
+
+    echo "============================================"
+    echo "Debug Preprocessing — Nuclei Tracking"
+    echo "Timepoint: ${timepoint}"
+    echo "Stage: ${stage_name}"
+    echo "File: ${stage_tif}"
+    echo "============================================"
+
+    python3 ${debug_script} \\
+        --input "${stage_tif}" \\
+        --stage_name "${stage_name}" \\
+        --outdir . \\
+        --model "${model}" \\
+        --diameter ${cfg.cellpose_diameter} \\
+        --flow_threshold ${cfg.cellpose_flow_threshold} \\
+        --cellprob_threshold ${cfg.cellpose_cellprob_threshold} \\
+        --min_size ${cfg.cellpose_min_size} \\
+        ${cfg.cellpose_do_3d ? '--do_3d' : ''} \\
+        ${save_mask_flag}
+
+    echo ""
+    echo "✓ Nuclei tracking complete for ${stage_name}"
+    """
+}
+
+// ============================================================================
+// PROCESS: Debug Preprocessing — Nuclei Comparison Report (CPU)
+// ============================================================================
+
+process DEBUG_PREPROCESS_REPORT {
+    tag "t${String.format('%04d', timepoint)}"
+
+    maxRetries 1
+    errorStrategy 'terminate'
+
+    publishDir "${params.output_dir}/debug_preprocessing/t${String.format('%04d', timepoint)}/report",
+        mode: 'copy',
+        pattern: "report/*"
+
+    publishDir "${params.output_dir}/logs/debug_preprocessing",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    tuple val(timepoint), path(json_files)
+    path report_script
+
+    output:
+    path "report/*", emit: report
+    path "debug_report_t${String.format('%04d', timepoint)}.log", emit: log
+
+    script:
+    def t_formatted = String.format('%04d', timepoint)
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    exec > >(tee debug_report_t${t_formatted}.log) 2>&1
+
+    echo "============================================"
+    echo "Debug Preprocessing — Nuclei Report"
+    echo "Timepoint: ${timepoint}"
+    echo "JSON files: \$(ls -1 *.json | wc -l)"
+    echo "============================================"
+
+    python3 ${report_script} \\
+        --json_dir . \\
+        --outdir report/
+
+    echo ""
+    echo "✓ Report generated for timepoint ${timepoint}"
+    """
+}
+
+// ============================================================================
 // MAIN WORKFLOW
 // ============================================================================
 
@@ -1927,6 +2079,55 @@ workflow {
         preproc_script_ch.collect(),
         config.preprocessing
     )
+
+    // 2b. OPTIONAL: Debug preprocessing — run Cellpose on each intermediate stage
+    if (run_debug_preprocessing) {
+        log.info "Debug preprocessing ENABLED — will run nuclei tracking on intermediates"
+        log.info "  Cellpose model: ${config.preprocessing.debug_preprocessing.cellpose_model}"
+        log.info "  save_intermediates: ${config.preprocessing.save_intermediates}"
+
+        debug_nuclei_script_ch = Channel.fromPath(params.debug_nuclei_script, checkIfExists: true)
+        debug_report_script_ch = Channel.fromPath(params.debug_report_script, checkIfExists: true)
+
+        // The PREPROCESS_DECONVOLVE process emits:
+        //   processed:     tuple(timepoint, processed_file)
+        //   intermediates: path("intermediates/*.tif") — no timepoint attached
+        // Both channels emit in the same order (same process instance), so we
+        // use merge to pair timepoint with its intermediates, then flatMap to
+        // create one (timepoint, stage_name, tif) tuple per intermediate file.
+
+        debug_paired_ch = PREPROCESS_DECONVOLVE.out.processed
+            .map { timepoint, processed_file -> timepoint }
+            .merge(PREPROCESS_DECONVOLVE.out.intermediates)
+            .flatMap { items ->
+                def timepoint = items[0]
+                def tifs = items[1]
+                if (tifs instanceof List) {
+                    return tifs.collect { tif -> tuple(timepoint, tif.baseName, tif) }
+                } else if (tifs != null) {
+                    return [tuple(timepoint, tifs.baseName, tifs)]
+                } else {
+                    return []
+                }
+            }
+
+        DEBUG_PREPROCESS_NUCLEI(
+            debug_paired_ch,
+            debug_nuclei_script_ch.collect(),
+            config.preprocessing.debug_preprocessing
+        )
+
+        // Collect all JSONs per timepoint for the report
+        debug_report_input = DEBUG_PREPROCESS_NUCLEI.out.metrics
+            .groupTuple(by: 0)  // Group by timepoint → [timepoint, [json1, json2, ...]]
+
+        DEBUG_PREPROCESS_REPORT(
+            debug_report_input,
+            debug_report_script_ch.collect()
+        )
+    } else {
+        log.info "Debug preprocessing DISABLED"
+    }
 
     // 3. Segment each timepoint with Cellpose
     if (!skip_segmentation) {
@@ -2087,6 +2288,7 @@ workflow.onComplete {
 
     def benchmark_status = (config.benchmark?.enabled ?: false) ? "ENABLED" : "DISABLED"
     def tracking_status = (config.tracking?.enabled ?: false) ? "ENABLED (ultrack)" : "DISABLED"
+    def debug_status = (config.preprocessing?.debug_preprocessing?.enabled ?: false) ? "ENABLED" : "DISABLED"
 
     log.info """
     ============================================================================
@@ -2102,6 +2304,7 @@ workflow.onComplete {
     Downscale    : ${downscale_status}
     Tracking     : ${tracking_status}
     Benchmark    : ${benchmark_status}
+    Debug preproc: ${debug_status}
     Output dir   : ${params.output_dir}
 
     Results:
@@ -2112,6 +2315,7 @@ workflow.onComplete {
       ${!(config.output?.skip_merge ?: false) ? "- Hyperstacks        : in 01_preprocessed/ and 02_segmented/" : ""}
       ${(config.tracking?.enabled ?: false) ? "- Tracking results   : ${params.output_dir}/03_tracking/" : ""}
       ${(config.benchmark?.enabled ?: false) ? "- Benchmark          : ${params.output_dir}/benchmark/" : ""}
+      ${(config.preprocessing?.debug_preprocessing?.enabled ?: false) ? "- Debug nuclei report: ${params.output_dir}/debug_preprocessing/" : ""}
       - Logs                : ${params.output_dir}/logs/
 
     Completed at: ${workflow.complete}
