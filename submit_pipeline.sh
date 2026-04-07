@@ -134,6 +134,9 @@ else
     echo "Resume: enabled"
 fi
 
+# Ensure the reports directory exists
+mkdir -p "$OUTPUT_DIR/reports"
+
 # Run the pipeline (Nextflow reads all params from config.json)
 nextflow run ./spim_pipeline.nf \
     --config_json "$CONFIG_JSON" \
