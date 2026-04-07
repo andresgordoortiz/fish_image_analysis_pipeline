@@ -807,7 +807,7 @@ process PREPROCESS_DECONVOLVE {
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_processed.tif"), emit: processed
     path "t${String.format('%04d', timepoint)}_preprocess.log", emit: log
-    path "intermediates/*.tif", optional: true, emit: intermediates
+    tuple val(timepoint), path("intermediates/*.tif"), optional: true, emit: intermediates
 
     script:
     def cfg = preprocess_config
@@ -2090,18 +2090,12 @@ workflow {
         debug_report_script_ch = Channel.fromPath(params.debug_report_script, checkIfExists: true)
 
         // The PREPROCESS_DECONVOLVE process emits:
-        //   processed:     tuple(timepoint, processed_file)
-        //   intermediates: path("intermediates/*.tif") — no timepoint attached
-        // Both channels emit in the same order (same process instance), so we
-        // use merge to pair timepoint with its intermediates, then flatMap to
-        // create one (timepoint, stage_name, tif) tuple per intermediate file.
+        //   intermediates: tuple(timepoint, path("intermediates/*.tif"))
+        // flatMap fans out each intermediate TIF into a separate item so
+        // Nextflow can schedule them in parallel.
 
-        debug_paired_ch = PREPROCESS_DECONVOLVE.out.processed
-            .map { timepoint, processed_file -> timepoint }
-            .merge(PREPROCESS_DECONVOLVE.out.intermediates)
-            .flatMap { items ->
-                def timepoint = items[0]
-                def tifs = items[1]
+        debug_paired_ch = PREPROCESS_DECONVOLVE.out.intermediates
+            .flatMap { timepoint, tifs ->
                 if (tifs instanceof List) {
                     return tifs.collect { tif -> tuple(timepoint, tif.baseName, tif) }
                 } else if (tifs != null) {
