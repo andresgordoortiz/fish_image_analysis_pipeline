@@ -2010,24 +2010,93 @@ workflow {
         }
     }
 
+    // ---- Fallback: if no files match the expected naming convention,
+    //      collect ALL .tif/.tiff files in the directory and assign
+    //      timepoints based on whatever numeric info can be extracted
+    //      from the filenames (or alphabetical order as last resort). ----
+    def used_fallback = false
     if (matched_files.isEmpty()) {
-        error "No files found matching pattern: ${params.input_dir}/${glob_pattern}"
-    }
-
-    log.info "Found ${matched_files.size()} files matching pattern in: ${params.input_dir}"
-
-    input_channel = Channel
-        .fromList(matched_files.collect { f -> file(f.toPath()) })
-        .ifEmpty { error "No files found matching pattern: ${params.input_dir}/${glob_pattern}" }
-        .map { file ->
-            def matcher = (file.name =~ /t(\d+)_Channel/)
-            if (matcher.find()) {
-                def timepoint = matcher.group(1).toInteger()
-                return tuple(timepoint, file)
-            } else {
-                error "Could not parse timepoint from filename: ${file.name}"
+        log.warn "No files matching '${glob_pattern}' — falling back to all TIF files in ${params.input_dir}"
+        def tifMatcher  = FileSystems.getDefault().getPathMatcher("glob:*.tif")
+        def tiffMatcher = FileSystems.getDefault().getPathMatcher("glob:*.tiff")
+        Files.list(input_dir_path).each { p ->
+            def fname = p.getFileName()
+            if (tifMatcher.matches(fname) || tiffMatcher.matches(fname)) {
+                matched_files.add(p.toFile())
             }
         }
+        used_fallback = true
+    }
+
+    if (matched_files.isEmpty()) {
+        error "No .tif/.tiff files found in: ${params.input_dir}"
+    }
+
+    log.info "Found ${matched_files.size()} files ${used_fallback ? '(fallback – all TIFs)' : 'matching pattern'} in: ${params.input_dir}"
+
+    // --- Helper: extract a numeric timepoint from a filename ---
+    // Tries several common patterns in order:
+    //   1. t####_Channel  (original convention)
+    //   2. t#### or T####  (e.g. t0000.tif, T012_decon.tif)
+    //   3. tp#### or TP#### (e.g. tp001.tif)
+    //   4. _####. or -####. (trailing number before extension, e.g. embryo_001.tif)
+    //   5. Any digit run in the filename
+    // Returns null if nothing numeric is found.
+    def extractTimepoint = { String name ->
+        def m
+        // Pattern 1: original t####_Channel
+        m = (name =~ /(?i)t(\d+)_Channel/)
+        if (m.find()) return m.group(1).toInteger()
+        // Pattern 2: t#### or T####
+        m = (name =~ /(?i)(?:^|[^a-z])t(\d+)/)
+        if (m.find()) return m.group(1).toInteger()
+        // Pattern 3: tp#### or TP####
+        m = (name =~ /(?i)tp(\d+)/)
+        if (m.find()) return m.group(1).toInteger()
+        // Pattern 4: trailing number before extension  e.g. img_001.tif
+        m = (name =~ /[_\-\s](\d+)\.[tT][iI][fF]{1,2}$/)
+        if (m.find()) return m.group(1).toInteger()
+        // Pattern 5: first digit run anywhere in the name
+        m = (name =~ /(\d+)/)
+        if (m.find()) return m.group(1).toInteger()
+        return null
+    }
+
+    // Build (timepoint, file) tuples.  When numeric extraction fails for
+    // ALL files we fall back to alphabetical ordering.
+    def file_tuples = matched_files.collect { f ->
+        def tp = extractTimepoint(f.name)
+        return [tp, f]
+    }
+
+    def all_null = file_tuples.every { it[0] == null }
+
+    if (all_null) {
+        // No numeric info at all — sort alphabetically and assign 0, 1, 2, …
+        log.warn "Could not extract numeric timepoints from filenames — using alphabetical order"
+        file_tuples = file_tuples.sort { it[1].name }
+        file_tuples = file_tuples.withIndex().collect { entry, idx -> [idx, entry[1]] }
+    } else {
+        // For any file where extraction failed, assign a unique large number so
+        // it sorts to the end rather than causing a crash.
+        def max_tp = file_tuples.findAll { it[0] != null }.collect { it[0] }.max() ?: 0
+        def fallback_tp = max_tp + 1
+        file_tuples = file_tuples.collect { tp, f ->
+            if (tp == null) {
+                log.warn "Could not extract timepoint from '${f.name}' — assigning t=${fallback_tp}"
+                def assigned = fallback_tp
+                fallback_tp++
+                return [assigned, f]
+            }
+            return [tp, f]
+        }
+        // Sort by timepoint
+        file_tuples = file_tuples.sort { it[0] }
+    }
+
+    input_channel = Channel
+        .fromList(file_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) })
+        .ifEmpty { error "No TIF files could be loaded from: ${params.input_dir}" }
         .tap { parsed_files }
 
     // Log parsed files
