@@ -2278,28 +2278,50 @@ workflow {
 
         // 5. OPTIONAL: Merge timepoints into 4D hyperstacks
         if (!skip_merge) {
-            log.info "Hyperstack merging enabled (processed + segmented)"
+            if (skip_preprocessing && skip_tracking) {
+                // When preprocessing is skipped and no tracking, only merge segmented output
+                log.info "Hyperstack merging enabled (segmented only, preprocessing was skipped)"
 
-            // Collect processed files into a merge job tuple: ['processed', [files...]]
-            processed_merge_ch = segmentation_input
-                .map { timepoint, processed_file -> processed_file }
-                .collect()
-                .map { files -> tuple('processed', files) }
+                segmented_merge_ch = CELLPOSE_SEGMENT.out.segmented
+                    .map { timepoint, segmented_file -> segmented_file }
+                    .collect()
+                    .map { files -> tuple('segmented', files) }
 
-            // Collect segmented files into a merge job tuple: ['segmented', [files...]]
-            segmented_merge_ch = CELLPOSE_SEGMENT.out.segmented
-                .map { timepoint, segmented_file -> segmented_file }
-                .collect()
-                .map { files -> tuple('segmented', files) }
+                MERGE_TO_HYPERSTACK(
+                    segmented_merge_ch,
+                    shared_metadata,
+                    merge_script_ch.collect()
+                )
+            } else {
+                if (skip_preprocessing) {
+                    log.info "Hyperstack merging enabled (input as processed + segmented, for tracking)"
+                } else {
+                    log.info "Hyperstack merging enabled (processed + segmented)"
+                }
 
-            // Mix both merge jobs into a single channel (each emitted item = one process invocation)
-            merge_jobs_ch = processed_merge_ch.mix(segmented_merge_ch)
+                // Collect processed and segmented files, then create merge jobs
+                // only after BOTH are ready (prevents merge starting before segmentation finishes)
+                processed_files_ch = segmentation_input
+                    .map { timepoint, f -> f }
+                    .collect()
 
-            MERGE_TO_HYPERSTACK(
-                merge_jobs_ch,
-                shared_metadata,
-                merge_script_ch.collect()
-            )
+                segmented_files_ch = CELLPOSE_SEGMENT.out.segmented
+                    .map { timepoint, segmented_file -> segmented_file }
+                    .collect()
+
+                // combine() waits for both to complete before emitting
+                merge_jobs_ch = processed_files_ch
+                    .combine(segmented_files_ch)
+                    .flatMap { proc_files, seg_files ->
+                        [tuple('processed', proc_files), tuple('segmented', seg_files)]
+                    }
+
+                MERGE_TO_HYPERSTACK(
+                    merge_jobs_ch,
+                    shared_metadata,
+                    merge_script_ch.collect()
+                )
+            }
         } else {
             log.info "Hyperstack merging SKIPPED (skip_merge=true)"
         }
