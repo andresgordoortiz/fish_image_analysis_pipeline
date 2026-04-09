@@ -287,7 +287,21 @@ def main():
 
     seg_files = sorted(Path(".").glob(file_pattern))
     if not seg_files:
-        raise RuntimeError(f"No {label} files matching '{file_pattern}' found in work directory!")
+        # Fallback: try any .tif/.tiff file (e.g. raw input when preprocessing is skipped)
+        fallback = sorted(
+            f for f in Path(".").glob("*.tif")
+            if not f.name.startswith("4D_hyperstack")
+            and f.name != "shared_metadata.json"
+        )
+        fallback += sorted(
+            f for f in Path(".").glob("*.tiff")
+            if not f.name.startswith("4D_hyperstack")
+        )
+        if fallback:
+            print(f"No files matching '{file_pattern}', falling back to {len(fallback)} TIF file(s)")
+            seg_files = sorted(set(fallback), key=lambda f: f.name)
+        else:
+            raise RuntimeError(f"No {label} files matching '{file_pattern}' found in work directory!")
 
     # Output file naming based on data type
     base_name = f"4D_hyperstack_{label}"
