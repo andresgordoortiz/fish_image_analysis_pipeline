@@ -2260,11 +2260,14 @@ workflow {
 
     // 3. Segment each timepoint with Cellpose
     if (!skip_segmentation) {
+        // When preprocessing is skipped, no XY scaling was applied — use 1.0
+        def effective_scaling = skip_preprocessing ? 1.0 : config.preprocessing.image_scaling
+
         CELLPOSE_SEGMENT(
             segmentation_input,
             shared_metadata,
             config.segmentation,
-            config.preprocessing.image_scaling
+            effective_scaling
         )
 
         // 4. OPTIONAL: Downscale segmented labels using Fiji headless (nearest-neighbor)

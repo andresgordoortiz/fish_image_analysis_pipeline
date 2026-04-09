@@ -315,7 +315,9 @@ def main():
         Y, X = tf.pages[0].shape
 
     # Calculate resolutions
-    scaling = config.get("preprocessing", {}).get("image_scaling", 1.0)
+    # When preprocessing is skipped, image_scaling was never applied — use 1.0
+    skip_preproc = config.get("preprocessing", {}).get("skip_preprocessing", False)
+    scaling = 1.0 if skip_preproc else config.get("preprocessing", {}).get("image_scaling", 1.0)
 
     # Metadata stores the ORIGINAL (pre-processing) resolution in microns
     vox_x = meta.get("x_resolution_um", 1.0) / scaling
