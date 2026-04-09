@@ -120,10 +120,27 @@ if (config.roi_cropping.enabled) {
     }
 }
 
-// Set defaults for skip_merge and downscale_labels
+// Set defaults for skip_merge, skip_preprocessing and downscale_labels
 def skip_merge = config.output?.skip_merge ?: false
 def skip_segmentation = config.segmentation?.enabled == false
+def skip_preprocessing = config.preprocessing?.skip_preprocessing ?: false
+def preprocessed_dir = config.preprocessing?.preprocessed_dir ?: null
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
+
+// Validate skip_preprocessing config
+if (skip_preprocessing) {
+    if (skip_segmentation) {
+        log.error "skip_preprocessing=true requires segmentation.enabled=true (nothing to do otherwise)"
+        exit 1
+    }
+    if (preprocessed_dir) {
+        def preproc_dir_file = file(preprocessed_dir)
+        if (!preproc_dir_file.exists()) {
+            log.error "skip_preprocessing=true but preprocessed_dir not found: ${preprocessed_dir} (resolved to: ${preproc_dir_file})"
+            exit 1
+        }
+    }
+}
 
 // Set defaults for tracking (ultrack)
 if (!config.containsKey('tracking')) {
@@ -260,6 +277,7 @@ def edge_taper_info = config.preprocessing.deconvolution.edge_taper_width > 0 ? 
 def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stitch_threshold != null ? "2D+Stitch(${config.segmentation.stitch_threshold})" : "2D")
 def tracking_info = skip_tracking ? "SKIPPED" : "Enabled (ultrack)"
 def debug_info = run_debug_preprocessing ? "ENABLED (nuclei tracking per stage)" : "Disabled"
+def preproc_info = skip_preprocessing ? (preprocessed_dir ? "SKIPPED (using ${preprocessed_dir})" : "SKIPPED (using raw input)") : "Enabled"
 
 log.info """
 ================================================
@@ -276,6 +294,7 @@ Pad mode     : ${config.preprocessing.deconvolution.padding_mode}
 Edge taper   : ${edge_taper_info}
 Edge mask    : ${edge_mask_info}
 Seg mode     : ${seg_mode_info}
+Preprocess   : ${preproc_info}
 Tracking     : ${tracking_info}
 Debug preproc: ${debug_info}
 ================================================
@@ -2104,9 +2123,6 @@ workflow {
         log.info "Found timepoint ${timepoint}: ${file.name}"
     }
 
-    // Create channel for preprocessing script
-    preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
-
     // Create channel for merge script (only needed if merge is enabled)
     if (!skip_merge) {
         merge_script_ch = Channel.fromPath(params.merge_script, checkIfExists: true)
@@ -2141,16 +2157,61 @@ workflow {
     // Share the same metadata with all timepoints
     shared_metadata = EXTRACT_METADATA.out.metadata
 
-    // 2. Preprocess and deconvolve each timepoint
-    PREPROCESS_DECONVOLVE(
-        processing_input,
-        shared_metadata,
-        preproc_script_ch.collect(),
-        config.preprocessing
-    )
+    if (skip_preprocessing) {
+        // ---- Skip preprocessing ----
+        if (preprocessed_dir) {
+            // Load already-processed TIFs from preprocessed_dir
+            log.info "Preprocessing SKIPPED — reading pre-processed images from: ${preprocessed_dir}"
 
-    // 2b. OPTIONAL: Debug preprocessing — run Cellpose on each intermediate stage
-    if (run_debug_preprocessing) {
+            def preproc_path = Paths.get(preprocessed_dir)
+            def preproc_files = []
+            Files.list(preproc_path).each { p ->
+                def fname = p.getFileName().toString()
+                if (fname.endsWith('.tif') || fname.endsWith('.tiff')) {
+                    preproc_files.add(p.toFile())
+                }
+            }
+
+            if (preproc_files.isEmpty()) {
+                error "No .tif/.tiff files found in preprocessed_dir: ${preprocessed_dir}"
+            }
+
+            log.info "Found ${preproc_files.size()} preprocessed files in: ${preprocessed_dir}"
+
+            // Extract timepoints from filenames (e.g. t0000_processed.tif)
+            segmentation_input = Channel
+                .fromList(preproc_files.collect { f ->
+                    def m = (f.name =~ /(?i)t(\d+)/)
+                    def tp = m.find() ? m.group(1).toInteger() : null
+                    if (tp == null) {
+                        log.warn "Could not extract timepoint from preprocessed file: ${f.name}"
+                    }
+                    return tuple(tp, file(f.toPath()))
+                })
+                .filter { it[0] != null }
+                .ifEmpty { error "No preprocessed files with recognizable timepoint numbers found in: ${preprocessed_dir}" }
+        } else {
+            // No preprocessed_dir — use raw input images directly
+            log.info "Preprocessing SKIPPED — using raw input images for segmentation"
+            segmentation_input = processing_input
+        }
+
+    } else {
+        // ---- Normal preprocessing ----
+
+        // Create channel for preprocessing script
+        preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+
+        // 2. Preprocess and deconvolve each timepoint
+        PREPROCESS_DECONVOLVE(
+            processing_input,
+            shared_metadata,
+            preproc_script_ch.collect(),
+            config.preprocessing
+        )
+
+        // 2b. OPTIONAL: Debug preprocessing — run Cellpose on each intermediate stage
+        if (run_debug_preprocessing) {
         log.info "Debug preprocessing ENABLED — will run nuclei tracking on intermediates"
         log.info "  Cellpose model: ${config.preprocessing.debug_preprocessing.cellpose_model}"
         log.info "  save_intermediates: ${config.preprocessing.save_intermediates}"
@@ -2192,10 +2253,15 @@ workflow {
         log.info "Debug preprocessing DISABLED"
     }
 
+        // Use PREPROCESS_DECONVOLVE output as segmentation input
+        segmentation_input = PREPROCESS_DECONVOLVE.out.processed
+
+    } // end skip_preprocessing else
+
     // 3. Segment each timepoint with Cellpose
     if (!skip_segmentation) {
         CELLPOSE_SEGMENT(
-            PREPROCESS_DECONVOLVE.out.processed,
+            segmentation_input,
             shared_metadata,
             config.segmentation,
             config.preprocessing.image_scaling
@@ -2215,7 +2281,7 @@ workflow {
             log.info "Hyperstack merging enabled (processed + segmented)"
 
             // Collect processed files into a merge job tuple: ['processed', [files...]]
-            processed_merge_ch = PREPROCESS_DECONVOLVE.out.processed
+            processed_merge_ch = segmentation_input
                 .map { timepoint, processed_file -> processed_file }
                 .collect()
                 .map { files -> tuple('processed', files) }
@@ -2323,7 +2389,7 @@ workflow {
         if (!skip_merge) {
             log.info "Hyperstack merging enabled (processed only, no segmentation)"
 
-            processed_merge_ch = PREPROCESS_DECONVOLVE.out.processed
+            processed_merge_ch = segmentation_input
                 .map { timepoint, processed_file -> processed_file }
                 .collect()
                 .map { files -> tuple('processed', files) }
