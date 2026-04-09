@@ -2299,22 +2299,20 @@ workflow {
                     log.info "Hyperstack merging enabled (processed + segmented)"
                 }
 
-                // Collect processed and segmented files, then create merge jobs
-                // only after BOTH are ready (prevents merge starting before segmentation finishes)
-                processed_files_ch = segmentation_input
+                // Collect processed and segmented files into labeled merge jobs
+                processed_merge_ch = segmentation_input
                     .map { timepoint, f -> f }
                     .collect()
+                    .map { files -> tuple('processed', files) }
 
-                segmented_files_ch = CELLPOSE_SEGMENT.out.segmented
+                segmented_merge_ch = CELLPOSE_SEGMENT.out.segmented
                     .map { timepoint, segmented_file -> segmented_file }
                     .collect()
+                    .map { files -> tuple('segmented', files) }
 
-                // combine() waits for both to complete before emitting
-                merge_jobs_ch = processed_files_ch
-                    .combine(segmented_files_ch)
-                    .flatMap { proc_files, seg_files ->
-                        [tuple('processed', proc_files), tuple('segmented', seg_files)]
-                    }
+                // .collect() on each channel already waits for all items;
+                // .mix() just combines the two ready merge jobs
+                merge_jobs_ch = processed_merge_ch.mix(segmented_merge_ch)
 
                 MERGE_TO_HYPERSTACK(
                     merge_jobs_ch,
