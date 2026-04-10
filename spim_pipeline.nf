@@ -1658,6 +1658,7 @@ process ULTRACK_SEGMENT {
     output:
     path "local_ultrack_config.toml", emit: config_toml
     path "data.db", emit: database
+    path "metadata.toml", emit: metadata
 
     container params.ultrack_container
 
@@ -1706,6 +1707,7 @@ PYEOF
     echo ""
     echo "✓ Segment complete"
     ls -lh data.db
+    ls -lh metadata.toml
     """
 }
 
@@ -1722,10 +1724,12 @@ process ULTRACK_LINK {
     input:
     path ultrack_config_toml
     path database
+    path metadata_toml
 
     output:
     path "local_ultrack_config.toml", emit: config_toml
     path "data.db", emit: database
+    path "metadata.toml", emit: metadata
 
     container params.ultrack_container
 
@@ -1775,10 +1779,12 @@ process ULTRACK_SOLVE {
     input:
     path ultrack_config_toml
     path database
+    path metadata_toml
 
     output:
     path "local_ultrack_config.toml", emit: config_toml
     path "data.db", emit: database
+    path "metadata.toml", emit: metadata
 
     container params.ultrack_container
 
@@ -1833,6 +1839,7 @@ process ULTRACK_EXPORT {
     input:
     path ultrack_config_toml
     path database
+    path metadata_toml
 
     output:
     path "results/**", emit: results
@@ -2364,17 +2371,20 @@ workflow {
 
             ULTRACK_LINK(
                 ULTRACK_SEGMENT.out.config_toml,
-                ULTRACK_SEGMENT.out.database
+                ULTRACK_SEGMENT.out.database,
+                ULTRACK_SEGMENT.out.metadata
             )
 
             ULTRACK_SOLVE(
                 ULTRACK_LINK.out.config_toml,
-                ULTRACK_LINK.out.database
+                ULTRACK_LINK.out.database,
+                ULTRACK_LINK.out.metadata
             )
 
             ULTRACK_EXPORT(
                 ULTRACK_SOLVE.out.config_toml,
-                ULTRACK_SOLVE.out.database
+                ULTRACK_SOLVE.out.database,
+                ULTRACK_SOLVE.out.metadata
             )
         } else {
             log.info "Ultrack tracking SKIPPED (tracking.enabled=false)"
