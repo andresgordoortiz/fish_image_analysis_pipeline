@@ -42,10 +42,7 @@
     "deconvolution": {
       "niter": 3,
       "niterz": 3,
-      "padding": 64,
-      "padding_mode": "edge",
-      "edge_mask_px": 8,
-      "edge_taper_width": 24
+      "padding": 64
     },
     "normalization": {
       "min_v": 0,
@@ -59,25 +56,10 @@
       "noise_lvl": 2
     },
     "postprocessing": {
-      "sigma": 1.2,
-      "clahe_clip_limit": 0.008,
-      "clahe_post_smooth": 0.8,
-      "clahe_dual_axis": true,
-      "mask_border_px": 25
-    },
-    "z_correction_method": "p50",
-    "z_correction_max_scale": 1.3,
-    "z_correction_signal_floor_pct": 40.0,
-    "camera_bg_percentile": 5.0,
-    "dim_slice_threshold_pct": 30.0,
-    "destripe": {
-      "enabled": false,
-      "sigma_long": 64,
-      "sigma_short": 2
+      "sigma": 1.2
     },
     "correction_flags": {
       "no_clahe": false,
-      "no_clahe_xy": false,
       "no_z_correction": false,
       "no_shading": false
     },
