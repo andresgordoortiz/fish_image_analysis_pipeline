@@ -212,45 +212,6 @@ if (!skip_tracking) {
 }
 
 // Set defaults for new optional parameters
-if (!config.preprocessing.deconvolution.containsKey('padding_mode')) {
-    config.preprocessing.deconvolution.padding_mode = 'reflect'
-}
-if (!config.preprocessing.deconvolution.containsKey('edge_mask_px')) {
-    config.preprocessing.deconvolution.edge_mask_px = 0
-}
-if (!config.preprocessing.deconvolution.containsKey('edge_taper_width')) {
-    config.preprocessing.deconvolution.edge_taper_width = 0
-}
-if (!config.preprocessing.postprocessing.containsKey('clahe_clip_limit')) {
-    config.preprocessing.postprocessing.clahe_clip_limit = 0.01
-}
-if (!config.preprocessing.postprocessing.containsKey('clahe_post_smooth')) {
-    config.preprocessing.postprocessing.clahe_post_smooth = 0.0
-}
-if (!config.preprocessing.postprocessing.containsKey('mask_border_px')) {
-    config.preprocessing.postprocessing.mask_border_px = 10
-}
-if (!config.preprocessing.containsKey('z_correction_method')) {
-    config.preprocessing.z_correction_method = 'p75'
-}
-if (!config.preprocessing.containsKey('z_correction_max_scale')) {
-    config.preprocessing.z_correction_max_scale = 2.0
-}
-if (!config.preprocessing.containsKey('z_correction_signal_floor_pct')) {
-    config.preprocessing.z_correction_signal_floor_pct = 25.0
-}
-if (!config.preprocessing.containsKey('dim_slice_threshold_pct')) {
-    config.preprocessing.dim_slice_threshold_pct = 30.0
-}
-if (!config.preprocessing.containsKey('camera_bg_percentile')) {
-    config.preprocessing.camera_bg_percentile = 2.0
-}
-if (!config.preprocessing.postprocessing.containsKey('clahe_dual_axis')) {
-    config.preprocessing.postprocessing.clahe_dual_axis = true
-}
-if (!config.preprocessing.containsKey('destripe')) {
-    config.preprocessing.destripe = [enabled: true, sigma_long: 64, sigma_short: 2]
-}
 if (!config.segmentation.containsKey('anisotropy')) {
     config.segmentation.anisotropy = null
 }
@@ -272,8 +233,6 @@ def voxel_info = config.voxel_size.auto_detect ? "Auto-detect" : "Manual: ${conf
 def roi_info = config.roi_cropping.enabled ? "Enabled" : "Disabled"
 def merge_info = skip_merge ? "SKIPPED" : "Enabled"
 def downscale_info = downscale_labels < 1.0 ? "${downscale_labels} (Fiji nearest-neighbor)" : "Disabled"
-def edge_mask_info = config.preprocessing.deconvolution.edge_mask_px > 0 ? "${config.preprocessing.deconvolution.edge_mask_px}px" : "Disabled"
-def edge_taper_info = config.preprocessing.deconvolution.edge_taper_width > 0 ? "${config.preprocessing.deconvolution.edge_taper_width}px" : "Disabled"
 def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stitch_threshold != null ? "2D+Stitch(${config.segmentation.stitch_threshold})" : "2D")
 def tracking_info = skip_tracking ? "SKIPPED" : "Enabled (ultrack)"
 def debug_info = run_debug_preprocessing ? "ENABLED (nuclei tracking per stage)" : "Disabled"
@@ -281,7 +240,7 @@ def preproc_info = skip_preprocessing ? (preprocessed_dir ? "SKIPPED (using ${pr
 
 log.info """
 ================================================
-SPIM Pipeline - IMP Vienna
+SPIM Pipeline - IMP Vienna (vanilla)
 ================================================
 Input        : ${params.input_dir}
 Output       : ${params.output_dir}
@@ -290,9 +249,6 @@ ROI Cropping : ${roi_info}
 Voxel Size   : ${voxel_info}
 Merge        : ${merge_info}
 Downscale    : ${downscale_info}
-Pad mode     : ${config.preprocessing.deconvolution.padding_mode}
-Edge taper   : ${edge_taper_info}
-Edge mask    : ${edge_mask_info}
 Seg mode     : ${seg_mode_info}
 Preprocess   : ${preproc_info}
 Tracking     : ${tracking_info}
@@ -903,20 +859,6 @@ cmd = [
     '--resolution_pz0', str(config['background_subtraction']['resolution_pz0']),
     '--noise_lvl', str(config['background_subtraction']['noise_lvl']),
     '--padding', str(config['deconvolution']['padding']),
-    '--padding_mode', str(config['deconvolution'].get('padding_mode', 'reflect')),
-    '--edge_mask_px', str(config['deconvolution'].get('edge_mask_px', 0)),
-    '--edge_taper_width', str(config['deconvolution'].get('edge_taper_width', 0)),
-    '--clahe_clip_limit', str(config['postprocessing'].get('clahe_clip_limit', 0.01)),
-    '--clahe_min_signal_pct', str(config['postprocessing'].get('clahe_min_signal_pct', 15.0)),
-    '--clahe_post_smooth', str(config['postprocessing'].get('clahe_post_smooth', 0.0)),
-    '--mask_border_px', str(config['postprocessing'].get('mask_border_px', 10)),
-    '--z_correction_method', str(config.get('z_correction_method', 'p75')),
-    '--z_correction_max_scale', str(config.get('z_correction_max_scale', 2.0)),
-    '--z_correction_signal_floor_pct', str(config.get('z_correction_signal_floor_pct', 25.0)),
-    '--dim_slice_threshold_pct', str(config.get('dim_slice_threshold_pct', 30.0)),
-    '--camera_bg_percentile', str(config.get('camera_bg_percentile', 2.0)),
-    '--destripe_sigma_long', str(config.get('destripe', {}).get('sigma_long', 64)),
-    '--destripe_sigma_short', str(config.get('destripe', {}).get('sigma_short', 2))
 ]
 
 # Add optional flags from correction_flags
@@ -926,12 +868,6 @@ if config['correction_flags'].get('no_z_correction', False):
     cmd.append('--no_z_correction')
 if config['correction_flags'].get('no_shading', False):
     cmd.append('--no_shading')
-if not config['postprocessing'].get('clahe_dual_axis', True):
-    cmd.append('--no_clahe_xy')
-if not config.get('destripe', {}).get('enabled', True):
-    cmd.append('--no_destripe')
-if config.get('save_intermediates', False):
-    cmd.append('--save_intermediates')
 
 print("Preprocessing command:", ' '.join(cmd))
 print("\\n" + "="*60)
