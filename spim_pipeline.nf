@@ -296,8 +296,11 @@ Debug preproc: ${debug_info}
 process SPLIT_INPUT_FILE {
     tag { input_file.name }
 
-    maxRetries 1
-    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+    // Splitting a multi-GB hyperstack is expensive and deterministic; failures
+    // are almost always config/data problems that won't fix themselves on
+    // retry. Fail fast.
+    maxRetries 0
+    errorStrategy 'terminate'
 
     publishDir "${params.output_dir}/00_split_input",
         mode: 'copy',
