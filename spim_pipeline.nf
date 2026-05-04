@@ -97,17 +97,30 @@ params.container = config.system?.container_image ?: 'library://andresgordoortiz
 params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
 params.ultrack_container = config.tracking?.ultrack_container ?: null
 
-// Validate input directory (use file() for Nextflow-native path resolution)
-def input_dir_file = file(params.input_dir)
-if (!input_dir_file.exists()) {
-    log.error "Input directory not found: ${params.input_dir} (resolved to: ${input_dir_file})"
+// Validate input path. Accept either:
+//   - a directory of per-timepoint TIFFs / single hyperstack
+//   - a single .czi / .tif / .tiff hyperstack file (we then use its parent
+//     directory and treat the filename as input.file)
+def input_path_file = file(params.input_dir)
+if (!input_path_file.exists()) {
+    log.error "Input path not found: ${params.input_dir} (resolved to: ${input_path_file})"
     log.error "If the path contains spaces, use plain spaces in config.json (not backslash-escaped)"
     exit 1
 }
+if (!input_path_file.isDirectory()) {
+    // Path points at a single file -> auto-promote to (parent_dir, file)
+    def fname = input_path_file.getName().toLowerCase()
+    if (!(fname.endsWith('.czi') || fname.endsWith('.tif') || fname.endsWith('.tiff'))) {
+        log.error "input.directory points at a file but it is not .czi/.tif/.tiff: ${params.input_dir}"
+        exit 1
+    }
+    log.info "input.directory points at a single file — using its parent directory as the input dir"
+    params.input_file = input_path_file.getName()
+    params.input_dir  = input_path_file.getParent().toString()
+}
+def input_dir_file = file(params.input_dir)
 if (!input_dir_file.isDirectory()) {
-    log.error "input.directory must be a directory, got a file: ${params.input_dir}"
-    log.error "If you want to process a single .czi or hyperstack .tif, set input.directory to its parent folder"
-    log.error "and (optionally) input.file to the filename."
+    log.error "Resolved input directory is not a directory: ${params.input_dir}"
     exit 1
 }
 

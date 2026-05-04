@@ -54,10 +54,16 @@ OUTPUT_DIR=$(sed -n '/"output"/,/}/p' "$CONFIG_JSON" | grep '"directory"' | sed 
 INPUT_DIR=$(echo "$INPUT_DIR" | sed 's/\\\\//g; s/\\//g' | sed 's:/*$::')
 OUTPUT_DIR=$(echo "$OUTPUT_DIR" | sed 's/\\\\//g; s/\\//g' | sed 's:/*$::')
 
-# Validate input directory exists
-if [ ! -d "$INPUT_DIR" ]; then
-    echo "ERROR: Input directory does not exist: $INPUT_DIR"
+# Validate input path exists. Accept either a directory of per-timepoint TIFFs
+# OR a single .czi / hyperstack .tif/.tiff file (Nextflow will resolve the
+# parent directory automatically).
+if [ ! -e "$INPUT_DIR" ]; then
+    echo "ERROR: Input path does not exist: $INPUT_DIR"
     echo "  (If the path contains spaces, use plain spaces in config.json, not backslash-escaped)"
+    exit 1
+fi
+if [ ! -d "$INPUT_DIR" ] && [ ! -f "$INPUT_DIR" ]; then
+    echo "ERROR: Input path is neither a directory nor a regular file: $INPUT_DIR"
     exit 1
 fi
 
