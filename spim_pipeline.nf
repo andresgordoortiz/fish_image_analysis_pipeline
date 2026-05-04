@@ -87,37 +87,40 @@ def sanitizePath(String p) {
     return p.replaceAll('\\\\', '').replaceAll('\\/', '/').replaceAll('/+$', '')
 }
 
-params.input_dir = sanitizePath(config.input.directory)
-params.output_dir = sanitizePath(config.output.directory)
-params.channel = config.input.channel
-// Optional: explicitly point to a single .czi or hyperstack .tif file
-// (relative paths are resolved against input.directory).
-params.input_file = config.input?.file ? sanitizePath(config.input.file) : null
-params.container = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
-params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
-params.ultrack_container = config.tracking?.ultrack_container ?: null
-
-// Validate input path. Accept either:
+// Resolve input path. Accept either:
 //   - a directory of per-timepoint TIFFs / single hyperstack
 //   - a single .czi / .tif / .tiff hyperstack file (we then use its parent
 //     directory and treat the filename as input.file)
-def input_path_file = file(params.input_dir)
-if (!input_path_file.exists()) {
-    log.error "Input path not found: ${params.input_dir} (resolved to: ${input_path_file})"
+// IMPORTANT: params.X can only be assigned once in Nextflow, so we figure out
+// the final values in plain locals first, then bind them to params.* below.
+def _raw_input_dir  = sanitizePath(config.input.directory)
+def _raw_input_file = config.input?.file ? sanitizePath(config.input.file) : null
+
+def _input_path_file = file(_raw_input_dir)
+if (!_input_path_file.exists()) {
+    log.error "Input path not found: ${_raw_input_dir} (resolved to: ${_input_path_file})"
     log.error "If the path contains spaces, use plain spaces in config.json (not backslash-escaped)"
     exit 1
 }
-if (!input_path_file.isDirectory()) {
-    // Path points at a single file -> auto-promote to (parent_dir, file)
-    def fname = input_path_file.getName().toLowerCase()
+if (!_input_path_file.isDirectory()) {
+    def fname = _input_path_file.getName().toLowerCase()
     if (!(fname.endsWith('.czi') || fname.endsWith('.tif') || fname.endsWith('.tiff'))) {
-        log.error "input.directory points at a file but it is not .czi/.tif/.tiff: ${params.input_dir}"
+        log.error "input.directory points at a file but it is not .czi/.tif/.tiff: ${_raw_input_dir}"
         exit 1
     }
     log.info "input.directory points at a single file — using its parent directory as the input dir"
-    params.input_file = input_path_file.getName()
-    params.input_dir  = input_path_file.getParent().toString()
+    _raw_input_file = _input_path_file.getName()
+    _raw_input_dir  = _input_path_file.getParent().toString()
 }
+
+params.input_dir   = _raw_input_dir
+params.output_dir  = sanitizePath(config.output.directory)
+params.channel     = config.input.channel
+params.input_file  = _raw_input_file
+params.container   = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
+params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
+params.ultrack_container = config.tracking?.ultrack_container ?: null
+
 def input_dir_file = file(params.input_dir)
 if (!input_dir_file.isDirectory()) {
     log.error "Resolved input directory is not a directory: ${params.input_dir}"
