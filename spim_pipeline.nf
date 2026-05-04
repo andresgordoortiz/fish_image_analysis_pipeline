@@ -90,6 +90,9 @@ def sanitizePath(String p) {
 params.input_dir = sanitizePath(config.input.directory)
 params.output_dir = sanitizePath(config.output.directory)
 params.channel = config.input.channel
+// Optional: explicitly point to a single .czi or hyperstack .tif file
+// (relative paths are resolved against input.directory).
+params.input_file = config.input?.file ? sanitizePath(config.input.file) : null
 params.container = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
 params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
 params.ultrack_container = config.tracking?.ultrack_container ?: null
@@ -99,6 +102,12 @@ def input_dir_file = file(params.input_dir)
 if (!input_dir_file.exists()) {
     log.error "Input directory not found: ${params.input_dir} (resolved to: ${input_dir_file})"
     log.error "If the path contains spaces, use plain spaces in config.json (not backslash-escaped)"
+    exit 1
+}
+if (!input_dir_file.isDirectory()) {
+    log.error "input.directory must be a directory, got a file: ${params.input_dir}"
+    log.error "If you want to process a single .czi or hyperstack .tif, set input.directory to its parent folder"
+    log.error "and (optionally) input.file to the filename."
     exit 1
 }
 
@@ -255,6 +264,222 @@ Tracking     : ${tracking_info}
 Debug preproc: ${debug_info}
 ================================================
 """.stripIndent()
+
+// ============================================================================
+// PROCESS: Split a single CZI / hyperstack TIFF into per-timepoint TIFFs
+// ============================================================================
+// Used when the input is NOT a directory of per-timepoint files but instead
+// a single .czi (Zeiss) or 4D/5D ImageJ/OME hyperstack .tif. The process
+// extracts the requested channel and writes one ZYX TIFF per timepoint named
+// "t####_Channel <c>.tif" so the rest of the pipeline can consume them
+// unchanged.
+
+process SPLIT_INPUT_FILE {
+    tag { input_file.name }
+
+    maxRetries 1
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    publishDir "${params.output_dir}/00_split_input",
+        mode: 'copy',
+        pattern: "t*_Channel*.tif"
+    publishDir "${params.output_dir}/logs/split_input",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    path input_file
+    val channel
+
+    output:
+    path "t*_Channel*.tif", emit: timepoints
+    path "split_input.log", emit: log
+
+    script:
+    def filename = input_file.name
+    """
+    #!/bin/bash
+    set -euo pipefail
+    exec > >(tee split_input.log) 2>&1
+
+    echo "============================================"
+    echo "Splitting hyperstack input: ${filename}"
+    echo "Channel index requested: ${channel}"
+    echo "============================================"
+
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    python3 --version
+
+    # czifile is a small pure-python lib that handles most CZI files.
+    # Install at runtime (same pattern as CROP_WITH_ROI for read-roi).
+    if [[ "${filename}" == *.czi || "${filename}" == *.CZI ]]; then
+        python3 -c "import czifile" 2>/dev/null || {
+            echo "Installing czifile..."
+            pip install czifile --break-system-packages
+        }
+    fi
+
+    python3 << 'PYTHON_SPLIT_SCRIPT'
+import sys
+import os
+import numpy as np
+import tifffile
+from pathlib import Path
+
+input_file = '${filename}'
+channel = ${channel}  # 1-based channel index, matches t####_Channel <c>.tif convention
+
+print(f"Input file: {input_file}")
+print(f"Channel (1-based): {channel}")
+
+if channel < 1:
+    print(f"ERROR: channel must be >= 1 (got {channel})", file=sys.stderr)
+    sys.exit(1)
+
+ch_idx = channel - 1  # 0-based index into the C axis
+
+ext = Path(input_file).suffix.lower()
+
+
+def save_timepoint(stack3d, t_idx, channel):
+    \"\"\"Save a 3D ZYX stack as t####_Channel <c>.tif (ImageJ hyperstack).\"\"\"
+    out_name = f"t{t_idx:04d}_Channel {channel}.tif"
+    # Cast to uint16 if it's not already an integer type
+    if stack3d.dtype.kind == 'f':
+        # Clip to uint16 range to avoid overflow
+        stack3d = np.clip(stack3d, 0, 65535).astype(np.uint16)
+    elif stack3d.dtype.itemsize > 2 and stack3d.dtype.kind in ('u', 'i'):
+        stack3d = np.clip(stack3d, 0, 65535).astype(np.uint16)
+    tifffile.imwrite(
+        out_name,
+        stack3d,
+        imagej=True,
+        metadata={'axes': 'ZYX'},
+    )
+    print(f"  -> {out_name}  shape={stack3d.shape} dtype={stack3d.dtype}")
+
+
+def split_czi(path, channel):
+    import czifile
+    print("Reading CZI metadata...")
+    with czifile.CziFile(path) as czi:
+        axes = czi.axes  # e.g. 'BCTZYX0' or 'STCZYX'
+        shape = czi.shape
+        print(f"  CZI axes:  {axes}")
+        print(f"  CZI shape: {shape}")
+
+        data = czi.asarray()
+    print(f"  Loaded array shape: {data.shape}, dtype: {data.dtype}")
+
+    # Squeeze trailing singleton sample axis ("0") and any size-1 axes that
+    # aren't T/C/Z/Y/X
+    keep = []
+    new_axes = ''
+    for ax, sz in zip(axes, data.shape):
+        if ax in ('T', 'C', 'Z', 'Y', 'X'):
+            keep.append(slice(None))
+            new_axes += ax
+        else:
+            # Take first index of any other axis (B, S, M, V, 0, ...)
+            keep.append(0)
+    data = data[tuple(keep)]
+    print(f"  After squeezing extra axes: shape={data.shape}, axes={new_axes}")
+
+    # Move axes to canonical TCZYX order (insert size-1 dims if missing)
+    for needed in 'TCZYX':
+        if needed not in new_axes:
+            data = np.expand_dims(data, axis=0)
+            new_axes = needed + new_axes
+    order = [new_axes.index(a) for a in 'TCZYX']
+    data = np.transpose(data, order)
+    print(f"  Canonical TCZYX shape: {data.shape}")
+
+    nT, nC, nZ, nY, nX = data.shape
+    if ch_idx < 0 or ch_idx >= nC:
+        raise ValueError(f"Channel {channel} out of range (file has {nC} channels: 1..{nC})")
+
+    print(f"Splitting {nT} timepoints (channel {channel} of {nC})...")
+    for t in range(nT):
+        save_timepoint(data[t, ch_idx], t, channel)
+
+
+def split_tiff(path, channel):
+    print("Reading TIFF metadata...")
+    with tifffile.TiffFile(path) as tif:
+        series = tif.series[0]
+        axes = series.axes  # e.g. 'TZYX', 'TCZYX', 'ZYX'
+        shape = series.shape
+        print(f"  TIFF series axes:  {axes}")
+        print(f"  TIFF series shape: {shape}")
+        # Per-timepoint files are 3D (ZYX or YX) — no splitting needed
+        if 'T' not in axes:
+            print("  No T axis -> file is already a single timepoint, copying as t0000.")
+            data = series.asarray()
+            if data.ndim == 2:
+                data = data[None, ...]  # YX -> 1YX
+            if 'C' in axes:
+                # Reduce channel dim by selecting requested index (1-based)
+                c_axis = axes.index('C')
+                nC_here = data.shape[c_axis]
+                if ch_idx < 0 or ch_idx >= nC_here:
+                    raise ValueError(f"Channel {channel} out of range (file has {nC_here} channels: 1..{nC_here})")
+                data = np.take(data, ch_idx, axis=c_axis)
+            save_timepoint(data, 0, channel)
+            return
+
+        data = series.asarray()
+    print(f"  Loaded array shape: {data.shape}, dtype: {data.dtype}")
+
+    # Insert missing axes so we end up with canonical TCZYX
+    new_axes = axes
+    arr = data
+    for needed in 'TCZYX':
+        if needed not in new_axes:
+            arr = np.expand_dims(arr, axis=0)
+            new_axes = needed + new_axes
+    order = [new_axes.index(a) for a in 'TCZYX']
+    arr = np.transpose(arr, order)
+    print(f"  Canonical TCZYX shape: {arr.shape}")
+
+    nT, nC, nZ, nY, nX = arr.shape
+    if ch_idx < 0 or ch_idx >= nC:
+        raise ValueError(f"Channel {channel} out of range (file has {nC} channels: 1..{nC})")
+
+    print(f"Splitting {nT} timepoints (channel {channel} of {nC})...")
+    for t in range(nT):
+        save_timepoint(arr[t, ch_idx], t, channel)
+
+
+try:
+    if ext in ('.czi',):
+        split_czi(input_file, channel)
+    elif ext in ('.tif', '.tiff'):
+        split_tiff(input_file, channel)
+    else:
+        print(f"ERROR: Unsupported file extension: {ext}", file=sys.stderr)
+        sys.exit(1)
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    print(f"ERROR splitting input: {e}", file=sys.stderr)
+    sys.exit(1)
+
+print("Split complete.")
+PYTHON_SPLIT_SCRIPT
+
+    n_out=\$(ls -1 t*_Channel*.tif 2>/dev/null | wc -l || true)
+    echo "Produced \$n_out per-timepoint TIFF(s)."
+    if [ "\$n_out" -eq 0 ]; then
+        echo "ERROR: split produced no output files"
+        exit 1
+    fi
+    """
+}
 
 // Process: ROI-based Cropping (optional)
 
@@ -1972,99 +2197,167 @@ workflow {
         }
     }
 
-    // ---- Fallback: if no files match the expected naming convention,
-    //      collect ALL .tif/.tiff files in the directory and assign
-    //      timepoints based on whatever numeric info can be extracted
-    //      from the filenames (or alphabetical order as last resort). ----
-    def used_fallback = false
-    if (matched_files.isEmpty()) {
-        log.warn "No files matching '${glob_pattern}' — falling back to all TIF files in ${params.input_dir}"
-        def tifMatcher  = FileSystems.getDefault().getPathMatcher("glob:*.tif")
-        def tiffMatcher = FileSystems.getDefault().getPathMatcher("glob:*.tiff")
+    // ---- Detect hyperstack / CZI inputs.  We use the SPLIT_INPUT_FILE
+    //      process (CZI or 4D/5D ImageJ/OME hyperstack TIFF) only when the
+    //      directory does NOT already contain per-timepoint TIFFs matching
+    //      the expected pattern.  An explicit `input.file` in config.json
+    //      always takes precedence. ----
+    def hyperstack_input = null  // java.io.File for the .czi / hyperstack .tif
+
+    if (params.input_file) {
+        // Resolve relative to input_dir if not absolute
+        def f = new File(params.input_file)
+        if (!f.isAbsolute()) {
+            f = new File(input_dir_file, params.input_file)
+        }
+        if (!f.exists()) {
+            error "Configured input.file does not exist: ${f}"
+        }
+        hyperstack_input = f
+        matched_files = []  // explicit override -> ignore per-timepoint files
+        log.info "Using explicit input.file: ${hyperstack_input}"
+    } else if (matched_files.isEmpty()) {
+        // Auto-detect: prefer .czi, then a single hyperstack .tif/.tiff
+        def czis = []
+        def tifs = []
+        def cziMatcher  = FileSystems.getDefault().getPathMatcher("glob:*.{czi,CZI}")
+        def tifMatcher  = FileSystems.getDefault().getPathMatcher("glob:*.{tif,tiff,TIF,TIFF}")
         Files.list(input_dir_path).each { p ->
             def fname = p.getFileName()
-            if (tifMatcher.matches(fname) || tiffMatcher.matches(fname)) {
-                matched_files.add(p.toFile())
-            }
+            if (cziMatcher.matches(fname)) czis.add(p.toFile())
+            else if (tifMatcher.matches(fname)) tifs.add(p.toFile())
         }
-        used_fallback = true
+        if (czis.size() == 1) {
+            hyperstack_input = czis[0]
+            log.info "Auto-detected single CZI input: ${hyperstack_input.name}"
+        } else if (czis.size() > 1) {
+            error "Multiple .czi files found in ${params.input_dir}. Set input.file in config.json to choose one."
+        } else if (tifs.size() == 1) {
+            hyperstack_input = tifs[0]
+            log.info "Auto-detected single TIFF input (will check for hyperstack axes): ${hyperstack_input.name}"
+        }
     }
 
-    if (matched_files.isEmpty()) {
-        error "No .tif/.tiff files found in: ${params.input_dir}"
-    }
+    if (hyperstack_input != null) {
+        // Run the SPLIT step. It writes per-timepoint TIFFs that we then
+        // feed into the rest of the pipeline as if they were the original
+        // input directory.
+        log.info "Splitting hyperstack/CZI input into per-timepoint TIFFs..."
+        SPLIT_INPUT_FILE(
+            Channel.fromPath(hyperstack_input.toString(), checkIfExists: true),
+            params.channel
+        )
 
-    log.info "Found ${matched_files.size()} files ${used_fallback ? '(fallback – all TIFs)' : 'matching pattern'} in: ${params.input_dir}"
-
-    // --- Helper: extract a numeric timepoint from a filename ---
-    // Tries several common patterns in order:
-    //   1. t####_Channel  (original convention)
-    //   2. t#### or T####  (e.g. t0000.tif, T012_decon.tif)
-    //   3. tp#### or TP#### (e.g. tp001.tif)
-    //   4. _####. or -####. (trailing number before extension, e.g. embryo_001.tif)
-    //   5. Any digit run in the filename
-    // Returns null if nothing numeric is found.
-    def extractTimepoint = { String name ->
-        def m
-        // Pattern 1: original t####_Channel
-        m = (name =~ /(?i)t(\d+)_Channel/)
-        if (m.find()) return m.group(1).toInteger()
-        // Pattern 2: t#### or T####
-        m = (name =~ /(?i)(?:^|[^a-z])t(\d+)/)
-        if (m.find()) return m.group(1).toInteger()
-        // Pattern 3: tp#### or TP####
-        m = (name =~ /(?i)tp(\d+)/)
-        if (m.find()) return m.group(1).toInteger()
-        // Pattern 4: trailing number before extension  e.g. img_001.tif
-        m = (name =~ /[_\-\s](\d+)\.[tT][iI][fF]{1,2}$/)
-        if (m.find()) return m.group(1).toInteger()
-        // Pattern 5: first digit run anywhere in the name
-        m = (name =~ /(\d+)/)
-        if (m.find()) return m.group(1).toInteger()
-        return null
-    }
-
-    // Build (timepoint, file) tuples.  When numeric extraction fails for
-    // ALL files we fall back to alphabetical ordering.
-    def file_tuples = matched_files.collect { f ->
-        def tp = extractTimepoint(f.name)
-        return [tp, f]
-    }
-
-    def all_null = file_tuples.every { it[0] == null }
-
-    if (all_null) {
-        // No numeric info at all — sort alphabetically and assign 0, 1, 2, …
-        log.warn "Could not extract numeric timepoints from filenames — using alphabetical order"
-        file_tuples = file_tuples.sort { it[1].name }
-        file_tuples = file_tuples.withIndex().collect { entry, idx -> [idx, entry[1]] }
-    } else {
-        // For any file where extraction failed, assign a unique large number so
-        // it sorts to the end rather than causing a crash.
-        def max_tp = file_tuples.findAll { it[0] != null }.collect { it[0] }.max() ?: 0
-        def fallback_tp = max_tp + 1
-        file_tuples = file_tuples.collect { tp, f ->
-            if (tp == null) {
-                log.warn "Could not extract timepoint from '${f.name}' — assigning t=${fallback_tp}"
-                def assigned = fallback_tp
-                fallback_tp++
-                return [assigned, f]
+        // SPLIT_INPUT_FILE.out.timepoints emits a list of files (one per t)
+        input_channel = SPLIT_INPUT_FILE.out.timepoints
+            .flatten()
+            .map { f ->
+                // Filenames are guaranteed to be t####_Channel <c>.tif
+                def m = (f.getName() =~ /t(\d+)_Channel/)
+                def tp = m.find() ? m.group(1).toInteger() : 0
+                tuple(tp, f)
             }
+            .toSortedList { a, b -> a[0] <=> b[0] }
+            .flatMap { it }
+
+        input_channel.subscribe { timepoint, f ->
+            log.info "Split timepoint ${timepoint}: ${f.name}"
+        }
+    } else {
+        // ---- Fallback: if no files match the expected naming convention,
+        //      collect ALL .tif/.tiff files in the directory and assign
+        //      timepoints based on whatever numeric info can be extracted
+        //      from the filenames (or alphabetical order as last resort). ----
+        def used_fallback = false
+        if (matched_files.isEmpty()) {
+            log.warn "No files matching '${glob_pattern}' — falling back to all TIF files in ${params.input_dir}"
+            def tifMatcher  = FileSystems.getDefault().getPathMatcher("glob:*.tif")
+            def tiffMatcher = FileSystems.getDefault().getPathMatcher("glob:*.tiff")
+            Files.list(input_dir_path).each { p ->
+                def fname = p.getFileName()
+                if (tifMatcher.matches(fname) || tiffMatcher.matches(fname)) {
+                    matched_files.add(p.toFile())
+                }
+            }
+            used_fallback = true
+        }
+
+        if (matched_files.isEmpty()) {
+            error "No .tif/.tiff/.czi files found in: ${params.input_dir}"
+        }
+
+        log.info "Found ${matched_files.size()} files ${used_fallback ? '(fallback – all TIFs)' : 'matching pattern'} in: ${params.input_dir}"
+
+        // --- Helper: extract a numeric timepoint from a filename ---
+        // Tries several common patterns in order:
+        //   1. t####_Channel  (original convention)
+        //   2. t#### or T####  (e.g. t0000.tif, T012_decon.tif)
+        //   3. tp#### or TP#### (e.g. tp001.tif)
+        //   4. _####. or -####. (trailing number before extension, e.g. embryo_001.tif)
+        //   5. Any digit run in the filename
+        // Returns null if nothing numeric is found.
+        def extractTimepoint = { String name ->
+            def m
+            // Pattern 1: original t####_Channel
+            m = (name =~ /(?i)t(\d+)_Channel/)
+            if (m.find()) return m.group(1).toInteger()
+            // Pattern 2: t#### or T####
+            m = (name =~ /(?i)(?:^|[^a-z])t(\d+)/)
+            if (m.find()) return m.group(1).toInteger()
+            // Pattern 3: tp#### or TP####
+            m = (name =~ /(?i)tp(\d+)/)
+            if (m.find()) return m.group(1).toInteger()
+            // Pattern 4: trailing number before extension  e.g. img_001.tif
+            m = (name =~ /[_\-\s](\d+)\.[tT][iI][fF]{1,2}$/)
+            if (m.find()) return m.group(1).toInteger()
+            // Pattern 5: first digit run anywhere in the name
+            m = (name =~ /(\d+)/)
+            if (m.find()) return m.group(1).toInteger()
+            return null
+        }
+
+        // Build (timepoint, file) tuples.  When numeric extraction fails for
+        // ALL files we fall back to alphabetical ordering.
+        def file_tuples = matched_files.collect { f ->
+            def tp = extractTimepoint(f.name)
             return [tp, f]
         }
-        // Sort by timepoint
-        file_tuples = file_tuples.sort { it[0] }
-    }
 
-    input_channel = Channel
-        .fromList(file_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) })
-        .ifEmpty { error "No TIF files could be loaded from: ${params.input_dir}" }
-        .tap { parsed_files }
+        def all_null = file_tuples.every { it[0] == null }
 
-    // Log parsed files
-    parsed_files.subscribe { timepoint, file ->
-        log.info "Found timepoint ${timepoint}: ${file.name}"
-    }
+        if (all_null) {
+            // No numeric info at all — sort alphabetically and assign 0, 1, 2, …
+            log.warn "Could not extract numeric timepoints from filenames — using alphabetical order"
+            file_tuples = file_tuples.sort { it[1].name }
+            file_tuples = file_tuples.withIndex().collect { entry, idx -> [idx, entry[1]] }
+        } else {
+            // For any file where extraction failed, assign a unique large number so
+            // it sorts to the end rather than causing a crash.
+            def max_tp = file_tuples.findAll { it[0] != null }.collect { it[0] }.max() ?: 0
+            def fallback_tp = max_tp + 1
+            file_tuples = file_tuples.collect { tp, f ->
+                if (tp == null) {
+                    log.warn "Could not extract timepoint from '${f.name}' — assigning t=${fallback_tp}"
+                    def assigned = fallback_tp
+                    fallback_tp++
+                    return [assigned, f]
+                }
+                return [tp, f]
+            }
+            // Sort by timepoint
+            file_tuples = file_tuples.sort { it[0] }
+        }
+
+        input_channel = Channel
+            .fromList(file_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) })
+            .ifEmpty { error "No TIF files could be loaded from: ${params.input_dir}" }
+            .tap { parsed_files }
+
+        // Log parsed files
+        parsed_files.subscribe { timepoint, file ->
+            log.info "Found timepoint ${timepoint}: ${file.name}"
+        }
+    } // end else (no hyperstack input)
 
     // Create channel for merge script (only needed if merge is enabled)
     if (!skip_merge) {
