@@ -313,7 +313,7 @@ process SPLIT_INPUT_FILE {
 
     input:
     path input_file
-    val channel
+    val channel_idx
 
     output:
     path "t*_Channel*.tif", emit: timepoints
@@ -328,7 +328,7 @@ process SPLIT_INPUT_FILE {
 
     echo "============================================"
     echo "Splitting hyperstack input: ${filename}"
-    echo "Channel index requested: ${channel}"
+    echo "Channel index requested: ${channel_idx}"
     echo "============================================"
 
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -354,7 +354,7 @@ import tifffile
 from pathlib import Path
 
 input_file = '${filename}'
-channel = ${channel}  # 1-based channel index, matches t####_Channel <c>.tif convention
+channel = ${channel_idx}  # 1-based channel index, matches t####_Channel <c>.tif convention
 
 print(f"Input file: {input_file}")
 print(f"Channel (1-based): {channel}")
