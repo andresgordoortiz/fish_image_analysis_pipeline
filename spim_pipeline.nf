@@ -2227,7 +2227,7 @@ workflow {
         // Resolve relative to input_dir if not absolute
         def f = new File(params.input_file)
         if (!f.isAbsolute()) {
-            f = new File(input_dir_file, params.input_file)
+            f = new File(params.input_dir, params.input_file)
         }
         if (!f.exists()) {
             error "Configured input.file does not exist: ${f}"
