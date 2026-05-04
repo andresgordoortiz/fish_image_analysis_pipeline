@@ -132,7 +132,10 @@ if (config.roi_cropping.enabled) {
 // Set defaults for skip_merge, skip_preprocessing and downscale_labels
 def skip_merge = config.output?.skip_merge ?: false
 def skip_segmentation = config.segmentation?.enabled == false
-def skip_preprocessing = config.preprocessing?.skip_preprocessing ?: false
+// Two equivalent ways to disable preprocessing:
+//   - preprocessing.enabled = false        (preferred, matches segmentation/tracking)
+//   - preprocessing.skip_preprocessing = true   (legacy)
+def skip_preprocessing = (config.preprocessing?.enabled == false) || (config.preprocessing?.skip_preprocessing ?: false)
 def preprocessed_dir = config.preprocessing?.preprocessed_dir ?: null
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
 
