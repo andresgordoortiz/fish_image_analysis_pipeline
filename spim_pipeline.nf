@@ -798,7 +798,7 @@ process RESLICE_ISOTROPIC {
 
     publishDir "${params.output_dir}/00b_isotropic",
         mode: 'copy',
-        pattern: "t*_Channel*.tif"
+        pattern: "t*_iso_Channel*.tif"
     publishDir "${params.output_dir}/logs/isotropic",
         mode: 'copy',
         pattern: "*.log"
@@ -810,7 +810,7 @@ process RESLICE_ISOTROPIC {
     path metadata_json
 
     output:
-    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_Channel*.tif"), emit: resliced
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_iso_Channel*.tif"), emit: resliced
     path "t${String.format('%04d', timepoint)}_isotropic.log", emit: log
 
     script:
@@ -860,7 +860,7 @@ print(f"Output shape: {out.shape}, dtype: {out.dtype}")
 import re
 m = re.search(r'_Channel\\s*(\\d+)', '${filename}')
 channel = m.group(1) if m else '1'
-out_name = f"t${t_formatted}_Channel {channel}.tif"
+out_name = f"t${t_formatted}_iso_Channel {channel}.tif"
 
 tifffile.imwrite(
     out_name,
