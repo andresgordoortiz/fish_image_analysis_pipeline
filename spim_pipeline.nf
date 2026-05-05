@@ -853,7 +853,9 @@ else:
     out = zoom(img, (zoom_z, 1.0, 1.0), order=1, prefilter=False)
 
 if out.dtype != np.uint16:
-    out = np.clip(out, 0, 65535).astype(np.uint16)
+    # Promote to a wide enough dtype before clipping; np.clip with bounds
+    # outside the source dtype range raises OverflowError on uint8 etc.
+    out = np.clip(out.astype(np.int32), 0, 65535).astype(np.uint16)
 print(f"Output shape: {out.shape}, dtype: {out.dtype}")
 
 # Preserve original Channel <c> filename so downstream stages keep working
