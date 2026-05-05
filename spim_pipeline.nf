@@ -155,6 +155,17 @@ def skip_preprocessing = (config.preprocessing?.enabled == false) || (config.pre
 def preprocessed_dir = config.preprocessing?.preprocessed_dir ?: null
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
 
+// Optional: limit input to the first N timepoints (after sorting). Useful when
+// late timepoints in an acquisition are unusable (sample drift, photodamage,
+// etc.) and you want to discard them without rebuilding the input dataset.
+// Accepts an integer >= 1; null/missing/<=0 means "use all timepoints".
+def max_timepoints = config.input?.max_timepoints != null \
+    ? (config.input.max_timepoints as Integer) \
+    : null
+if (max_timepoints != null && max_timepoints <= 0) {
+    max_timepoints = null
+}
+
 // When preprocessing is skipped, raw acquisitions are typically anisotropic
 // (Z spacing >> XY spacing). Cellpose-SAM with --do_3D handles anisotropy
 // internally for inference but does NOT necessarily emit masks at the input
@@ -2392,6 +2403,11 @@ workflow {
             .toSortedList { a, b -> a[0] <=> b[0] }
             .flatMap { it }
 
+        if (max_timepoints != null) {
+            log.info "Limiting input to first ${max_timepoints} timepoint(s) (input.max_timepoints)"
+            input_channel = input_channel.take(max_timepoints)
+        }
+
         input_channel.subscribe { timepoint, f ->
             log.info "Split timepoint ${timepoint}: ${f.name}"
         }
@@ -2480,6 +2496,11 @@ workflow {
             file_tuples = file_tuples.sort { it[0] }
         }
 
+        if (max_timepoints != null && file_tuples.size() > max_timepoints) {
+            log.info "Limiting input to first ${max_timepoints} of ${file_tuples.size()} timepoint(s) (input.max_timepoints)"
+            file_tuples = file_tuples.take(max_timepoints)
+        }
+
         input_channel = Channel
             .fromList(file_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) })
             .ifEmpty { error "No TIF files could be loaded from: ${params.input_dir}" }
@@ -2546,17 +2567,24 @@ workflow {
 
             log.info "Found ${preproc_files.size()} preprocessed files in: ${preprocessed_dir}"
 
-            // Extract timepoints from filenames (e.g. t0000_processed.tif)
+            // Sort by extracted timepoint and apply max_timepoints limit
+            // before building the channel.
+            def preproc_tuples = preproc_files.collect { f ->
+                def m = (f.name =~ /(?i)t(\d+)/)
+                def tp = m.find() ? m.group(1).toInteger() : null
+                if (tp == null) {
+                    log.warn "Could not extract timepoint from preprocessed file: ${f.name}"
+                }
+                return [tp, f]
+            }.findAll { it[0] != null }.sort { it[0] }
+
+            if (max_timepoints != null && preproc_tuples.size() > max_timepoints) {
+                log.info "Limiting preprocessed input to first ${max_timepoints} of ${preproc_tuples.size()} timepoint(s) (input.max_timepoints)"
+                preproc_tuples = preproc_tuples.take(max_timepoints)
+            }
+
             segmentation_input = Channel
-                .fromList(preproc_files.collect { f ->
-                    def m = (f.name =~ /(?i)t(\d+)/)
-                    def tp = m.find() ? m.group(1).toInteger() : null
-                    if (tp == null) {
-                        log.warn "Could not extract timepoint from preprocessed file: ${f.name}"
-                    }
-                    return tuple(tp, file(f.toPath()))
-                })
-                .filter { it[0] != null }
+                .fromList(preproc_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) })
                 .ifEmpty { error "No preprocessed files with recognizable timepoint numbers found in: ${preprocessed_dir}" }
         } else {
             // No preprocessed_dir — use raw input images directly

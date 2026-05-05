@@ -8,7 +8,9 @@
 
   "input": {
     "directory": "./subset/",
-    "channel": 2
+    "channel": 2,
+    "_comment_max_timepoints": "Optional. Use only the first N timepoints (after sorting). Set to null or omit to use all. Useful when late timepoints are unusable.",
+    "max_timepoints": null
   },
 
   "output": {
