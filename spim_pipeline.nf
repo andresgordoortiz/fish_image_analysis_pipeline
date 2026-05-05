@@ -155,6 +155,18 @@ def skip_preprocessing = (config.preprocessing?.enabled == false) || (config.pre
 def preprocessed_dir = config.preprocessing?.preprocessed_dir ?: null
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
 
+// When preprocessing is skipped, raw acquisitions are typically anisotropic
+// (Z spacing >> XY spacing). Cellpose-SAM with --do_3D handles anisotropy
+// internally for inference but does NOT necessarily emit masks at the input
+// shape, so the segmented hyperstack and the raw hyperstack may end up with
+// different Z dimensions. This flag enables a lightweight Z-only linear
+// resampling that makes voxels isotropic on the way in, so raw, segmented
+// and tracked outputs all share the same XYZ shape and can be overlaid.
+// Default: true when skip_preprocessing is on, false otherwise.
+def isotropic_reslice = config.preprocessing?.isotropic_reslice != null \
+    ? (config.preprocessing.isotropic_reslice as Boolean) \
+    : skip_preprocessing
+
 // Validate skip_preprocessing config
 if (skip_preprocessing) {
     if (skip_segmentation) {
@@ -770,6 +782,102 @@ PYTHON_CROP_SCRIPT
     echo "✓ Output: t${t_formatted}_cropped.tif"
     FILE_SIZE=\$(du -h t${t_formatted}_cropped.tif | cut -f1)
     echo "✓ File size: \$FILE_SIZE"
+    """
+}
+
+// ============================================================================
+// PROCESS: Isotropic Z reslicing (lightweight; used when full preprocessing
+// is skipped but you still need Z to match XY for overlaying raw + tracks)
+// ============================================================================
+
+process RESLICE_ISOTROPIC {
+    tag "t${String.format('%04d', timepoint)}"
+
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    publishDir "${params.output_dir}/00b_isotropic",
+        mode: 'copy',
+        pattern: "t*_Channel*.tif"
+    publishDir "${params.output_dir}/logs/isotropic",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    tuple val(timepoint), path(image_file)
+    path metadata_json
+
+    output:
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_Channel*.tif"), emit: resliced
+    path "t${String.format('%04d', timepoint)}_isotropic.log", emit: log
+
+    script:
+    def t_formatted = String.format('%04d', timepoint)
+    def filename = image_file.name
+    """
+    #!/bin/bash
+    set -euo pipefail
+    exec > >(tee t${t_formatted}_isotropic.log) 2>&1
+
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    python3 << 'PYTHON_EOF'
+import json
+import sys
+import numpy as np
+import tifffile
+from scipy.ndimage import zoom
+
+with open('${metadata_json}', 'r') as f:
+    metadata = json.load(f)
+
+xy_pixel = float(metadata['x_resolution_um'])
+z_pixel = float(metadata['imagej']['spacing']) if 'imagej' in metadata else 1.0
+print(f"XY pixel size: {xy_pixel:.4f} um")
+print(f"Z  pixel size: {z_pixel:.4f} um")
+
+img = tifffile.imread('${filename}')
+if img.ndim != 3:
+    raise SystemExit(f"Expected 3D ZYX input, got shape {img.shape}")
+print(f"Input shape: {img.shape}, dtype: {img.dtype}")
+
+zoom_z = z_pixel / xy_pixel
+if abs(zoom_z - 1.0) < 1e-3:
+    print("Already isotropic, copying through.")
+    out = img
+else:
+    print(f"Z zoom factor: {zoom_z:.4f}  ({img.shape[0]} -> ~{int(round(img.shape[0]*zoom_z))} slices)")
+    out = zoom(img, (zoom_z, 1.0, 1.0), order=1, prefilter=False)
+
+if out.dtype != np.uint16:
+    out = np.clip(out, 0, 65535).astype(np.uint16)
+print(f"Output shape: {out.shape}, dtype: {out.dtype}")
+
+# Preserve original Channel <c> filename so downstream stages keep working
+import re
+m = re.search(r'_Channel\\s*(\\d+)', '${filename}')
+channel = m.group(1) if m else '1'
+out_name = f"t${t_formatted}_Channel {channel}.tif"
+
+tifffile.imwrite(
+    out_name,
+    out,
+    imagej=True,
+    resolution=(1.0/xy_pixel, 1.0/xy_pixel),
+    metadata={
+        'spacing': xy_pixel,
+        'unit': 'um',
+        'axes': 'ZYX',
+        'TimePoint': ${timepoint},
+        'WasROICropped': metadata.get('was_roi_cropped', False),
+        'IsotropicResliced': True,
+    },
+)
+print(f"Wrote {out_name}")
+PYTHON_EOF
     """
 }
 
@@ -2450,8 +2558,14 @@ workflow {
                 .ifEmpty { error "No preprocessed files with recognizable timepoint numbers found in: ${preprocessed_dir}" }
         } else {
             // No preprocessed_dir — use raw input images directly
-            log.info "Preprocessing SKIPPED — using raw input images for segmentation"
-            segmentation_input = processing_input
+            if (isotropic_reslice) {
+                log.info "Preprocessing SKIPPED — applying lightweight isotropic Z reslicing only (preprocessing.isotropic_reslice=true)"
+                RESLICE_ISOTROPIC(processing_input, shared_metadata)
+                segmentation_input = RESLICE_ISOTROPIC.out.resliced
+            } else {
+                log.info "Preprocessing SKIPPED — using raw input images for segmentation (no isotropic reslicing)"
+                segmentation_input = processing_input
+            }
         }
 
     } else {

@@ -37,6 +37,8 @@
 
   "preprocessing": {
     "enabled": true,
+    "_comment_isotropic_reslice": "When enabled=false, lightly resample Z so voxels become isotropic (XY pixel size). Lets raw + segmented + tracks share the same shape for overlay. Defaults to true when preprocessing is skipped, false when full preprocessing runs (because full preprocessing already reslices).",
+    "isotropic_reslice": true,
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
     "image_scaling": 0.33,
     "save_intermediates": true,
