@@ -34,12 +34,34 @@ echo "Modules loaded: nextflow $(nextflow -version 2>&1 | grep -oP 'version \K\S
 # Re-enable strict error handling for the rest of the script
 set -e
 
-# Configuration file - only use $1 as config if it doesn't start with '-'
-if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
-    CONFIG_JSON="$1"
-    shift 1
+# Configuration file - REQUIRED as first positional argument.
+# Any additional args are forwarded verbatim to `nextflow run`.
+if [ $# -lt 1 ] || [[ "$1" == -* ]]; then
+    echo "ERROR: missing required config.json argument"
+    echo ""
+    echo "Usage: sbatch submit_pipeline.sh <path/to/config.json> [extra nextflow args...]"
+    echo "   or: ./submit_pipeline.sh   <path/to/config.json> [extra nextflow args...]"
+    exit 1
+fi
+
+CONFIG_JSON="$1"
+shift 1
+
+if [ ! -f "$CONFIG_JSON" ]; then
+    echo "ERROR: config file not found: $CONFIG_JSON"
+    exit 1
+fi
+
+# Resolve to an absolute path so that:
+#   1. Nextflow (which may be launched from a different working directory)
+#      can always find the file.
+#   2. The path printed in logs is unambiguous.
+# `realpath` is available on the HPC images we use; fall back to a python
+# one-liner if not.
+if command -v realpath &>/dev/null; then
+    CONFIG_JSON="$(realpath "$CONFIG_JSON")"
 else
-    CONFIG_JSON="./config.json"
+    CONFIG_JSON="$(python3 -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$CONFIG_JSON")"
 fi
 
 EXTRA_NXF_ARGS="${@}"
