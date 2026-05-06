@@ -855,6 +855,25 @@ if img.ndim != 3:
     raise SystemExit(f"Expected 3D ZYX input, got shape {img.shape}")
 print(f"Input shape: {img.shape}, dtype: {img.dtype}")
 
+# Defensive: refuse to reslice an already-resliced file. This protects
+# against accidental reuse of published outputs as new inputs (e.g. when
+# pointing input.directory at a folder that contains prior pipeline outputs).
+already_iso = False
+try:
+    with tifffile.TiffFile('${filename}') as _t:
+        _ij = _t.imagej_metadata or {}
+        if _ij.get('IsotropicResliced'):
+            already_iso = True
+except Exception:
+    pass
+if already_iso:
+    raise SystemExit(
+        "Refusing to reslice: input already has 'IsotropicResliced=True' in its "
+        "ImageJ metadata. This usually means you fed published reslice outputs "
+        "back in as raw input. Wipe the published 00b_isotropic/ directory and "
+        "re-run from clean inputs."
+    )
+
 zoom_z = z_pixel / xy_pixel
 if abs(zoom_z - 1.0) < 1e-3:
     print("Already isotropic, copying through.")

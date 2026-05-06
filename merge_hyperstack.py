@@ -61,10 +61,36 @@ def write_tiff_hyperstack_streaming(
         json.dump(hyperstack_meta, fh, indent=2)
 
     T = len(seg_files)
-    # Get shape from first file
-    with tifffile.TiffFile(str(seg_files[0])) as tf:
-        Z = len(tf.pages)
-        Y, X = tf.pages[0].shape
+    # Pre-scan all per-timepoint files to find a CONSISTENT (Z, Y, X) shape.
+    # Cellpose / reslicing can produce slightly different Z per timepoint
+    # (e.g. 144 vs 145 due to rounding), and ImageJ hyperstack format strictly
+    # requires uniform Z. We pick max Z and zero-pad shorter stacks; we abort
+    # hard on XY mismatches because those indicate a real data problem.
+    print("Pre-scanning per-timepoint shapes...")
+    shapes = []
+    for fp in seg_files:
+        with tifffile.TiffFile(str(fp)) as tf:
+            shapes.append((len(tf.pages), tf.pages[0].shape[0], tf.pages[0].shape[1]))
+    zs = sorted({s[0] for s in shapes})
+    ys = sorted({s[1] for s in shapes})
+    xs = sorted({s[2] for s in shapes})
+    if len(ys) != 1 or len(xs) != 1:
+        # Surface the offending files so the user can clean them up.
+        bad = [(fp.name, s) for fp, s in zip(seg_files, shapes)
+               if (s[1], s[2]) != (shapes[0][1], shapes[0][2])][:10]
+        raise SystemExit(
+            f"XY size is not uniform across timepoints: Y={ys}, X={xs}. "
+            f"First few mismatches: {bad}. "
+            f"Wipe stale files in the publish dir and re-run."
+        )
+    Z = max(zs)
+    Y, X = ys[0], xs[0]
+    if len(zs) > 1:
+        from collections import Counter
+        z_dist = Counter(s[0] for s in shapes)
+        print(f"  WARNING: per-timepoint Z varies: {dict(z_dist)} -> padding all to Z={Z}")
+    else:
+        print(f"  Per-timepoint shape uniform: Z={Z}, Y={Y}, X={X}")
 
     # Estimate file size
     estimated_gb = (T * Z * Y * X * 2) / (1024**3)  # uint16 = 2 bytes
@@ -107,6 +133,16 @@ max=65535.0
             # Ensure data is 3D (Z, Y, X)
             if data.ndim == 2:
                 data = data[np.newaxis, :, :]
+
+            # Pad with zeros along Z if this timepoint is shorter than the
+            # global Z (keeps hyperstack metadata/strides consistent).
+            if data.shape[0] < Z:
+                pad = np.zeros((Z - data.shape[0], data.shape[1], data.shape[2]),
+                               dtype=data.dtype)
+                data = np.concatenate([data, pad], axis=0)
+            elif data.shape[0] > Z:
+                # Should not happen because Z = max, but truncate defensively.
+                data = data[:Z]
 
             # Flip Y if needed (axis 1 is Y in ZYX)
             if need_flip:
