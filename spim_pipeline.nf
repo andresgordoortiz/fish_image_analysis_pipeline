@@ -2146,7 +2146,10 @@ process ULTRACK_EXPORT {
     path metadata_toml
 
     output:
-    path "results/**", emit: results
+    // Publish the entire results/ directory as-is. Using "results/**" drops
+    // dotfiles (e.g. zarr's .zarray, .zgroup, .zattrs) on some Nextflow
+    // versions / filesystems, which silently breaks downstream zarr readers.
+    path "results", emit: results
     path "ultrack_export.log", emit: log
 
     container params.ultrack_container
