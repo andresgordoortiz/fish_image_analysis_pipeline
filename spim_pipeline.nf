@@ -1127,9 +1127,13 @@ process PREPROCESS_DECONVOLVE {
     maxRetries 2
     errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
+    // Only publish per-timepoint preprocessed TIFFs when the 4D hyperstack
+    // merge is disabled. Otherwise the same data ends up in publishDir twice
+    // (once per timepoint, once inside 4D_hyperstack_processed.tif).
     publishDir "${params.output_dir}/01_preprocessed",
         mode: 'copy',
-        pattern: "*_processed.tif"
+        pattern: "*_processed.tif",
+        enabled: skip_merge
 
     publishDir "${params.output_dir}/logs/preprocessing",
         mode: 'copy',
@@ -1390,9 +1394,13 @@ process CELLPOSE_SEGMENT {
     maxRetries 2
     errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
+    // Only publish per-timepoint segmented TIFFs when the 4D hyperstack
+    // merge is disabled. Otherwise the same data ends up in publishDir twice
+    // (once per timepoint, once inside 4D_hyperstack_segmented.tif).
     publishDir "${params.output_dir}/02_segmented",
         mode: 'copy',
-        pattern: "*_segmented.tif"
+        pattern: "*_segmented.tif",
+        enabled: skip_merge
 
     publishDir "${params.output_dir}/logs/segmentation",
         mode: 'copy',
@@ -1805,7 +1813,11 @@ process BENCHMARK {
 
     input:
     val results_dir
-    val ready_signal  // dummy signal to ensure upstream processes are done
+    // Optional staged files (used as a fallback when per-timepoint TIFFs are
+    // NOT published to results_dir, e.g. when output.skip_merge=false).
+    // When the lists are empty, benchmark reads from results_dir directly.
+    path(processed_staged, stageAs: 'staged/01_preprocessed/*')
+    path(segmented_staged, stageAs: 'staged/02_segmented/*')
     path benchmark_script
 
     output:
@@ -1814,6 +1826,9 @@ process BENCHMARK {
     path "benchmark.log", emit: log, optional: true
 
     script:
+    def n_staged_proc = (processed_staged instanceof List) ? processed_staged.size() : (processed_staged ? 1 : 0)
+    def n_staged_seg  = (segmented_staged instanceof List) ? segmented_staged.size() : (segmented_staged ? 1 : 0)
+    def use_staged = (n_staged_proc + n_staged_seg) > 0
     """
     #!/bin/bash
     set -uo pipefail
@@ -1825,32 +1840,45 @@ process BENCHMARK {
     echo "============================================"
     echo "Running Pipeline Benchmark"
     echo "============================================"
-    echo "Results directory: ${results_dir}"
     echo "Python: \$(which python3)"
     echo ""
 
-    # Check files exist in the publishDir
+    # Decide source: staged work-dir files (when per-timepoint files were
+    # NOT published) vs the publishDir (when they were).
+    USE_STAGED=${use_staged ? 1 : 0}
+
+    if [ "\$USE_STAGED" -eq 1 ]; then
+        BENCH_DIR="\$PWD/staged"
+        echo "Using STAGED inputs from work dir: \$BENCH_DIR"
+        echo "  (per-timepoint TIFFs are not in publishDir because merge is enabled)"
+        mkdir -p staged/01_preprocessed staged/02_segmented
+    else
+        BENCH_DIR="${results_dir}"
+        echo "Using PUBLISHED inputs from: \$BENCH_DIR"
+    fi
+    echo ""
+
     echo "=== Preprocessed files ==="
-    ls -lh ${results_dir}/01_preprocessed/*_processed.tif 2>/dev/null | head -10 || echo "  (none found)"
-    PREPROC_COUNT=\$(ls ${results_dir}/01_preprocessed/*_processed.tif 2>/dev/null | wc -l | tr -d ' ')
+    ls -lh "\$BENCH_DIR"/01_preprocessed/*_processed.tif 2>/dev/null | head -10 || echo "  (none found)"
+    PREPROC_COUNT=\$(ls "\$BENCH_DIR"/01_preprocessed/*_processed.tif 2>/dev/null | wc -l | tr -d ' ')
     echo "Total preprocessed: \$PREPROC_COUNT"
     echo ""
 
     echo "=== Segmented files ==="
-    ls -lh ${results_dir}/02_segmented/*_segmented.tif 2>/dev/null | head -10 || echo "  (none found)"
-    SEG_COUNT=\$(ls ${results_dir}/02_segmented/*_segmented.tif 2>/dev/null | wc -l | tr -d ' ')
+    ls -lh "\$BENCH_DIR"/02_segmented/*_segmented.tif 2>/dev/null | head -10 || echo "  (none found)"
+    SEG_COUNT=\$(ls "\$BENCH_DIR"/02_segmented/*_segmented.tif 2>/dev/null | wc -l | tr -d ' ')
     echo "Total segmented: \$SEG_COUNT"
     echo ""
 
     if [ "\$PREPROC_COUNT" -eq 0 ] && [ "\$SEG_COUNT" -eq 0 ]; then
-        echo "ERROR: No pipeline output files found in ${results_dir}"
+        echo "ERROR: No pipeline output files found in \$BENCH_DIR"
         echo "Check that preprocessing and segmentation completed successfully."
         exit 1
     fi
 
     # Sample up to 3 timepoints for fast benchmarking
     # Find timepoint numbers from filenames and pick first, middle, last
-    TIMEPOINTS=\$(ls ${results_dir}/01_preprocessed/*_processed.tif 2>/dev/null \\
+    TIMEPOINTS=\$(ls "\$BENCH_DIR"/01_preprocessed/*_processed.tif 2>/dev/null \\
         | sed 's/.*\\/t\\([0-9]*\\)_.*/\\1/' \\
         | sort -n)
 
@@ -1873,7 +1901,7 @@ process BENCHMARK {
 
     # Run benchmark (output goes to stdout so .command.out gets it in real-time)
     python3 ${benchmark_script.name} \\
-        --results_dir ${results_dir}/ \\
+        --results_dir "\$BENCH_DIR/" \\
         --labels "pipeline_run" \\
         --output_csv benchmark_results.csv \\
         --output_json benchmark_results.json \\
@@ -2797,17 +2825,29 @@ workflow {
 
             // Resolve output_dir to absolute path (it may be relative like './results/')
             def abs_output_dir = file(params.output_dir).toAbsolutePath().toString()
-            log.info "Benchmark will read from: ${abs_output_dir}"
 
-            // Wait for segmentation to finish, then run benchmark on the publishDir directly.
-            // This avoids staging hundreds of GB of TIF files into the benchmark work dir.
-            ready_signal = CELLPOSE_SEGMENT.out.segmented
-                .map { timepoint, segmented_file -> true }
-                .collect()
+            // When per-timepoint TIFFs are NOT published (merge enabled), stage
+            // them from the work dir so benchmark can still read them. When
+            // they ARE published (skip_merge=true), pass empty lists and let
+            // benchmark read directly from publishDir to avoid staging GBs.
+            if (skip_merge) {
+                log.info "Benchmark will read per-timepoint TIFFs from publishDir: ${abs_output_dir}"
+                proc_for_bench = Channel.value([])
+                seg_for_bench  = Channel.value([])
+            } else {
+                log.info "Benchmark will stage per-timepoint TIFFs from work dir (merge enabled, files not in publishDir)"
+                proc_for_bench = segmentation_input
+                    .map { timepoint, f -> f }
+                    .collect()
+                seg_for_bench = CELLPOSE_SEGMENT.out.segmented
+                    .map { timepoint, f -> f }
+                    .collect()
+            }
 
             BENCHMARK(
                 abs_output_dir,
-                ready_signal,
+                proc_for_bench,
+                seg_for_bench,
                 benchmark_script_ch.collect()
             )
         } else {
