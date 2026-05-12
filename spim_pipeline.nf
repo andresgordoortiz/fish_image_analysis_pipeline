@@ -325,6 +325,10 @@ process SPLIT_INPUT_FILE {
     maxRetries 0
     errorStrategy 'terminate'
 
+    // Splitting parallelises across timepoints with a thread pool. Allow the
+    // user to override via process.cpus in nextflow.config; default 4.
+    cpus { params.split_cpus ?: 4 }
+
     publishDir "${params.output_dir}/00_split_input",
         mode: 'copy',
         pattern: "t*_Channel*.tif"
@@ -358,6 +362,10 @@ process SPLIT_INPUT_FILE {
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
 
+    # Expose Nextflow's CPU allocation to the Python splitter so it can size
+    # its thread pool appropriately.
+    export NXF_TASK_CPUS=${task.cpus}
+
     python3 --version
 
     # czifile is a small pure-python lib that handles most CZI files.
@@ -369,18 +377,32 @@ process SPLIT_INPUT_FILE {
         }
     fi
 
+    # zarr is required for lazy, low-memory TIFF hyperstack splitting.
+    python3 -c "import zarr" 2>/dev/null || {
+        echo "Installing zarr (for lazy TIFF reads)..."
+        pip install 'zarr<3' --break-system-packages || pip install zarr --break-system-packages
+    }
+
     python3 << 'PYTHON_SPLIT_SCRIPT'
 import sys
 import os
 import numpy as np
 import tifffile
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 input_file = '${filename}'
 channel = ${channel_idx}  # 1-based channel index, matches t####_Channel <c>.tif convention
 
+# Use Nextflow-allocated CPU count for parallel per-timepoint writes.
+# Fall back to a conservative default if the env var is missing.
+try:
+    n_workers = max(1, int(os.environ.get('NXF_TASK_CPUS', os.cpu_count() or 1)))
+except Exception:
+    n_workers = 1
 print(f"Input file: {input_file}")
 print(f"Channel (1-based): {channel}")
+print(f"Worker threads:    {n_workers}")
 
 if channel < 1:
     print(f"ERROR: channel must be >= 1 (got {channel})", file=sys.stderr)
@@ -391,84 +413,145 @@ ch_idx = channel - 1  # 0-based index into the C axis
 ext = Path(input_file).suffix.lower()
 
 
+def _to_uint16(arr):
+    """Cast/clip a 3D stack to uint16 without doubling memory unnecessarily."""
+    if arr.dtype == np.uint16:
+        return arr
+    if arr.dtype.kind == 'f' or (arr.dtype.itemsize > 2 and arr.dtype.kind in ('u', 'i')):
+        return np.clip(arr, 0, 65535).astype(np.uint16)
+    return arr.astype(np.uint16, copy=False)
+
+
 def save_timepoint(stack3d, t_idx, channel):
-    \"\"\"Save a 3D ZYX stack as t####_Channel <c>.tif (ImageJ hyperstack).\"\"\"
+    """Save a 3D ZYX stack as t####_Channel <c>.tif (ImageJ hyperstack)."""
     out_name = f"t{t_idx:04d}_Channel {channel}.tif"
-    # Cast to uint16 if it's not already an integer type
-    if stack3d.dtype.kind == 'f':
-        # Clip to uint16 range to avoid overflow
-        stack3d = np.clip(stack3d, 0, 65535).astype(np.uint16)
-    elif stack3d.dtype.itemsize > 2 and stack3d.dtype.kind in ('u', 'i'):
-        stack3d = np.clip(stack3d, 0, 65535).astype(np.uint16)
+    stack3d = _to_uint16(stack3d)
     tifffile.imwrite(
         out_name,
         stack3d,
         imagej=True,
         metadata={'axes': 'ZYX'},
     )
-    print(f"  -> {out_name}  shape={stack3d.shape} dtype={stack3d.dtype}")
+    print(f"  -> {out_name}  shape={stack3d.shape} dtype={stack3d.dtype}", flush=True)
 
 
 def split_czi(path, channel):
+    """Stream-split a CZI hyperstack one timepoint at a time.
+
+    czifile.CziFile.asarray() materialises the entire 5D array in RAM, which
+    is infeasible for multi-hundred-GB acquisitions. Instead we walk the
+    subblock directory and, for each timepoint of the requested channel,
+    allocate only a (Z, Y, X) buffer and fill it from the relevant subblocks.
+    Timepoints are processed in parallel using a thread pool — reads are
+    I/O-bound and tifffile/czifile release the GIL on bulk decode, so threads
+    keep peak RAM bounded to ~n_workers * (Z*Y*X*dtype) bytes.
+    """
     import czifile
-    print("Reading CZI metadata...")
-    with czifile.CziFile(path) as czi:
+
+    print("Reading CZI metadata (no full-array load)...")
+    czi = czifile.CziFile(path)
+    try:
         axes = czi.axes  # e.g. 'BCTZYX0' or 'STCZYX'
         shape = czi.shape
+        dtype = np.dtype(czi.dtype)
         print(f"  CZI axes:  {axes}")
         print(f"  CZI shape: {shape}")
+        print(f"  CZI dtype: {dtype}")
 
-        data = czi.asarray()
-    print(f"  Loaded array shape: {data.shape}, dtype: {data.dtype}")
+        # Map axis name -> index into czi.shape / subblock start vectors
+        axis_index = {a: i for i, a in enumerate(axes)}
 
-    # Squeeze trailing singleton sample axis ("0") and any size-1 axes that
-    # aren't T/C/Z/Y/X
-    keep = []
-    new_axes = ''
-    for ax, sz in zip(axes, data.shape):
-        if ax in ('T', 'C', 'Z', 'Y', 'X'):
-            keep.append(slice(None))
-            new_axes += ax
-        else:
-            # Take first index of any other axis (B, S, M, V, 0, ...)
-            keep.append(0)
-    data = data[tuple(keep)]
-    print(f"  After squeezing extra axes: shape={data.shape}, axes={new_axes}")
+        def axis_size(a, default=1):
+            return shape[axis_index[a]] if a in axis_index else default
 
-    # Move axes to canonical TCZYX order (insert size-1 dims if missing)
-    for needed in 'TCZYX':
-        if needed not in new_axes:
-            data = np.expand_dims(data, axis=0)
-            new_axes = needed + new_axes
-    order = [new_axes.index(a) for a in 'TCZYX']
-    data = np.transpose(data, order)
-    print(f"  Canonical TCZYX shape: {data.shape}")
+        nT = axis_size('T')
+        nC = axis_size('C')
+        nZ = axis_size('Z')
+        nY = axis_size('Y')
+        nX = axis_size('X')
 
-    nT, nC, nZ, nY, nX = data.shape
-    if ch_idx < 0 or ch_idx >= nC:
-        raise ValueError(f"Channel {channel} out of range (file has {nC} channels: 1..{nC})")
+        if ch_idx < 0 or ch_idx >= nC:
+            raise ValueError(f"Channel {channel} out of range (file has {nC} channels: 1..{nC})")
 
-    print(f"Splitting {nT} timepoints (channel {channel} of {nC})...")
-    for t in range(nT):
-        save_timepoint(data[t, ch_idx], t, channel)
+        # Group subblock directory entries by timepoint for the requested channel.
+        # Each DirectoryEntry has `.start` (one int per axis in czi.axes order)
+        # and `.shape` plus a `.data_segment().data()` accessor.
+        t_axis = axis_index.get('T')
+        c_axis = axis_index.get('C')
+        z_axis = axis_index.get('Z')
+        y_axis = axis_index['Y']
+        x_axis = axis_index['X']
+
+        from collections import defaultdict
+        per_t_entries = defaultdict(list)
+        for entry in czi.filtered_subblock_directory:
+            if c_axis is not None and entry.start[c_axis] != ch_idx:
+                continue
+            t = entry.start[t_axis] if t_axis is not None else 0
+            per_t_entries[t].append(entry)
+
+        if not per_t_entries:
+            raise RuntimeError("No subblocks found for requested channel")
+
+        print(f"Splitting {nT} timepoints (channel {channel} of {nC}) "
+              f"with {n_workers} worker thread(s)...")
+
+        def process_timepoint(t):
+            entries = per_t_entries.get(t, [])
+            if not entries:
+                raise RuntimeError(f"No subblocks for timepoint {t}")
+            # Allocate ONE timepoint at a time: (Z, Y, X)
+            buf = np.zeros((nZ, nY, nX), dtype=dtype)
+            for entry in entries:
+                z = entry.start[z_axis] if z_axis is not None else 0
+                y = entry.start[y_axis]
+                x = entry.start[x_axis]
+                # Subblock data is shaped to match entry.shape across czi.axes;
+                # squeeze it down to (sz, sy, sx).
+                tile = entry.data_segment().data()
+                # tile.shape mirrors czi.axes; collapse all non-ZYX axes (size 1)
+                sl = []
+                for a, sz in zip(axes, tile.shape):
+                    if a in ('Z', 'Y', 'X'):
+                        sl.append(slice(None))
+                    else:
+                        sl.append(0)
+                tile = tile[tuple(sl)]
+                if tile.ndim == 2:
+                    tile = tile[None, ...]
+                sz, sy, sx = tile.shape
+                buf[z:z + sz, y:y + sy, x:x + sx] = tile
+            save_timepoint(buf, t, channel)
+            return t
+
+        timepoints = sorted(per_t_entries.keys())
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futs = {ex.submit(process_timepoint, t): t for t in timepoints}
+            for fut in as_completed(futs):
+                fut.result()  # propagate exceptions
+    finally:
+        czi.close()
 
 
 def split_tiff(path, channel):
-    print("Reading TIFF metadata...")
+    """Stream-split a TIFF hyperstack one timepoint at a time using tifffile's
+    zarr store, which performs lazy per-page reads instead of loading the
+    whole series into RAM."""
+    print("Reading TIFF metadata (lazy zarr store)...")
     with tifffile.TiffFile(path) as tif:
         series = tif.series[0]
         axes = series.axes  # e.g. 'TZYX', 'TCZYX', 'ZYX'
         shape = series.shape
         print(f"  TIFF series axes:  {axes}")
         print(f"  TIFF series shape: {shape}")
-        # Per-timepoint files are 3D (ZYX or YX) — no splitting needed
+
+        # Per-timepoint files are 3D (ZYX or YX) — no splitting needed.
         if 'T' not in axes:
             print("  No T axis -> file is already a single timepoint, copying as t0000.")
             data = series.asarray()
             if data.ndim == 2:
                 data = data[None, ...]  # YX -> 1YX
             if 'C' in axes:
-                # Reduce channel dim by selecting requested index (1-based)
                 c_axis = axes.index('C')
                 nC_here = data.shape[c_axis]
                 if ch_idx < 0 or ch_idx >= nC_here:
@@ -477,27 +560,70 @@ def split_tiff(path, channel):
             save_timepoint(data, 0, channel)
             return
 
-        data = series.asarray()
-    print(f"  Loaded array shape: {data.shape}, dtype: {data.dtype}")
+        # Open the series as a (read-only) zarr store. Slicing this store only
+        # reads the needed TIFF pages from disk, so peak RAM stays at one
+        # timepoint per worker thread instead of the whole hyperstack.
+        try:
+            import zarr
+            store = series.aszarr()
+            zarr_arr = zarr.open(store, mode='r')
+            use_zarr = True
+        except Exception as e:
+            print(f"  WARNING: zarr-backed lazy access unavailable ({e}); "
+                  f"falling back to per-page reads.")
+            use_zarr = False
+            zarr_arr = None
 
-    # Insert missing axes so we end up with canonical TCZYX
-    new_axes = axes
-    arr = data
-    for needed in 'TCZYX':
-        if needed not in new_axes:
-            arr = np.expand_dims(arr, axis=0)
-            new_axes = needed + new_axes
-    order = [new_axes.index(a) for a in 'TCZYX']
-    arr = np.transpose(arr, order)
-    print(f"  Canonical TCZYX shape: {arr.shape}")
+        # Build axis index map
+        axis_index = {a: i for i, a in enumerate(axes)}
+        nT = shape[axis_index['T']]
+        nC = shape[axis_index['C']] if 'C' in axis_index else 1
+        if ch_idx < 0 or ch_idx >= nC:
+            raise ValueError(f"Channel {channel} out of range (file has {nC} channels: 1..{nC})")
 
-    nT, nC, nZ, nY, nX = arr.shape
-    if ch_idx < 0 or ch_idx >= nC:
-        raise ValueError(f"Channel {channel} out of range (file has {nC} channels: 1..{nC})")
+        def slice_for_t(t):
+            """Build an indexing tuple selecting (t, ch_idx) from the lazy array."""
+            idx = []
+            for a in axes:
+                if a == 'T':
+                    idx.append(t)
+                elif a == 'C':
+                    idx.append(ch_idx)
+                else:
+                    idx.append(slice(None))
+            return tuple(idx)
 
-    print(f"Splitting {nT} timepoints (channel {channel} of {nC})...")
-    for t in range(nT):
-        save_timepoint(arr[t, ch_idx], t, channel)
+        print(f"Splitting {nT} timepoints (channel {channel} of {nC}) "
+              f"with {n_workers} worker thread(s)...")
+
+        if use_zarr:
+            # tifffile's zarr store is thread-safe for independent reads.
+            def process_timepoint(t):
+                stack = np.asarray(zarr_arr[slice_for_t(t)])
+                # Ensure ZYX layout
+                if stack.ndim == 2:
+                    stack = stack[None, ...]
+                save_timepoint(stack, t, channel)
+                return t
+
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futs = {ex.submit(process_timepoint, t): t for t in range(nT)}
+                for fut in as_completed(futs):
+                    fut.result()
+        else:
+            # Fallback: read each timepoint sequentially via series.asarray
+            # with explicit indexing — still avoids loading the full stack.
+            for t in range(nT):
+                stack = series.asarray(key=t) if 'C' not in axes else None
+                if stack is None:
+                    # Generic path: read full timepoint slab then index channel
+                    raise RuntimeError(
+                        "Lazy TIFF access requires the 'zarr' package; "
+                        "please install zarr in the container."
+                    )
+                if stack.ndim == 2:
+                    stack = stack[None, ...]
+                save_timepoint(stack, t, channel)
 
 
 try:
