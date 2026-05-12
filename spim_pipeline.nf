@@ -413,8 +413,8 @@ def resolve_channel(n_channels_in_file, cfg):
             return 1, 0
         raise ValueError(
             f"File has {n_channels_in_file} channels but 'input.channel' is not set "
-            f"in config.json. Please add \"channel\": <1..{n_channels_in_file}> "
-            f"under the \"input\" section."
+            f"in config.json. Please add 'channel': <1..{n_channels_in_file}> "
+            f"under the 'input' section."
         )
     if cfg < 1:
         raise ValueError(f"channel must be >= 1 (got {cfg})")
