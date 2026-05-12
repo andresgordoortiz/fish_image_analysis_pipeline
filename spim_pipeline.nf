@@ -414,7 +414,7 @@ ext = Path(input_file).suffix.lower()
 
 
 def _to_uint16(arr):
-    """Cast/clip a 3D stack to uint16 without doubling memory unnecessarily."""
+    '''Cast/clip a 3D stack to uint16 without doubling memory unnecessarily.'''
     if arr.dtype == np.uint16:
         return arr
     if arr.dtype.kind == 'f' or (arr.dtype.itemsize > 2 and arr.dtype.kind in ('u', 'i')):
@@ -423,7 +423,7 @@ def _to_uint16(arr):
 
 
 def save_timepoint(stack3d, t_idx, channel):
-    """Save a 3D ZYX stack as t####_Channel <c>.tif (ImageJ hyperstack)."""
+    '''Save a 3D ZYX stack as t####_Channel <c>.tif (ImageJ hyperstack).'''
     out_name = f"t{t_idx:04d}_Channel {channel}.tif"
     stack3d = _to_uint16(stack3d)
     tifffile.imwrite(
@@ -436,16 +436,16 @@ def save_timepoint(stack3d, t_idx, channel):
 
 
 def split_czi(path, channel):
-    """Stream-split a CZI hyperstack one timepoint at a time.
+    '''Stream-split a CZI hyperstack one timepoint at a time.
 
     czifile.CziFile.asarray() materialises the entire 5D array in RAM, which
     is infeasible for multi-hundred-GB acquisitions. Instead we walk the
     subblock directory and, for each timepoint of the requested channel,
     allocate only a (Z, Y, X) buffer and fill it from the relevant subblocks.
-    Timepoints are processed in parallel using a thread pool — reads are
+    Timepoints are processed in parallel using a thread pool - reads are
     I/O-bound and tifffile/czifile release the GIL on bulk decode, so threads
     keep peak RAM bounded to ~n_workers * (Z*Y*X*dtype) bytes.
-    """
+    '''
     import czifile
 
     print("Reading CZI metadata (no full-array load)...")
@@ -534,9 +534,9 @@ def split_czi(path, channel):
 
 
 def split_tiff(path, channel):
-    """Stream-split a TIFF hyperstack one timepoint at a time using tifffile's
+    '''Stream-split a TIFF hyperstack one timepoint at a time using tifffile's
     zarr store, which performs lazy per-page reads instead of loading the
-    whole series into RAM."""
+    whole series into RAM.'''
     print("Reading TIFF metadata (lazy zarr store)...")
     with tifffile.TiffFile(path) as tif:
         series = tif.series[0]
@@ -582,7 +582,7 @@ def split_tiff(path, channel):
             raise ValueError(f"Channel {channel} out of range (file has {nC} channels: 1..{nC})")
 
         def slice_for_t(t):
-            """Build an indexing tuple selecting (t, ch_idx) from the lazy array."""
+            '''Build an indexing tuple selecting (t, ch_idx) from the lazy array.'''
             idx = []
             for a in axes:
                 if a == 'T':
