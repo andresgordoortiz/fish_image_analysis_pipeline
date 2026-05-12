@@ -115,7 +115,7 @@ if (!_input_path_file.isDirectory()) {
 
 params.input_dir   = _raw_input_dir
 params.output_dir  = sanitizePath(config.output.directory)
-params.channel     = config.input.channel
+params.channel     = config.input?.channel ?: 0  // 0 = auto-detect (required when file has only 1 channel)
 params.input_file  = _raw_input_file
 params.container   = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
 params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
@@ -392,7 +392,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 input_file = '${filename}'
-channel = ${channel_idx}  # 1-based channel index, matches t####_Channel <c>.tif convention
+_channel_cfg = ${channel_idx}  # 1-based; 0 means auto-detect
 
 # Use Nextflow-allocated CPU count for parallel per-timepoint writes.
 # Fall back to a conservative default if the env var is missing.
@@ -401,14 +401,29 @@ try:
 except Exception:
     n_workers = 1
 print(f"Input file: {input_file}")
-print(f"Channel (1-based): {channel}")
-print(f"Worker threads:    {n_workers}")
+print(f"Channel config (0=auto): {_channel_cfg}")
+print(f"Worker threads:          {n_workers}")
 
-if channel < 1:
-    print(f"ERROR: channel must be >= 1 (got {channel})", file=sys.stderr)
-    sys.exit(1)
 
-ch_idx = channel - 1  # 0-based index into the C axis
+def resolve_channel(n_channels_in_file, cfg):
+    '''Return (channel_1based, ch_idx_0based), auto-selecting when cfg==0.'''
+    if cfg == 0:
+        if n_channels_in_file == 1:
+            print("  Auto-detected single channel -> using channel 1")
+            return 1, 0
+        raise ValueError(
+            f"File has {n_channels_in_file} channels but 'input.channel' is not set "
+            f"in config.json. Please add \"channel\": <1..{n_channels_in_file}> "
+            f"under the \"input\" section."
+        )
+    if cfg < 1:
+        raise ValueError(f"channel must be >= 1 (got {cfg})")
+    if cfg > n_channels_in_file:
+        raise ValueError(
+            f"Channel {cfg} out of range (file has {n_channels_in_file} channels: 1..{n_channels_in_file})"
+        )
+    return cfg, cfg - 1
+
 
 ext = Path(input_file).suffix.lower()
 
@@ -435,7 +450,7 @@ def save_timepoint(stack3d, t_idx, channel):
     print(f"  -> {out_name}  shape={stack3d.shape} dtype={stack3d.dtype}", flush=True)
 
 
-def split_czi(path, channel):
+def split_czi(path):
     '''Stream-split a CZI hyperstack one timepoint at a time.
 
     czifile.CziFile.asarray() materialises the entire 5D array in RAM, which
@@ -470,8 +485,8 @@ def split_czi(path, channel):
         nY = axis_size('Y')
         nX = axis_size('X')
 
-        if ch_idx < 0 or ch_idx >= nC:
-            raise ValueError(f"Channel {channel} out of range (file has {nC} channels: 1..{nC})")
+        channel, ch_idx = resolve_channel(nC, _channel_cfg)
+        print(f"  Using channel {channel} of {nC}")
 
         # Group subblock directory entries by timepoint for the requested channel.
         # Each DirectoryEntry has `.start` (one int per axis in czi.axes order)
@@ -533,7 +548,7 @@ def split_czi(path, channel):
         czi.close()
 
 
-def split_tiff(path, channel):
+def split_tiff(path):
     '''Stream-split a TIFF hyperstack one timepoint at a time using tifffile's
     zarr store, which performs lazy per-page reads instead of loading the
     whole series into RAM.'''
@@ -545,18 +560,18 @@ def split_tiff(path, channel):
         print(f"  TIFF series axes:  {axes}")
         print(f"  TIFF series shape: {shape}")
 
-        # Per-timepoint files are 3D (ZYX or YX) — no splitting needed.
+        nC_here = shape[axes.index('C')] if 'C' in axes else 1
+        channel, ch_idx = resolve_channel(nC_here, _channel_cfg)
+        print(f"  Using channel {channel} of {nC_here}")
+
+        # Per-timepoint files are 3D (ZYX or YX) - no splitting needed.
         if 'T' not in axes:
             print("  No T axis -> file is already a single timepoint, copying as t0000.")
             data = series.asarray()
             if data.ndim == 2:
                 data = data[None, ...]  # YX -> 1YX
             if 'C' in axes:
-                c_axis = axes.index('C')
-                nC_here = data.shape[c_axis]
-                if ch_idx < 0 or ch_idx >= nC_here:
-                    raise ValueError(f"Channel {channel} out of range (file has {nC_here} channels: 1..{nC_here})")
-                data = np.take(data, ch_idx, axis=c_axis)
+                data = np.take(data, ch_idx, axis=axes.index('C'))
             save_timepoint(data, 0, channel)
             return
 
@@ -577,9 +592,6 @@ def split_tiff(path, channel):
         # Build axis index map
         axis_index = {a: i for i, a in enumerate(axes)}
         nT = shape[axis_index['T']]
-        nC = shape[axis_index['C']] if 'C' in axis_index else 1
-        if ch_idx < 0 or ch_idx >= nC:
-            raise ValueError(f"Channel {channel} out of range (file has {nC} channels: 1..{nC})")
 
         def slice_for_t(t):
             '''Build an indexing tuple selecting (t, ch_idx) from the lazy array.'''
@@ -593,7 +605,7 @@ def split_tiff(path, channel):
                     idx.append(slice(None))
             return tuple(idx)
 
-        print(f"Splitting {nT} timepoints (channel {channel} of {nC}) "
+        print(f"Splitting {nT} timepoints (channel {channel} of {nC_here}) "
               f"with {n_workers} worker thread(s)...")
 
         if use_zarr:
@@ -612,11 +624,10 @@ def split_tiff(path, channel):
                     fut.result()
         else:
             # Fallback: read each timepoint sequentially via series.asarray
-            # with explicit indexing — still avoids loading the full stack.
+            # with explicit indexing - still avoids loading the full stack.
             for t in range(nT):
                 stack = series.asarray(key=t) if 'C' not in axes else None
                 if stack is None:
-                    # Generic path: read full timepoint slab then index channel
                     raise RuntimeError(
                         "Lazy TIFF access requires the 'zarr' package; "
                         "please install zarr in the container."
@@ -628,9 +639,9 @@ def split_tiff(path, channel):
 
 try:
     if ext in ('.czi',):
-        split_czi(input_file, channel)
+        split_czi(input_file)
     elif ext in ('.tif', '.tiff'):
-        split_tiff(input_file, channel)
+        split_tiff(input_file)
     else:
         print(f"ERROR: Unsupported file extension: {ext}", file=sys.stderr)
         sys.exit(1)
@@ -2506,7 +2517,11 @@ workflow {
     // Use java.nio.file.FileSystems to handle paths with spaces correctly
     // (Nextflow's fromPath glob can break on spaces in directory names)
     def input_dir_path = Paths.get(params.input_dir)
-    def glob_pattern = "t*_Channel ${params.channel}.tif"
+    // When channel is 0 (auto-detect) use a wildcard so existing per-timepoint
+    // TIFFs are found regardless of which channel number they carry.
+    def glob_pattern = params.channel > 0
+        ? "t*_Channel ${params.channel}.tif"
+        : "t*_Channel *.tif"
     def matched_files = []
 
     def globMatcher = FileSystems.getDefault().getPathMatcher("glob:${glob_pattern}")
