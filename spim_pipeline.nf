@@ -2105,6 +2105,12 @@ process PREP_ULTRACK {
     echo "Labels hyperstack: ${labels_hyperstack}"
     echo ""
 
+    # Expose Nextflow's CPU/memory allocation to the Python autosizer so it
+    # caps worker count to the SLURM cgroup, not the full node (otherwise
+    # psutil + os.cpu_count() see the host and overcommit → OOM / exit 137).
+    export NXF_TASK_CPUS=${task.cpus}
+    export SLURM_CPUS_PER_TASK=${task.cpus}
+
     python3 ${script_name} \\
         --raw "${raw_hyperstack}" \\
         --labels "${labels_hyperstack}" \\

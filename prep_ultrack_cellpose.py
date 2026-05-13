@@ -45,23 +45,85 @@ import sys
 import numpy as np
 
 
+def _get_cgroup_memory_limit_bytes():
+    """Return the cgroup memory limit in bytes, or None if not constrained.
+
+    Honors both cgroup v2 (memory.max) and v1 (memory.limit_in_bytes). Returns
+    None when the limit is "max" / unset / effectively unlimited.
+    """
+    candidates = (
+        "/sys/fs/cgroup/memory.max",  # cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+    )
+    for path in candidates:
+        try:
+            with open(path) as f:
+                raw = f.read().strip()
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        if not raw or raw == "max":
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        # cgroup v1 reports a huge sentinel (~2^63) when unlimited
+        if value <= 0 or value >= (1 << 62):
+            continue
+        return value
+    return None
+
+
+def _get_slurm_memory_limit_bytes():
+    """Return SLURM-allocated memory in bytes, or None if not running under SLURM."""
+    # SLURM_MEM_PER_NODE is in MB and reflects the per-node allocation
+    mem_per_node = os.environ.get("SLURM_MEM_PER_NODE")
+    if mem_per_node:
+        try:
+            return int(mem_per_node) * 1024 * 1024
+        except ValueError:
+            pass
+    # Fall back to mem-per-cpu * cpus-per-task
+    mem_per_cpu = os.environ.get("SLURM_MEM_PER_CPU")
+    cpus_per_task = os.environ.get("SLURM_CPUS_PER_TASK")
+    if mem_per_cpu and cpus_per_task:
+        try:
+            return int(mem_per_cpu) * int(cpus_per_task) * 1024 * 1024
+        except ValueError:
+            pass
+    return None
+
+
 def _get_available_ram_bytes():
-    """Return available RAM in bytes."""
+    """Return available RAM in bytes, respecting cgroup / SLURM limits.
+
+    Without this, on a shared node `psutil.virtual_memory().available` reports
+    the entire host's free RAM (often hundreds of GB) even though the job's
+    cgroup is capped much lower, which makes worker autosizing wildly
+    overcommit and trigger OOM kills (SIGKILL, exit 137).
+    """
+    node_avail = None
     try:
         import psutil
 
-        return psutil.virtual_memory().available
+        node_avail = psutil.virtual_memory().available
     except ImportError:
-        pass
-    # fallback: parse /proc/meminfo (Linux)
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-    except (FileNotFoundError, ValueError):
-        pass
-    return None
+        # fallback: parse /proc/meminfo (Linux)
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        node_avail = int(line.split()[1]) * 1024
+                        break
+        except (FileNotFoundError, ValueError):
+            pass
+
+    limits = [v for v in (_get_cgroup_memory_limit_bytes(), _get_slurm_memory_limit_bytes()) if v]
+    if node_avail is not None:
+        limits.append(node_avail)
+    if not limits:
+        return None
+    return min(limits)
 
 
 def _open_hyperstack(path):
@@ -188,8 +250,15 @@ def process_all(args):
     # --- determine number of workers ---
     frame_mem = _estimate_frame_memory(Z, Y, X, raw.dtype, labels.dtype)
     avail_ram = _get_available_ram_bytes()
-    # respect SLURM allocation if available
-    cpu_count = int(os.environ.get("SLURM_CPUS_PER_TASK", 0)) or os.cpu_count() or 1
+    # respect SLURM / Nextflow allocation if available — falling back to
+    # os.cpu_count() picks up the whole node (e.g. 64 CPUs) even when the
+    # job was scheduled with cpus=4, which causes massive overcommit.
+    cpu_count = (
+        int(os.environ.get("SLURM_CPUS_PER_TASK", 0))
+        or int(os.environ.get("NXF_TASK_CPUS", 0))
+        or os.cpu_count()
+        or 1
+    )
 
     if avail_ram is not None:
         # reserve 20% of RAM for OS / zarr / memmap overhead
