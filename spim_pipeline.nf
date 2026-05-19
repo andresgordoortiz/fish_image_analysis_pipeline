@@ -457,14 +457,19 @@ def split_czi(path):
     is infeasible for multi-hundred-GB acquisitions. Instead we walk the
     subblock directory and, for each timepoint of the requested channel,
     allocate only a (Z, Y, X) buffer and fill it from the relevant subblocks.
-    Timepoints are processed in parallel using a thread pool - reads are
-    I/O-bound and tifffile/czifile release the GIL on bulk decode, so threads
-    keep peak RAM bounded to ~n_workers * (Z*Y*X*dtype) bytes.
+    Timepoints are processed in parallel using a thread pool, but the actual
+    subblock reads are serialized with a lock: czifile shares a single file
+    handle and seek()s into it inside data_segment(), so concurrent reads
+    race and raise "SegmentNotFoundError: not a ZISRAW segment". The lock
+    only covers the I/O; decompression of the returned numpy array and the
+    final TIFF write still run in parallel.
     '''
     import czifile
+    import threading
 
     print("Reading CZI metadata (no full-array load)...")
     czi = czifile.CziFile(path)
+    czi_read_lock = threading.Lock()
     try:
         axes = czi.axes  # e.g. 'BCTZYX0' or 'STCZYX'
         shape = czi.shape
@@ -523,7 +528,11 @@ def split_czi(path):
                 x = entry.start[x_axis]
                 # Subblock data is shaped to match entry.shape across czi.axes;
                 # squeeze it down to (sz, sy, sx).
-                tile = entry.data_segment().data()
+                # czifile.CziFile is NOT thread-safe: data_segment() seeks on
+                # the shared file handle, so concurrent calls produce
+                # "not a ZISRAW segment" errors. Serialize the actual read.
+                with czi_read_lock:
+                    tile = entry.data_segment().data()
                 # tile.shape mirrors czi.axes; collapse all non-ZYX axes (size 1)
                 sl = []
                 for a, sz in zip(axes, tile.shape):
