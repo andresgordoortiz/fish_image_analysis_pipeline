@@ -117,13 +117,18 @@ params.input_dir   = _raw_input_dir
 params.output_dir  = sanitizePath(config.output.directory)
 params.channel     = config.input?.channel ?: 0  // 0 = auto-detect (required when file has only 1 channel)
 params.input_file  = _raw_input_file
-params.container   = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
-params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
-// ultrack_container default comes from nextflow.config (shared containers dir).
-// Allow per-run override via config.tracking.ultrack_container, but fall back
-// to the cluster-wide pre-pulled image so users don't have to hard-code paths.
-if (config.tracking?.ultrack_container) {
-    params.ultrack_container = config.tracking.ultrack_container
+// Container images are ALWAYS taken from nextflow.config (shared long-term
+// folder on the cluster). Any container_image / fiji_container_image /
+// ultrack_container values in config.json are intentionally ignored so every
+// run uses the same pre-pulled images.
+if (config.system?.container_image && config.system.container_image != params.container) {
+    log.warn "Ignoring config.system.container_image (${config.system.container_image}) — using hardcoded ${params.container}"
+}
+if (config.system?.fiji_container_image && config.system.fiji_container_image != params.fiji_container) {
+    log.warn "Ignoring config.system.fiji_container_image (${config.system.fiji_container_image}) — using hardcoded ${params.fiji_container}"
+}
+if (config.tracking?.ultrack_container && config.tracking.ultrack_container != params.ultrack_container) {
+    log.warn "Ignoring config.tracking.ultrack_container (${config.tracking.ultrack_container}) — using hardcoded ${params.ultrack_container}"
 }
 
 def input_dir_file = file(params.input_dir)
