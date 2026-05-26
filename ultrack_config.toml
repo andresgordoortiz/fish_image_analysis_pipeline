@@ -1,0 +1,37 @@
+[data]
+n_workers = 16
+working_dir = "./ultrack_work"
+database = "sqlite"
+
+[segmentation]
+min_area = 2
+max_area = 10000
+n_workers = 16
+min_frontier = 0.0
+threshold = 0.0
+max_noise = 0
+ws_hierarchy = "area"
+anisotropy_penalization = 0.0
+
+[linking]
+max_distance = 10.0
+n_workers = 16
+max_neighbors = 5
+distance_weight = 0.0
+z_score_threshold = 5.0
+
+[tracking]
+appear_weight = -0.001
+disappear_weight = -0.001
+division_weight = -0.001
+n_threads = -1
+overlap_size = 1
+solution_gap = 0.001
+time_limit = 36000
+method = 0
+link_function = "power"
+power = 4
+bias = -0.0
+
+
+
