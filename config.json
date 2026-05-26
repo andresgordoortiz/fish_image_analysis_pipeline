@@ -99,8 +99,8 @@
 
   "tracking": {
     "enabled": false,
-    "ultrack_container": "/groups/pinheiro/user/andres.gordo/processed_data/M45/ultrack_cuda12_gurobi.sif",
-    "ultrack_config_toml": "/groups/pinheiro/user/andres.gordo/processed_data/M45/medaka_071125/ultrack_config.toml",
+    "_comment_ultrack_container": "Defaults to /groups/pinheiro/user/andres.gordo/containers_licences/ultrack.sif (see nextflow.config). Set this key only to override.",
+    "_comment_ultrack_config_toml": "Defaults to the ultrack_config.toml at the repo root. Set this key only to override.",
     "prep": {
       "fg_sigma": 5.0,
       "raw_sigma": 1.0,

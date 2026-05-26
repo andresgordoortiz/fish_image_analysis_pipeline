@@ -15,10 +15,12 @@ fi
 OUTPUT_DIR=$(sed -n '/"output"/,/}/p' "$CONFIG_JSON" | grep '"directory"' | sed 's/.*: *"\([^"]*\)".*/\1/')
 mkdir -p "$OUTPUT_DIR"
 
-# Setup cache directories
-export NXF_SINGULARITY_CACHEDIR="$OUTPUT_DIR/singularity_images"
-export APPTAINER_CACHEDIR="$OUTPUT_DIR/singularity_images/cache"
-export APPTAINER_TMPDIR="$OUTPUT_DIR/singularity_images/tmp"
+# Setup cache directories - we always populate the shared long-term folder so
+# every pipeline run on the cluster reuses the same pre-pulled images.
+CONTAINERS_DIR="/groups/pinheiro/user/andres.gordo/containers_licences"
+export NXF_SINGULARITY_CACHEDIR="$CONTAINERS_DIR"
+export APPTAINER_CACHEDIR="$CONTAINERS_DIR/.cache"
+export APPTAINER_TMPDIR="$CONTAINERS_DIR/.tmp"
 mkdir -p "$NXF_SINGULARITY_CACHEDIR" "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 
 # Container details

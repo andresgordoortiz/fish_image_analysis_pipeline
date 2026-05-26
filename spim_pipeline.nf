@@ -119,7 +119,12 @@ params.channel     = config.input?.channel ?: 0  // 0 = auto-detect (required wh
 params.input_file  = _raw_input_file
 params.container   = config.system?.container_image ?: 'library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559'
 params.fiji_container = config.system?.fiji_container_image ?: 'docker://fiji/fiji:20220415'
-params.ultrack_container = config.tracking?.ultrack_container ?: null
+// ultrack_container default comes from nextflow.config (shared containers dir).
+// Allow per-run override via config.tracking.ultrack_container, but fall back
+// to the cluster-wide pre-pulled image so users don't have to hard-code paths.
+if (config.tracking?.ultrack_container) {
+    params.ultrack_container = config.tracking.ultrack_container
+}
 
 def input_dir_file = file(params.input_dir)
 if (!input_dir_file.isDirectory()) {
@@ -231,18 +236,22 @@ if (run_debug_preprocessing && !config.preprocessing.save_intermediates) {
 // Validate tracking config if enabled
 if (!skip_tracking) {
     if (!params.ultrack_container) {
-        log.error "Tracking enabled but no ultrack_container specified in config.tracking"
+        log.error "Tracking enabled but no ultrack_container resolved (check params.ultrack_container in nextflow.config)"
         exit 1
     }
     if (!file(params.ultrack_container).exists()) {
         log.error "Ultrack container not found: ${params.ultrack_container}"
         exit 1
     }
-    def toml_path = config.tracking.ultrack_config_toml ?: './ultrack_config.toml'
+    // Always prefer the ultrack_config.toml shipped in the repo root.
+    // Allow an explicit override via config.tracking.ultrack_config_toml, but
+    // the default is the file checked in next to spim_pipeline.nf.
+    def toml_path = config.tracking.ultrack_config_toml ?: "${workflow.projectDir}/ultrack_config.toml"
     if (!file(toml_path).exists()) {
         log.error "Ultrack config TOML not found: ${toml_path}"
         exit 1
     }
+    config.tracking.ultrack_config_toml = toml_path
     // Tracking requires segmentation + merge
     if (skip_segmentation) {
         log.error "Tracking requires segmentation (segmentation.enabled=true)"
@@ -2959,8 +2968,9 @@ workflow {
             )
 
             // Step 2: ultrack segment → link → solve → export (4 separate processes)
+            // ultrack_config_toml is resolved at startup (defaults to repo-root ultrack_config.toml)
             ultrack_config_ch = Channel.fromPath(
-                config.tracking.ultrack_config_toml ?: './ultrack_config.toml',
+                config.tracking.ultrack_config_toml,
                 checkIfExists: true
             )
 

@@ -103,34 +103,49 @@ else
     echo "Seqera Tower: disabled"
 fi
 
-# Setup caching directories - must set BOTH singularity and apptainer variables
-CACHE_DIR="$OUTPUT_DIR/singularity_images"
+# Setup caching directories - must set BOTH singularity and apptainer variables.
+# We point Nextflow at the shared long-term folder that already contains the
+# pre-pulled images (main pipeline container + ultrack.sif) and the Gurobi
+# license. This avoids re-downloading containers per run and per output dir.
+CONTAINERS_DIR="/groups/pinheiro/user/andres.gordo/containers_licences"
+CACHE_DIR="$CONTAINERS_DIR"
 export NXF_SINGULARITY_CACHEDIR="$CACHE_DIR"
 export NXF_APPTAINER_CACHEDIR="$CACHE_DIR"
 export SINGULARITY_CACHEDIR="$CACHE_DIR"
 export APPTAINER_CACHEDIR="$CACHE_DIR"
-export SINGULARITY_TMPDIR="$CACHE_DIR/tmp"
-export APPTAINER_TMPDIR="$CACHE_DIR/tmp"
+export SINGULARITY_TMPDIR="$OUTPUT_DIR/singularity_tmp"
+export APPTAINER_TMPDIR="$OUTPUT_DIR/singularity_tmp"
 export NXF_TEMP="$OUTPUT_DIR/.nextflow_temp"
 export NXF_OPTS="-Xss4M"
 export NXF_JVM_ARGS="-Xms2g -Xmx5g"
-mkdir -p "$CACHE_DIR" "$CACHE_DIR/tmp" "$NXF_TEMP"
+mkdir -p "$SINGULARITY_TMPDIR" "$NXF_TEMP"
+
+# Gurobi multi-user floating license (shared, lives next to the containers).
+# Export so any tool launched outside apptainer (e.g. login-node helpers)
+# can still find it; the apptainer container picks it up via
+# --env GRB_LICENSE_FILE=... set in nextflow.config.
+export GRB_LICENSE_FILE="$CONTAINERS_DIR/gurobi.lic"
+if [ ! -f "$GRB_LICENSE_FILE" ]; then
+    echo "WARNING: Gurobi license not found at $GRB_LICENSE_FILE"
+fi
 
 # Check that container was pre-pulled (compute nodes often can't access internet)
 CONTAINER_BASENAME="andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img"
 CONTAINER_SIF="$CACHE_DIR/$CONTAINER_BASENAME"
 if [ ! -f "$CONTAINER_SIF" ]; then
     echo ""
-    echo "ERROR: Container image not found!"
+    echo "ERROR: Container image not found in shared containers folder!"
     echo "  Expected: $CONTAINER_SIF"
     echo ""
-    echo "Run the setup script from the login node first:"
-    echo "  ./setup_container.sh"
-    echo ""
-    echo "Or copy from an existing results directory:"
-    echo "  cp -L results_testing/singularity_images/$CONTAINER_BASENAME $CACHE_DIR/"
+    echo "Ask the maintainer to (re-)populate $CONTAINERS_DIR, or run"
+    echo "  ./setup_container.sh   from the login node to repull."
     echo ""
     exit 1
+fi
+
+ULTRACK_SIF="$CONTAINERS_DIR/ultrack.sif"
+if [ ! -f "$ULTRACK_SIF" ]; then
+    echo "WARNING: ultrack container not found at $ULTRACK_SIF (tracking will fail if enabled)"
 fi
 
 echo "Container: $CONTAINER_SIF (cached)"
