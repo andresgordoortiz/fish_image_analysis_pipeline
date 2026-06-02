@@ -17,6 +17,11 @@ import java.nio.file.Paths
 // Parameters - only config_json is required, everything else comes from it
 params.config_json = null
 params.preprocessing_script = './spim_pipeline_fixed.py'
+// Self-Net deblurring front-end (alternative to deconvolution). The Self-Net
+// script reuses helpers from the deconvolution script (spim_pipeline_fixed.py)
+// and WBNS.py, so both are staged alongside it when method='selfnet'.
+params.selfnet_script = './spim_selfnet_preprocess.py'
+params.wbns_script = './WBNS.py'
 params.merge_script = './merge_hyperstack.py'
 params.benchmark_script = './benchmark_pipeline.py'
 params.prep_ultrack_script = './prep_ultrack_cellpose.py'
@@ -164,6 +169,30 @@ def skip_segmentation = config.segmentation?.enabled == false
 def skip_preprocessing = (config.preprocessing?.enabled == false) || (config.preprocessing?.skip_preprocessing ?: false)
 def preprocessed_dir = config.preprocessing?.preprocessed_dir ?: null
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
+
+// Preprocessing method: 'deconvolution' (GPU Richardson-Lucy, default) or
+// 'selfnet' (Self-Net deep-learning deblurring / isotropic reconstruction).
+def preprocess_method = (config.preprocessing?.method ?: 'deconvolution').toString().toLowerCase()
+if (!(preprocess_method in ['deconvolution', 'selfnet'])) {
+    log.error "Unknown preprocessing.method '${preprocess_method}'. Use 'deconvolution' or 'selfnet'."
+    exit 1
+}
+// Validate Self-Net settings up front so the run fails fast (not 50 jobs in).
+if (!skip_preprocessing && preprocess_method == 'selfnet') {
+    def sn = config.preprocessing?.selfnet
+    if (!sn || !sn.model_path) {
+        log.error "preprocessing.method='selfnet' requires preprocessing.selfnet.model_path in config.json"
+        exit 1
+    }
+    def sn_model = sanitizePath(sn.model_path.toString())
+    if (!file(sn_model).exists()) {
+        log.error "Self-Net model not found: ${sn.model_path} (resolved to: ${file(sn_model)})"
+        exit 1
+    }
+    log.info "Preprocessing method: SELF-NET (model: ${sn_model})"
+} else if (!skip_preprocessing) {
+    log.info "Preprocessing method: DECONVOLUTION"
+}
 
 // Optional: limit input to the first N timepoints (after sorting). Useful when
 // late timepoints in an acquisition are unusable (sample drift, photodamage,
@@ -1564,6 +1593,253 @@ RESTORE_META
 }
 
 // ============================================================================
+// PROCESS: Preprocess Single Timepoint with Self-Net deblurring
+// (alternative to PREPROCESS_DECONVOLVE; selected via preprocessing.method)
+// ============================================================================
+
+process PREPROCESS_SELFNET {
+    tag "t${String.format('%04d', timepoint)}"
+
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    publishDir "${params.output_dir}/01_preprocessed",
+        mode: 'copy',
+        pattern: "*_processed.tif",
+        enabled: skip_merge
+
+    publishDir "${params.output_dir}/logs/preprocessing",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    tuple val(timepoint), path(image_file)
+    path metadata_json
+    path selfnet_script
+    path shared_lib       // spim_pipeline_fixed.py (provides shared helpers)
+    path wbns_lib         // WBNS.py (imported by the shared lib)
+    val preprocess_config
+
+    output:
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_processed.tif"), emit: processed
+    path "t${String.format('%04d', timepoint)}_preprocess.log", emit: log
+    tuple val(timepoint), path("intermediates/*.tif"), optional: true, emit: intermediates
+
+    script:
+    def cfg = preprocess_config
+    def t_formatted = String.format('%04d', timepoint)
+    def filename = image_file.name
+    def config_json_str = groovy.json.JsonOutput.toJson(cfg).replace("'", "\\'")
+    def script_name = selfnet_script.name
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    # Activate micromamba environment
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    echo "============================================"
+    echo "Preprocessing timepoint: ${timepoint} (Self-Net)"
+    echo "File: ${filename}"
+    echo "Self-Net script: ${script_name}"
+    echo "============================================"
+
+    if [ ! -f "${script_name}" ]; then
+        echo "ERROR: Self-Net script not found: ${script_name}"
+        echo "Contents of work directory:"
+        ls -lh
+        exit 1
+    fi
+
+    # Run Self-Net preprocessing with all parameters from config
+    python3 << 'PYTHON_EOF'
+import json
+import sys
+import subprocess
+
+# Load metadata
+with open('${metadata_json}', 'r') as f:
+    metadata = json.load(f)
+
+# Load config - parse from JSON string to handle booleans correctly
+config = json.loads('${config_json_str}')
+selfnet = config.get('selfnet', {})
+
+xy_pixel = metadata['x_resolution_um']
+z_pixel = metadata['imagej']['spacing']
+
+print(f"Using voxel sizes from metadata:")
+print(f"  XY pixel size: {xy_pixel:.4f} um")
+print(f"  Z pixel size: {z_pixel:.4f} um")
+print(f"  Source: {metadata.get('voxel_size_source', 'unknown')}")
+print("")
+
+cmd = [
+    'python3', '${script_name}',
+    '--input_file', '${filename}',
+    '--outdir', '.',
+    '--model_path', str(selfnet['model_path']),
+    '--image_scaling', str(config['image_scaling']),
+    '--xy_pixel', str(xy_pixel),
+    '--z_pixel', str(z_pixel),
+    '--ngf', str(selfnet.get('ngf', 64)),
+    '--n_blocks', str(selfnet.get('n_blocks', 6)),
+    '--norm', str(selfnet.get('norm', 'instance')),
+    '--batch_size', str(selfnet.get('batch_size', 8)),
+    '--net_min_v', str(selfnet.get('net_min_v', 0)),
+    '--net_max_v', str(selfnet.get('net_max_v', 65535)),
+    '--percentile_low', str(config['normalization']['percentile_low']),
+    '--percentile_high', str(config['normalization']['percentile_high']),
+    '--sigma', str(config['postprocessing']['sigma']),
+    '--min_v', str(config['normalization']['min_v']),
+    '--max_v', str(config['normalization']['max_v']),
+    '--resolution_px0', str(config['background_subtraction']['resolution_px0']),
+    '--resolution_pz0', str(config['background_subtraction']['resolution_pz0']),
+    '--noise_lvl', str(config['background_subtraction']['noise_lvl']),
+]
+
+# Optional separate per-view models
+if selfnet.get('model_path_xz'):
+    cmd.extend(['--model_path_xz', str(selfnet['model_path_xz'])])
+if selfnet.get('model_path_yz'):
+    cmd.extend(['--model_path_yz', str(selfnet['model_path_yz'])])
+
+# Correction flags
+if config['correction_flags'].get('no_clahe', False):
+    cmd.append('--no_clahe')
+if config['correction_flags'].get('no_z_correction', False):
+    cmd.append('--no_z_correction')
+if config['correction_flags'].get('no_shading', False):
+    cmd.append('--no_shading')
+
+print("Self-Net command:", ' '.join(cmd))
+print("\\n" + "="*60)
+
+result = subprocess.run(cmd, capture_output=True, text=True)
+
+with open('t${t_formatted}_preprocess.log', 'w') as f:
+    f.write("STDOUT:\\n")
+    f.write(result.stdout)
+    f.write("\\n\\nSTDERR:\\n")
+    f.write(result.stderr)
+
+print(result.stdout)
+if result.stderr:
+    print("STDERR:", result.stderr, file=sys.stderr)
+
+if result.returncode != 0:
+    print(f"ERROR: Self-Net preprocessing failed with exit code {result.returncode}")
+    sys.exit(result.returncode)
+PYTHON_EOF
+
+    # Find and rename output to standard format with ROBUST pattern matching
+    echo ""
+    echo "Finding processed output file..."
+    echo "Expected scaling: ${cfg.image_scaling}"
+    echo "All TIF files in directory:"
+    ls -lh *.tif 2>/dev/null || echo "No .tif files found"
+    echo ""
+
+    ORIGINAL_OUTPUT=""
+
+    if [ -z "\$ORIGINAL_OUTPUT" ]; then
+        SCALING_STR=\$(echo "${cfg.image_scaling}" | sed 's/\\.//g')
+        echo "Trying pattern 1: *_\${SCALING_STR}*.tif"
+        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*_\${SCALING_STR}*.tif" -not -name "${filename}" 2>/dev/null | head -1)
+        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
+    fi
+
+    if [ -z "\$ORIGINAL_OUTPUT" ]; then
+        SCALING_PCT=\$(python3 -c "print(int(${cfg.image_scaling} * 100))")
+        echo "Trying pattern 2: *_\${SCALING_PCT}*.tif"
+        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*_\${SCALING_PCT}*.tif" -not -name "${filename}" 2>/dev/null | head -1)
+        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
+    fi
+
+    if [ -z "\$ORIGINAL_OUTPUT" ]; then
+        echo "Trying pattern 3: any new .tif file (not input)"
+        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" -newer "${script_name}" 2>/dev/null | head -1)
+        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
+    fi
+
+    if [ -z "\$ORIGINAL_OUTPUT" ]; then
+        echo "Trying pattern 4: any .tif file (not input)"
+        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" 2>/dev/null | head -1)
+        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
+    fi
+
+    if [ -n "\$ORIGINAL_OUTPUT" ]; then
+        echo ""
+        echo "SUCCESS: Found processed file: \$ORIGINAL_OUTPUT"
+        echo "Renaming to: t${t_formatted}_processed.tif"
+        mv "\$ORIGINAL_OUTPUT" "t${t_formatted}_processed.tif"
+        echo "✓ File renamed successfully"
+    else
+        echo ""
+        echo "ERROR: No processed output found after trying all patterns"
+        echo "Directory contents:"
+        ls -lha
+        exit 1
+    fi
+
+    # Restore and update metadata to processed image.
+    # Self-Net performs the SAME two geometric operations as the deconv path:
+    #   1. Rescales XY by image_scaling
+    #   2. Reconstructs/upsamples Z to make voxels isotropic
+    # so the Z spacing can be recomputed from the original vs processed Z count.
+    python3 << 'RESTORE_META'
+import tifffile
+import json
+
+with open('${metadata_json}', 'r') as f:
+    metadata = json.load(f)
+
+img = tifffile.imread('t${t_formatted}_processed.tif')
+
+x_res = metadata['x_resolution_um'] / ${cfg.image_scaling}
+y_res = metadata['y_resolution_um'] / ${cfg.image_scaling}
+original_z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
+
+original_z_slices = metadata['shape']['dimensions'][0]
+new_z_slices = img.shape[0]
+
+if new_z_slices != original_z_slices:
+    z_spacing = original_z_slices * original_z_spacing / new_z_slices
+    print(f"Isotropic reconstruction detected:")
+    print(f"  Z slices: {original_z_slices} -> {new_z_slices}")
+    print(f"  Z spacing: {original_z_spacing:.4f} -> {z_spacing:.4f} um")
+else:
+    z_spacing = original_z_spacing
+
+print(f"Voxel sizes after Self-Net preprocessing:")
+print(f"  Original: {metadata['x_resolution_um']:.4f} x {metadata['y_resolution_um']:.4f} x {original_z_spacing:.4f} um")
+print(f"  Final:    {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} um (isotropic)")
+
+tifffile.imwrite(
+    't${t_formatted}_processed.tif',
+    img,
+    imagej=True,
+    resolution=(1.0/x_res, 1.0/y_res),
+    metadata={
+        'spacing': z_spacing,
+        'unit': 'um',
+        'axes': 'ZYX',
+        'TimePoint': ${timepoint},
+        'WasROICropped': metadata.get('was_roi_cropped', False)
+    }
+)
+
+print(f"Metadata restored for timepoint ${timepoint}")
+RESTORE_META
+
+    echo "Self-Net preprocessing completed for timepoint ${timepoint}"
+    """
+}
+
+// ============================================================================
 // PROCESS: Cellpose Segmentation
 // ============================================================================
 
@@ -2821,16 +3097,41 @@ workflow {
     } else {
         // ---- Normal preprocessing ----
 
-        // Create channel for preprocessing script
-        preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+        if (preprocess_method == 'selfnet') {
+            // Self-Net deblurring front-end. Stage the Self-Net script plus the
+            // shared helper libs (spim_pipeline_fixed.py + WBNS.py) so all
+            // imports resolve inside the task work dir.
+            log.info "Preprocessing each timepoint with Self-Net deblurring"
+            selfnet_script_ch = Channel.fromPath(params.selfnet_script, checkIfExists: true)
+            shared_lib_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+            wbns_lib_ch = Channel.fromPath(params.wbns_script, checkIfExists: true)
 
-        // 2. Preprocess and deconvolve each timepoint
-        PREPROCESS_DECONVOLVE(
-            processing_input,
-            shared_metadata,
-            preproc_script_ch.collect(),
-            config.preprocessing
-        )
+            PREPROCESS_SELFNET(
+                processing_input,
+                shared_metadata,
+                selfnet_script_ch.collect(),
+                shared_lib_ch.collect(),
+                wbns_lib_ch.collect(),
+                config.preprocessing
+            )
+
+            preprocessed_processed = PREPROCESS_SELFNET.out.processed
+            preprocessed_intermediates = PREPROCESS_SELFNET.out.intermediates
+        } else {
+            // Create channel for preprocessing script
+            preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+
+            // 2. Preprocess and deconvolve each timepoint
+            PREPROCESS_DECONVOLVE(
+                processing_input,
+                shared_metadata,
+                preproc_script_ch.collect(),
+                config.preprocessing
+            )
+
+            preprocessed_processed = PREPROCESS_DECONVOLVE.out.processed
+            preprocessed_intermediates = PREPROCESS_DECONVOLVE.out.intermediates
+        }
 
         // 2b. OPTIONAL: Debug preprocessing — run Cellpose on each intermediate stage
         if (run_debug_preprocessing) {
@@ -2841,12 +3142,12 @@ workflow {
         debug_nuclei_script_ch = Channel.fromPath(params.debug_nuclei_script, checkIfExists: true)
         debug_report_script_ch = Channel.fromPath(params.debug_report_script, checkIfExists: true)
 
-        // The PREPROCESS_DECONVOLVE process emits:
+        // The preprocessing process emits:
         //   intermediates: tuple(timepoint, path("intermediates/*.tif"))
         // flatMap fans out each intermediate TIF into a separate item so
         // Nextflow can schedule them in parallel.
 
-        debug_paired_ch = PREPROCESS_DECONVOLVE.out.intermediates
+        debug_paired_ch = preprocessed_intermediates
             .flatMap { timepoint, tifs ->
                 if (tifs instanceof List) {
                     return tifs.collect { tif -> tuple(timepoint, tif.baseName, tif) }
@@ -2875,8 +3176,8 @@ workflow {
         log.info "Debug preprocessing DISABLED"
     }
 
-        // Use PREPROCESS_DECONVOLVE output as segmentation input
-        segmentation_input = PREPROCESS_DECONVOLVE.out.processed
+        // Use the preprocessing output as segmentation input
+        segmentation_input = preprocessed_processed
 
     } // end skip_preprocessing else
 

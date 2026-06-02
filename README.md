@@ -31,7 +31,7 @@ That's it! The pipeline handles everything else.
 ## What This Pipeline Does
 
 1. **ROI Cropping** (optional) — Crop all timepoints using an ImageJ ROI file
-2. **Preprocessing** — Shading correction, Z-intensity normalization, deconvolution
+2. **Preprocessing** — Shading correction, Z-intensity normalization, deconvolution (or Self-Net deblurring)
 3. **Segmentation** — 3D cell segmentation with Cellpose
 4. **Merging** — Combine all timepoints into a single 4D stack (TIFF or BigDataViewer HDF5)
 
@@ -87,6 +87,40 @@ To crop all timepoints to a region of interest:
 ```
 
 Create the `.roi` file in ImageJ/Fiji by drawing a rectangle on one of your images and saving it (`Edit > Selection > Save...`).
+
+### Preprocessing Method (Optional)
+
+The pipeline can sharpen / isotropize each volume with one of two interchangeable methods, selected by `preprocessing.method`:
+
+- `"deconvolution"` (default) — GPU Richardson-Lucy deconvolution using `preprocessing.psf_path`.
+- `"selfnet"` — deep-learning Self-Net deblurring / isotropic reconstruction using a trained `deblur_net` model.
+
+Both produce the same isotropic, intensity-normalized output, so the rest of the pipeline (segmentation, tracking, merging) is unchanged. To use Self-Net:
+
+```json
+{
+  "preprocessing": {
+    "method": "selfnet",
+    "selfnet": {
+      "model_path": "/path/to/deblur_net.pkl",
+      "model_path_xz": null,
+      "model_path_yz": null,
+      "ngf": 64,
+      "n_blocks": 6,
+      "norm": "instance",
+      "batch_size": 8,
+      "net_min_v": 0,
+      "net_max_v": 65535
+    }
+  }
+}
+```
+
+- `model_path` — trained Self-Net state-dict (`.pkl`). Required when `method` is `"selfnet"`.
+- `model_path_xz` / `model_path_yz` — optional per-view models; leave `null` to reuse `model_path` for both reslice directions.
+- `net_min_v` / `net_max_v` — intensity range used to normalize the network input (defaults cover full 16-bit range).
+
+Self-Net also runs on a GPU node; leaving `method` unset keeps the default deconvolution behavior.
 
 ### Seqera Tower (Optional)
 
