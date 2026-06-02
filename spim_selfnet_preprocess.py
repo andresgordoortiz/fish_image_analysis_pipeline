@@ -361,6 +361,67 @@ def selfnet_deblur(
     return fusion.astype(np.uint16)
 
 
+def select_device():
+    """Pick a usable compute device, falling back to CPU on incompatible GPUs.
+
+    ``torch.cuda.is_available()`` returns True even for GPUs whose compute
+    capability is too old for the installed PyTorch (e.g. a Tesla P100, sm_60,
+    with a build that only ships sm_70+ kernels). On such hardware the first
+    CUDA kernel launch raises ``no kernel image is available for execution on
+    the device``. Because SLURM may schedule a task on any GPU in the pool,
+    we verify both the reported capability *and* that a real kernel actually
+    runs before committing to CUDA; otherwise we transparently use the CPU so
+    the timepoint still completes (slower, but correct).
+    """
+    if not torch.cuda.is_available():
+        print("  No CUDA device available — using CPU.")
+        return torch.device("cpu")
+
+    try:
+        name = torch.cuda.get_device_name(0)
+        major, minor = torch.cuda.get_device_capability(0)
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"  Could not query CUDA device ({e}) — using CPU.")
+        return torch.device("cpu")
+
+    # Compute capabilities supported by the installed PyTorch build.
+    try:
+        supported = torch.cuda.get_arch_list()
+    except Exception:
+        supported = []
+    supported_majors = []
+    for arch in supported:
+        # Entries look like 'sm_70', 'sm_86', 'sm_90', 'sm_100', 'sm_120'.
+        digits = "".join(ch for ch in arch if ch.isdigit())
+        if len(digits) >= 2:
+            supported_majors.append(int(digits[:-1]))
+    min_supported_major = min(supported_majors) if supported_majors else 7
+
+    if major < min_supported_major:
+        print(
+            f"  GPU '{name}' has compute capability {major}.{minor}, but the "
+            f"installed PyTorch supports sm_{min_supported_major}0+ "
+            f"({', '.join(supported) if supported else 'unknown'}). "
+            "Falling back to CPU for Self-Net inference."
+        )
+        return torch.device("cpu")
+
+    # Capability looks fine; confirm a kernel actually launches on this device.
+    try:
+        _t = torch.zeros((1, 1, 4, 4), device="cuda:0")
+        _ = torch.nn.functional.pad(_t, (1, 1, 1, 1), mode="reflect")
+        torch.cuda.synchronize()
+    except Exception as e:
+        print(
+            f"  GPU '{name}' (cc {major}.{minor}) failed a CUDA smoke-test "
+            f"({type(e).__name__}: {e}). Falling back to CPU."
+        )
+        return torch.device("cpu")
+
+    print(f"  Using GPU '{name}' (compute capability {major}.{minor}).")
+    return torch.device("cuda:0")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="SPIM Image Preprocessing (Self-Net deblurring)"
@@ -534,7 +595,7 @@ def main():
     # ------------------------------------------------------------------
     # Device + model loading
     # ------------------------------------------------------------------
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = select_device()
     print(f"Self-Net device: {device}")
 
     t0 = time.time()
