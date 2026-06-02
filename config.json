@@ -53,7 +53,12 @@
       "norm": "instance",
       "batch_size": 8,
       "net_min_v": 0,
-      "net_max_v": 65535
+      "net_max_v": 65535,
+      "_comment_net_norm": "Self-Net runs in place of deconvolution, AFTER shading/Z-intensity correction. Its input is re-normalised to match the model's training distribution (percentile outlier removal + rescale to net_min_v..net_max_v). net_percentile_low/high and net_thres_scale are the training defaults; set no_net_normalization=true to feed the corrected stack directly instead.",
+      "net_percentile_low": 30,
+      "net_percentile_high": 99.999,
+      "net_thres_scale": 1.5,
+      "no_net_normalization": false
     },
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
     "image_scaling": 0.33,

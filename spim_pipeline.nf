@@ -1691,6 +1691,9 @@ cmd = [
     '--batch_size', str(selfnet.get('batch_size', 8)),
     '--net_min_v', str(selfnet.get('net_min_v', 0)),
     '--net_max_v', str(selfnet.get('net_max_v', 65535)),
+    '--net_percentile_low', str(selfnet.get('net_percentile_low', 30)),
+    '--net_percentile_high', str(selfnet.get('net_percentile_high', 99.999)),
+    '--net_thres_scale', str(selfnet.get('net_thres_scale', 1.5)),
     '--percentile_low', str(config['normalization']['percentile_low']),
     '--percentile_high', str(config['normalization']['percentile_high']),
     '--sigma', str(config['postprocessing']['sigma']),
@@ -1714,6 +1717,10 @@ if config['correction_flags'].get('no_z_correction', False):
     cmd.append('--no_z_correction')
 if config['correction_flags'].get('no_shading', False):
     cmd.append('--no_shading')
+
+# Self-Net specific: optionally disable the training-matched input normalization
+if selfnet.get('no_net_normalization', False):
+    cmd.append('--no_net_normalization')
 
 print("Self-Net command:", ' '.join(cmd))
 print("\\n" + "="*60)

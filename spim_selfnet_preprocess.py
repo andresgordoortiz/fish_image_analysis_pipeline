@@ -37,6 +37,7 @@ import numpy as np
 import tifffile
 import torch
 import torch.nn as nn
+from scipy import stats
 from skimage.transform import rescale
 
 # Shared correction / post-processing helpers. These live in
@@ -302,6 +303,42 @@ def run_net(net, device, raw_planes, min_v, max_v, batch_size):
     return out
 
 
+def _simple_fg_mask(img, thres_scale):
+    """Mode-based foreground mask, matching get_image_simple_mask(blurWnd=0).
+
+    The training-time normalization estimates the foreground from the image
+    mode (background peak) scaled by ``thres_scale``; no smoothing is applied
+    because the original call passes ``blurWnd=0``.
+    """
+    flat = img.ravel()
+    flat = flat[flat != 0]
+    if flat.size == 0:
+        return np.ones(img.shape, dtype=np.int16)
+    mode_result = stats.mode(flat, axis=None)
+    mode_val = float(np.atleast_1d(mode_result.mode)[0])
+    threshold_value = thres_scale * mode_val
+    return (img > threshold_value).astype(np.int16)
+
+
+def selfnet_input_normalization(img, percentiles, thres_scale, min_v, max_v):
+    """Replicate Supporting_functions.image_normalization (training/inference).
+
+    Percentile outlier removal — low threshold from the whole image, high
+    threshold from the foreground only — followed by a linear rescale into
+    ``[min_v, max_v]``. This matches the intensity distribution the
+    ``deblur_net`` model was trained on, so the network receives inputs that
+    look like its training data even though the surrounding SPIM corrections
+    (shading, Z-intensity) have already run.
+    """
+    if percentiles[0] > 0 or percentiles[1] < 100:
+        mask = _simple_fg_mask(img, thres_scale)
+        low_thres, _ = getNormalizationThresholds(img, percentiles)
+        _, high_thres = getNormalizationThresholds(img * mask, percentiles)
+        img = remove_outliers_image(img, low_thres, high_thres)
+    img = image_scaling_intens(img, min_v, max_v, True)
+    return img.astype(np.uint16)
+
+
 def selfnet_deblur(
     img, x_res, z_res, net_xz, net_yz, device, min_v, max_v, batch_size
 ):
@@ -375,6 +412,31 @@ def main():
         type=float,
         default=65535.0,
         help="Max intensity used to normalise the network input",
+    )
+    parser.add_argument(
+        "--no_net_normalization",
+        action="store_true",
+        help="Disable the training-matched percentile normalization of the "
+        "Self-Net input (feed the shading/Z-corrected stack directly)",
+    )
+    parser.add_argument(
+        "--net_percentile_low",
+        type=float,
+        default=30.0,
+        help="Low percentile for the Self-Net input normalization (training default)",
+    )
+    parser.add_argument(
+        "--net_percentile_high",
+        type=float,
+        default=99.999,
+        help="High percentile for the Self-Net input normalization (training default)",
+    )
+    parser.add_argument(
+        "--net_thres_scale",
+        type=float,
+        default=1.5,
+        help="Foreground mode multiplier for the Self-Net input normalization "
+        "(training default)",
     )
 
     # Image Parameters
@@ -455,6 +517,7 @@ def main():
     apply_clahe = not args.no_clahe
     apply_z_intensity_correction = not args.no_z_correction
     apply_shading_correct = not args.no_shading
+    apply_net_normalization = not args.no_net_normalization
     percentiles_source = (args.percentile_low, args.percentile_high)
 
     if not os.path.exists(args.outdir):
@@ -572,6 +635,28 @@ def main():
         print_resource_usage()
 
     img = img.astype(np.uint16)
+
+    # ------------------------------------------------------------------
+    # Training-matched input normalization for the Self-Net.
+    # The deblur_net was trained/validated on volumes passed through
+    # image_normalization (percentile outlier removal + rescale to
+    # net_min_v..net_max_v) right before inference. Apply the same here so the
+    # network sees its expected intensity distribution. The surrounding SPIM
+    # corrections above (shading, Z-intensity) and the post-processing below
+    # (WBNS, CLAHE, final normalization) are unaffected.
+    # ------------------------------------------------------------------
+    if apply_net_normalization:
+        t0 = time.time()
+        print("[Check-in] Normalising Self-Net input (training-matched)...")
+        img = selfnet_input_normalization(
+            img,
+            (args.net_percentile_low, args.net_percentile_high),
+            args.net_thres_scale,
+            args.net_min_v,
+            args.net_max_v,
+        )
+        print(f"[Timer] Self-Net input normalization took {time.time() - t0:.2f} seconds")
+        print_resource_usage()
 
     # ------------------------------------------------------------------
     # Self-Net deblurring + isotropic reconstruction (replaces deconv+reslice)

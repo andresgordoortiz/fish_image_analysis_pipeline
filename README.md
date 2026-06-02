@@ -95,7 +95,7 @@ The pipeline can sharpen / isotropize each volume with one of two interchangeabl
 - `"deconvolution"` (default) — GPU Richardson-Lucy deconvolution using `preprocessing.psf_path`.
 - `"selfnet"` — deep-learning Self-Net deblurring / isotropic reconstruction using a trained `deblur_net` model.
 
-Both produce the same isotropic, intensity-normalized output, so the rest of the pipeline (segmentation, tracking, merging) is unchanged. To use Self-Net:
+Both produce the same isotropic, intensity-normalized output, so the rest of the pipeline (segmentation, tracking, merging) is unchanged. Self-Net runs **in place of deconvolution**, after shading and Z-intensity correction, and the rest of the preprocessing chain (WBNS, CLAHE, final normalization) still runs around it. To use Self-Net:
 
 ```json
 {
@@ -110,15 +110,20 @@ Both produce the same isotropic, intensity-normalized output, so the rest of the
       "norm": "instance",
       "batch_size": 8,
       "net_min_v": 0,
-      "net_max_v": 65535
+      "net_max_v": 65535,
+      "net_percentile_low": 30,
+      "net_percentile_high": 99.999,
+      "net_thres_scale": 1.5,
+      "no_net_normalization": false
     }
   }
 }
 ```
 
-- `model_path` — trained Self-Net state-dict (`.pkl`). Required when `method` is `"selfnet"`.
+- `model_path` — trained Self-Net state-dict (`.pkl`). Required when `method` is `"selfnet"`. Use the `deblur_net_*.pkl` checkpoint (not the `netG_*` / `netD_*` files, which are training-only).
 - `model_path_xz` / `model_path_yz` — optional per-view models; leave `null` to reuse `model_path` for both reslice directions.
 - `net_min_v` / `net_max_v` — intensity range used to normalize the network input (defaults cover full 16-bit range).
+- `net_percentile_low` / `net_percentile_high` / `net_thres_scale` — training-matched percentile normalization applied to the Self-Net input so the model sees its expected intensity distribution. Set `no_net_normalization: true` to skip it.
 
 Self-Net also runs on a GPU node; leaving `method` unset keeps the default deconvolution behavior.
 
