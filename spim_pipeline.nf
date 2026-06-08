@@ -2416,6 +2416,7 @@ process PREP_ULTRACK {
     # psutil + os.cpu_count() see the host and overcommit → OOM / exit 137).
     export NXF_TASK_CPUS=${task.cpus}
     export SLURM_CPUS_PER_TASK=${task.cpus}
+    export NXF_TASK_MEMORY_BYTES=${task.memory.toBytes()}
 
     python3 ${script_name} \\
         --raw "${raw_hyperstack}" \\

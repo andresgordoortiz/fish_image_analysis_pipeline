@@ -94,6 +94,26 @@ def _get_slurm_memory_limit_bytes():
     return None
 
 
+def _get_nxf_memory_limit_bytes():
+    """Return the Nextflow task memory budget in bytes, or None.
+
+    The Nextflow task script exports NXF_TASK_MEMORY_BYTES (= task.memory as
+    a raw byte count). This is the authoritative SLURM allocation that
+    survives the apptainer --no-mount hostfs option (which hides the cgroup)
+    and cases where SLURM_MEM_PER_NODE is not propagated into the container.
+    """
+    raw = os.environ.get("NXF_TASK_MEMORY_BYTES")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
 def _get_available_ram_bytes():
     """Return available RAM in bytes, respecting cgroup / SLURM limits.
 
@@ -118,7 +138,15 @@ def _get_available_ram_bytes():
         except (FileNotFoundError, ValueError):
             pass
 
-    limits = [v for v in (_get_cgroup_memory_limit_bytes(), _get_slurm_memory_limit_bytes()) if v]
+    limits = [
+        v
+        for v in (
+            _get_cgroup_memory_limit_bytes(),
+            _get_slurm_memory_limit_bytes(),
+            _get_nxf_memory_limit_bytes(),
+        )
+        if v
+    ]
     if node_avail is not None:
         limits.append(node_avail)
     if not limits:
