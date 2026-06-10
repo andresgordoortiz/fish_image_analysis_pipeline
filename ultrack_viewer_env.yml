@@ -1,0 +1,61 @@
+# =============================================================================
+# Conda / mamba environment for ultrack_viewer.py (napari 4D embryo viewer)
+# =============================================================================
+#
+# Mirror of requirements.txt using conda-forge as the primary channel and
+# PyPI (pip) as a fallback for packages not available on conda-forge.
+#
+# Create / update with:
+#
+#   mamba env create -f environment.yml
+#   mamba env update -f environment.yml          # refresh an existing env
+#
+#   conda env create -f environment.yml           # conda also works
+#
+# Activate and run:
+#   mamba activate ultrack-viewer
+#   python ultrack_viewer.py medaka_25082025_combined_spots.csv \
+#                           --tracks medaka_25082025_combined_tracks.csv
+#
+# If you only need the pip-compatible list, see requirements.txt.
+# =============================================================================
+
+name: ultrack-viewer
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  # ---- Runtime ----------------------------------------------------------
+  - python>=3.12
+  - pip
+
+  # ---- Core scientific stack --------------------------------------------
+  - numpy>=1.26
+  - scipy>=1.12
+  - pandas>=2.0
+
+  # ---- napari viewer + Qt backend --------------------------------------
+  # napari on conda-forge pulls in pyqt + qtpy; the script also imports
+  # qtpy directly (qtpy.QtWidgets / qtpy.QtCore).
+  - napari>=0.5
+  - pyqt>=6.6
+  - qtpy>=2.4
+
+  # ---- Plotting ---------------------------------------------------------
+  - matplotlib>=3.8
+  - matplotlib-base>=3.8
+
+  # ---- Lazy / chunked image IO -----------------------------------------
+  - dask>=2024.1
+  - zarr>=2.15,<3            # ultrack segments.zarr is typically v2
+  - tifffile>=2024.1
+
+  # ---- Video / frame export --------------------------------------------
+  - imageio>=2.34
+
+  # ---- pip-only packages (no conda-forge equivalent / version lag) -----
+  - pip:
+      - magicgui>=0.8
+      - imageio-ffmpeg>=0.6.0
