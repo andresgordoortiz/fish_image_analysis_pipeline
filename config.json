@@ -1,5 +1,8 @@
 {
+  "_readme": "SPIM 4D pipeline config. Most users only need to edit input.directory, output.directory, and toggle the *_enabled flags. Paths can be absolute or relative to the repo dir. Input accepts a folder of per-timepoint TIFFs (t0001_*.tif, t0002_*.tif, ...) or a single hyperstack file (.czi, .tif, .tiff).",
+
   "pipeline": {
+    "_comment": "Informational only.",
     "name": "SPIM 4D Image Processing Pipeline",
     "version": "1.0.0",
     "author": "Andrés Gordo & Guilherme Ventura",
@@ -7,30 +10,39 @@
   },
 
   "input": {
+    "_comment_directory": "Folder = per-timepoint TIFFs named t0001_*.tif, ... File = single hyperstack (.czi, .tif, .tiff).",
     "directory": "./subset/",
+    "_comment_channel": "1-based channel index. Ignored for folder inputs (channel is in the filename).",
     "channel": 2,
-    "_comment_max_timepoints": "Optional. Use only the first N timepoints (after sorting). Set to null or omit to use all. Useful when late timepoints are unusable.",
+    "_comment_max_timepoints": "Optional. Only process the first N timepoints. null = use all.",
     "max_timepoints": null
   },
 
   "output": {
+    "_comment_directory": "Where to write results. Will be created if it does not exist.",
     "directory": "./subset_results/",
+    "_comment_format": "Final merged 4D stack format: 'tiff' or 'bdv' (HDF5+XML).",
     "format": "tiff",
+    "_comment_correct_y": "Flip Y axis to fix microscope orientation.",
     "correct_y": false,
+    "_comment_skip_merge": "Skip the final 4D merge. Recommended for large data; you only need per-timepoint TIFFs for the viewer.",
     "skip_merge": true
   },
 
   "seqera_tower": {
+    "_comment": "Paste your Seqera Platform access token to monitor runs in the browser (https://tower.nf -> Runs). Get one from tower.nf -> Settings -> Your tokens.",
     "enabled": true,
     "access_token": "eyJ0aWQiOiAxMzM2Nn0uZWRlMTAxYmIzZGE4ZDNjMzJjM2M1MmZkZThhNjBhZGI2M2EyNjE4Mg=="
   },
 
   "roi_cropping": {
+    "_comment": "Crop every timepoint to a region drawn in Fiji (Edit > Selection > Add to Manager > save as .roi). Leave enabled=false to skip.",
     "enabled": false,
     "roi_path": "./medaka_spim_crop.roi"
   },
 
   "voxel_size": {
+    "_comment": "Physical voxel size in micrometres. Required for tracking. auto_detect=true tries to read it from file metadata (CZI / OME-TIFF).",
     "auto_detect": false,
     "x_um": 0.347,
     "y_um": 0.347,
@@ -38,14 +50,17 @@
   },
 
   "preprocessing": {
+    "_comment": "Shading + Z-intensity correction + deblurring. Produces an isotropic, intensity-normalised stack ready for segmentation.",
     "enabled": true,
-    "_comment_isotropic_reslice": "When enabled=false, lightly resample Z so voxels become isotropic (XY pixel size). Lets raw + segmented + tracks share the same shape for overlay. Defaults to true when preprocessing is skipped, false when full preprocessing runs (because full preprocessing already reslices).",
+    "_comment_isotropic_reslice": "Resample Z so voxels become isotropic. Recommended for segmentation / tracking / viewer overlay.",
     "isotropic_reslice": true,
-    "_comment_method": "Preprocessing method: 'deconvolution' (GPU Richardson-Lucy, uses psf_path) or 'selfnet' (deep-learning Self-Net deblurring / isotropic reconstruction, uses selfnet.model_path). Both produce an isotropic, intensity-normalized stack ready for segmentation.",
+    "_comment_method": "'deconvolution' (GPU Richardson-Lucy, uses psf_path) or 'selfnet' (deep-learning deblurring, uses selfnet.model_path).",
     "method": "deconvolution",
+
     "selfnet": {
-      "_comment": "Used only when method='selfnet'. model_path is the trained deblur_net .pkl state-dict. model_path_xz / model_path_yz optionally override the per-view models (default: reuse model_path for both). net_min_v/net_max_v are the intensity range used to normalise the network input.",
+      "_comment": "Only used when method = 'selfnet'.",
       "model_path": "/groups/pinheiro/user/andres.gordo/selfnet_models/deblur_net.pkl",
+      "_comment_per_view": "Optional per-view models. Leave null to reuse model_path for both XZ and YZ.",
       "model_path_xz": null,
       "model_path_yz": null,
       "ngf": 64,
@@ -54,13 +69,16 @@
       "batch_size": 8,
       "net_min_v": 0,
       "net_max_v": 65535,
-      "_comment_net_norm": "Self-Net runs in place of deconvolution, AFTER shading/Z-intensity correction. Its input is re-normalised to match the model's training distribution (percentile outlier removal + rescale to net_min_v..net_max_v). net_percentile_low/high and net_thres_scale are the training defaults; set no_net_normalization=true to feed the corrected stack directly instead.",
+      "_comment_net_normalization": "Training-matched percentile normalisation applied to the Self-Net input. Set no_net_normalization=true to feed the corrected stack directly.",
       "net_percentile_low": 30,
       "net_percentile_high": 99.999,
       "net_thres_scale": 1.5,
       "no_net_normalization": false
     },
+
+    "_comment_psf": "Point spread function .tif used by Richardson-Lucy. Only used when method = 'deconvolution'.",
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
+    "_comment_image_scaling": "Downscale input by this factor before deconvolution. 1.0 = no downscale. 0.33 trades resolution for speed/RAM.",
     "image_scaling": 0.33,
     "save_intermediates": true,
     "deconvolution": {
@@ -68,59 +86,70 @@
       "niterz": 3,
       "padding": 64
     },
+
     "normalization": {
+      "_comment": "Output intensity normalisation (percentile clip + rescale to [min_v, max_v]).",
       "min_v": 0,
       "max_v": 65535,
       "percentile_low": 10.0,
       "percentile_high": 99.9
     },
     "background_subtraction": {
+      "_comment": "Rolling-ball background subtraction after deconvolution.",
       "resolution_px0": 10,
       "resolution_pz0": 10,
       "noise_lvl": 2
     },
     "postprocessing": {
+      "_comment": "Final Gaussian smoothing on the preprocessed volume.",
       "sigma": 1.2
     },
     "correction_flags": {
+      "_comment": "Force-disable individual correction steps (debugging only).",
       "no_clahe": false,
       "no_z_correction": false,
       "no_shading": false
     },
 
     "debug_preprocessing": {
+      "_comment": "Optional per-timepoint QA. Saves side-by-side raw vs preprocessed for the first timepoints.",
       "enabled": true,
-      "save_masks": false,
-      "_comment": "Cellpose params are inherited from the 'segmentation' section. Override here only if needed."
+      "save_masks": false
     }
   },
 
   "segmentation": {
+    "_comment": "3D Cellpose segmentation. Runs on a GPU node. Set enabled=false to skip.",
     "enabled": false,
+    "_comment_model": "Path to a Cellpose model folder or a built-in name ('cyto3', 'nuclei', ...).",
     "model": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Thomas/cellpose/models/cpsam_Gui_tracking_20250801",
     "diameter": 30,
     "flow_threshold": 0.8,
     "cellprob_threshold": 0.0,
     "use_gpu": true,
     "do_3d": true,
+    "_comment_anisotropy": "Z/Y voxel ratio. null = auto-derived from voxel_size.",
     "anisotropy": null,
+    "_comment_stitch_threshold": "Stitching threshold for multi-FOV tiles. null = no stitching.",
     "stitch_threshold": null,
     "min_size": 15,
     "save_tif": true,
     "save_flows": false,
     "save_npy": false,
+    "_comment_downscale_labels": "Downscale the saved label volume by this factor. 1.0 = full res. Useful when the label volume is too big for the viewer.",
     "downscale_labels": 1.0
   },
 
   "benchmark": {
+    "_comment": "Writes a small CSV/JSON with per-timepoint timing and memory stats.",
     "enabled": true
   },
 
   "tracking": {
+    "_comment": "Cell tracking with ultrack. Set enabled=true to run the full chain (prep -> segment -> link -> solve -> export). Needs segmentation enabled too.",
     "enabled": false,
-    "_comment_ultrack_container": "Defaults to /groups/pinheiro/user/andres.gordo/containers_licences/ultrack.sif (see nextflow.config). Set this key only to override.",
-    "_comment_ultrack_config_toml": "Defaults to the ultrack_config.toml at the repo root. Set this key only to override.",
     "prep": {
+      "_comment": "Foreground / contour extraction parameters used before linking.",
       "fg_sigma": 5.0,
       "raw_sigma": 1.0,
       "boundary_width": 1,
@@ -129,9 +158,11 @@
   },
 
   "system": {
+    "_comment": "Container images and resume behaviour. Most users never need to touch this.",
     "container_image": "library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559",
     "fiji_container_image": "docker://fiji/fiji:20220415",
     "profile": "standard",
+    "_comment_resume": "true = reuse finished tasks on re-submission. false = force a clean re-run.",
     "resume": true
   }
 }
