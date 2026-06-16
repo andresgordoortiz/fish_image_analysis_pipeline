@@ -78,7 +78,7 @@ Toggles to control what runs (set to `true` / `false`):
 - Use **plain spaces** in paths, never backslash-escape them (e.g. `"my data"` not `"my\ data"`).
 - Absolute paths are safest: `/scratch-cbe/users/me/data/...`
 - Relative paths are resolved against the repo directory (e.g. `./data/`).
-- For tracking, make sure `voxel_size` is correct (in micrometres).
+- For tracking, make sure `voxel_size` is correct (in micrometres). Try not to use the automatic detection, as the metadata is oftentimes wrong.
 
 **Seqera token (optional but recommended).** Create a free account at [tower.nf](https://tower.nf), go to **Settings → Your tokens**, generate a token, and paste it into `seqera_tower.access_token`. This lets you watch the run live in the browser under **Runs**.
 
