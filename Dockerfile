@@ -15,7 +15,10 @@ WORKDIR /app
 
 # 3. Setup conda environment
 COPY --chown=mambauser:mambauser microscopy_env.yml .
+# Cache pip downloads separately — aydin and its tree (numpy-indexed,
+# dask, scikit-learn, …) is heavy and a fresh pip cache makes rebuilds slow.
 RUN --mount=type=cache,target=/opt/conda/pkgs \
+    --mount=type=cache,target=/home/mambauser/.cache/pip \
     micromamba create -f microscopy_env.yml -y
 
 # 5. Switch to non-root user
