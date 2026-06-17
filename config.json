@@ -14,8 +14,8 @@
     "directory": "./subset/",
     "_comment_channel": "1-based channel index. Ignored for folder inputs (channel is in the filename).",
     "channel": 2,
-    "_comment_max_timepoints": "Optional. Only process the first N timepoints. null = use all.",
-    "max_timepoints": null
+    "_comment_timepoints": "Optional. Pick SPECIFIC timepoints to process. Accepts: a single integer (e.g. 42), a JSON list (e.g. [1, 5, 10]), or a string with comma-separated values and inclusive ranges (e.g. '1,5,10-12'). null = process every timepoint. Out-of-range timepoints are silently skipped.",
+    "timepoints": null
   },
 
   "output": {
@@ -109,6 +109,17 @@
       "no_clahe": false,
       "no_z_correction": false,
       "no_shading": false
+    },
+
+    "aydin": {
+      "_comment": "Optional aydin self-supervised denoising (https://github.com/royerlab/aydin). Runs BEFORE the deconvolution/Self-Net step. Recommended algorithms: 'nlm' (default, edge-preserving, no hallucination) or 'bmnd' (3D BM3D, sharper). AVOID 'noise2self-cnn' for medaka — aydin's own README flags it as hallucination-prone for small features.",
+      "enabled": false,
+      "_comment_method": "Algorithm: nlm, bmnd, bilateral, gaussianmedian, butterworth, tv, wavelet, spectral, pca, lipschitz, harmonic, noise2self-fgr (ML/CPU), noise2self-cnn (ML/GPU, RISKY).",
+      "method": "nlm",
+      "_comment_tile_shape": "Optional (z,y,x) tile shape, e.g. '128,256,256'. Empty = pick from max_memory_mb. Use a tile shape when the full volume doesn't fit in RAM.",
+      "tile_shape": "",
+      "_comment_max_memory_mb": "Optional RAM budget in MB. 0 = no cap. When set and the full volume doesn't fit, aydin auto-picks a tile shape that fits.",
+      "max_memory_mb": 0
     },
 
     "debug_preprocessing": {

@@ -47,6 +47,22 @@ The pipeline accepts **either** of these two inputs (set `input.directory` in `c
 
 If your data is large, keep the original copy somewhere safe and copy/symlink just the timepoint TIFFs into your scratch folder to save space.
 
+#### Picking which timepoints to process
+
+Use `input.timepoints` to process specific timepoints instead of all of them (or the first N). Three forms are accepted:
+
+```json
+"input": {
+  "timepoints": 42,                       // one specific timepoint
+  "timepoints": [1, 5, 10, 20],          // a list of timepoints
+  "timepoints": "1,5,10-12,42-44"        // comma + inclusive ranges
+}
+```
+
+Out-of-range timepoints are silently skipped (they don't exist, so there's nothing to process). The output naming, downstream stages and intermediate folders are unaffected — only the timepoints that run change.
+
+To take "the first N" of a continuous run, just use a range — `"timepoints": "1-5"` is the equivalent of the old `max_timepoints: 5` for any data that starts at t0001. Leave `timepoints` `null` (default) to process every timepoint.
+
 ### 1.4 Edit `config.json`
 
 Open `config.json` in your favourite editor (`nano`, `vim`, ...). The minimum fields you need to set are:
@@ -68,6 +84,7 @@ Toggles to control what runs (set to `true` / `false`):
 | Section | What it does |
 | --- | --- |
 | `preprocessing.enabled` | Shading + Z correction + deconvolution (or Self-Net) |
+| `preprocessing.aydin.enabled` | Optional **aydin** self-supervised denoising (runs before deconv). Recommended for noisy samples (medaka embryos) — see [Aydin denoising](#aydin-self-supervised-denoising-optional) below. |
 | `roi_cropping.enabled`  | Crop every timepoint to a Fiji `.roi` rectangle |
 | `segmentation.enabled`  | Cellpose 3D segmentation |
 | `tracking.enabled`      | ultrack cell tracking (needs segmentation on) |
@@ -122,6 +139,7 @@ After the run completes, your `output.directory` will look like:
 my_experiment/
 ├── 00_split_input/        # per-timepoint TIFFs (if you gave a hyperstack)
 ├── 00_cropped/            # only if roi_cropping.enabled
+├── 00a_denoised/          # only if preprocessing.aydin.enabled
 ├── 00b_isotropic/         # only if preprocessing.isotropic_reslice and preprocessing off
 ├── 01_preprocessed/       # the isotropic, normalised volumes
 │   └── *_processed.tif
@@ -221,6 +239,55 @@ Once napari opens, use the layer panel to toggle the processed volume, the segme
 
 ---
 
+## Aydin self-supervised denoising (optional)
+
+The pipeline can run [aydin](https://github.com/royerlab/aydin) (Royer's lab) as an **optional** pre-processing step that runs *before* deconvolution / Self-Net. Aydin is self-supervised — it needs **no clean ground truth** — and exposes a curated menu of classical (NLM, BMnD, bilateral, …) and ML (Noise2Self-FGR, Noise2Self-CNN) denoisers that auto-tune their parameters.
+
+This is the recommended way to deal with **noisy, cloudy embryos** (e.g. medaka) where you want to suppress background without blurring small, dim nuclei.
+
+### When to turn it on
+
+* **Yes** — your nuclei are dim or the background is heterogeneous (autofluorescence, scattering, cloudy cytoplasm). Medaka embryos typically benefit.
+* **No** — your data is already clean (low-noise acquisitions, good signal-to-noise). Aydin is a no-op on clean data but it will still take time to auto-tune, so leave it off when you don't need it.
+
+### Configuration
+
+Set in `config.json` under `preprocessing.aydin`:
+
+```json
+"aydin": {
+  "enabled":  true,
+  "method":   "nlm",      // see algorithms below
+  "tile_shape": "",       // e.g. "128,256,256" if a single slab doesn't fit in RAM
+  "max_memory_mb": 0      // 0 = no cap; otherwise aydin auto-picks a tile shape
+}
+```
+
+The output of the aydin step is written to `00a_denoised/t*_denoised.tif` and then fed into the regular deconvolution / Self-Net / Cellpose stages as if it were the raw input — the rest of the pipeline does not change.
+
+### Recommended algorithms (medaka lightsheet)
+
+| `method` | What it is | When to use it |
+| --- | --- | --- |
+| `nlm` **(default)** | Non-local means, 3D, edge-preserving | **First choice for medaka.** No hallucination, preserves small/dim nuclei. |
+| `bmnd` | n-D generalisation of BM3D | Sharper than NLM, ~2–3× slower. Use after NLM if you want crisper nuclei. |
+| `bilateral` | Edge-preserving bilateral filter | Cheaper than NLM, less sharp. |
+| `gaussianmedian` | Mixed Gaussian / median | Cheap baseline. |
+| `noise2self-fgr` | ML — CatBoost/lightGBM regressor | If classical under-denoises. CPU only, no hallucination problem (per aydin README). |
+| `noise2self-cnn` | ML — PyTorch CNN | **Avoid for medaka.** Aydin's own README flags this as hallucination-prone for small features. We expose it for completeness, not as a recommendation. |
+
+> The full list of algorithms is at the top of [spim_aydin_preprocess.py](spim_aydin_preprocess.py) (`AYDIN_METHODS`).
+
+### Memory
+
+Aydin's working set is roughly **8× the input volume** (input + denoiser scratch + output + integration buffers). For a `(500, 1024, 1024)` uint16 timepoint (~1 GB raw) the recommended allocation is **32 GB**. If the full volume doesn't fit, set `tile_shape` (e.g. `"128,256,256"`) or `max_memory_mb` and aydin will tile the volume automatically. Per-timepoint failures (exit 137) almost always mean the tile is still too big — halve the tile and retry.
+
+### Why aydin, not Noise2Self?
+
+Noise2Self ([czbiohub-sf/noise2self](https://github.com/czbiohub-sf/noise2self)) is the academic paper implementation — 98% Jupyter notebooks, no 3D support, no CLI, you supply the architecture and data loader. Aydin is the productionised version of the same idea from the same lab: n-dimensional arrays, 3D/volumetric first-class, CPU and GPU paths, a curated denoiser menu, and a working pipeline-friendly Python API. We chose aydin because it drops in; bolting Noise2Self onto this Nextflow pipeline would be weeks of engineering.
+
+---
+
 ## Troubleshooting
 
 **`sbatch` job stays in `PD` forever.** The cluster is busy. `squeue --me` will show the reason. If you need GPU, queue `g` is the bottleneck.
@@ -234,6 +301,12 @@ Once napari opens, use the layer panel to toggle the processed volume, the segme
 **Viewer is sluggish / crashes on load.** Drop `--preload`, set `--load_downsample 4`, or set `--downsample 4` for a low-res display.
 
 **Want to re-use finished tasks.** `system.resume = true` (default) makes Nextflow skip already-done work. Just `sbatch submit_pipeline.sh config.json` again.
+
+**Aydin step fails with `ImportError: aydin`.** The container was built before aydin was added. Rebuild it: `sbatch submit_pipeline.sh config.json` won't trigger a rebuild — you need to rerun the build workflow or `docker build` the image locally with the updated `microscopy_env.yml`.
+
+**Aydin step fails with exit 137 (OOM).** The auto-picked tile is too large for the SLURM allocation. Either bump `AYDIN_DENOISE` memory in `nextflow.config`, or set `preprocessing.aydin.tile_shape` (e.g. `"128,256,256"`) in `config.json` to force a smaller tile.
+
+**Aydin step produces visibly blobby / "hallucinated" nuclei.** You almost certainly set `method: "noise2self-cnn"`. Switch to `nlm` (default) or `bmnd`. The aydin README itself warns that the CNN variant is hallucination-prone for small features.
 
 ---
 

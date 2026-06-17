@@ -56,3 +56,4 @@ dependencies:
   - pip
   - pip:
     - cellpose  # Installed via pip as it's typically more up-to-date
+    - aydin  # Self-supervised denoising (NLM, BMnD, Noise2Self-FGR, ...). See spim_aydin_preprocess.py.

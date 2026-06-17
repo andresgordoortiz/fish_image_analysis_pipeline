@@ -21,6 +21,10 @@ params.preprocessing_script = './spim_pipeline_fixed.py'
 // script reuses helpers from the deconvolution script (spim_pipeline_fixed.py)
 // and WBNS.py, so both are staged alongside it when method='selfnet'.
 params.selfnet_script = './spim_selfnet_preprocess.py'
+// Aydin self-supervised denoising front-end (optional). Runs before
+// deconvolution/Self-Net. Reuses helpers from spim_pipeline_fixed.py, so the
+// shared library is staged alongside it (same pattern as Self-Net).
+params.aydin_script = './spim_aydin_preprocess.py'
 params.wbns_script = './WBNS.py'
 params.merge_script = './merge_hyperstack.py'
 params.benchmark_script = './benchmark_pipeline.py'
@@ -170,6 +174,24 @@ def skip_preprocessing = (config.preprocessing?.enabled == false) || (config.pre
 def preprocessed_dir = config.preprocessing?.preprocessed_dir ?: null
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
 
+// ------------------------------------------------------------------------
+// Aydin self-supervised denoising front-end (optional). Runs BEFORE
+// deconvolution / Self-Net when enabled. Independent of `preprocessing.enabled`
+// so the user can also run "aydin only" (denoise raw → segment, no deconv).
+// ------------------------------------------------------------------------
+if (!config.preprocessing.containsKey('aydin')) {
+    config.preprocessing.aydin = [enabled: false]
+}
+def aydin_cfg = config.preprocessing.aydin
+if (!aydin_cfg.containsKey('enabled'))   { aydin_cfg.enabled = false }
+if (!aydin_cfg.containsKey('method'))    { aydin_cfg.method  = 'nlm' }
+if (!aydin_cfg.containsKey('tile_shape')){ aydin_cfg.tile_shape = null }
+if (!aydin_cfg.containsKey('max_memory_mb')) { aydin_cfg.max_memory_mb = 0 }
+if (aydin_cfg.enabled && !file(params.aydin_script).exists()) {
+    log.error "Aydin denoising is enabled (preprocessing.aydin.enabled=true) but the script was not found: ${params.aydin_script}"
+    exit 1
+}
+
 // Preprocessing method: 'deconvolution' (GPU Richardson-Lucy, default) or
 // 'selfnet' (Self-Net deep-learning deblurring / isotropic reconstruction).
 def preprocess_method = (config.preprocessing?.method ?: 'deconvolution').toString().toLowerCase()
@@ -194,15 +216,60 @@ if (!skip_preprocessing && preprocess_method == 'selfnet') {
     log.info "Preprocessing method: DECONVOLUTION"
 }
 
-// Optional: limit input to the first N timepoints (after sorting). Useful when
-// late timepoints in an acquisition are unusable (sample drift, photodamage,
-// etc.) and you want to discard them without rebuilding the input dataset.
-// Accepts an integer >= 1; null/missing/<=0 means "use all timepoints".
-def max_timepoints = config.input?.max_timepoints != null \
-    ? (config.input.max_timepoints as Integer) \
-    : null
-if (max_timepoints != null && max_timepoints <= 0) {
-    max_timepoints = null
+// Optional: pick SPECIFIC timepoints to process. Accepts:
+//   - a single integer, e.g. 42
+//   - a JSON list of integers, e.g. [1, 5, 10]
+//   - a string with comma-separated values and inclusive ranges, e.g. "1,5,10-12"
+// null / missing = process every timepoint.
+// Out-of-range timepoints are silently dropped (they don't exist in the
+// input, so there's nothing to process).
+def parseTimepoints(spec) {
+    if (spec == null) return null
+    if (spec instanceof Number) {
+        int v = spec as Integer
+        if (v < 0) error "input.timepoints must be >= 0 (got ${spec})"
+        return [v]
+    }
+    if (spec instanceof List) {
+        if (spec.isEmpty()) return []
+        return spec.collect { entry ->
+            if (!(entry instanceof Number)) {
+                error "input.timepoints list entries must be integers (got ${entry})"
+            }
+            int v = entry as Integer
+            if (v < 0) error "input.timepoints must be >= 0 (got ${entry})"
+            v
+        }.toSorted().unique()
+    }
+    if (spec instanceof String) {
+        def trimmed = spec.trim()
+        if (!trimmed) return null
+        def result = new TreeSet()
+        trimmed.split(',').each { rawPart ->
+            def part = rawPart.trim()
+            if (!part) return  // skip empty (e.g. trailing comma)
+            if (part ==~ /\d+\s*-\s*\d+/) {
+                // Inclusive range "a-b"
+                def bits = part.split(/\s*-\s*/)
+                int a = bits[0] as Integer
+                int b = bits[1] as Integer
+                if (a > b) { int t = a; a = b; b = t }
+                (a..b).each { result << it }
+            } else if (part ==~ /\d+/) {
+                result << (part as Integer)
+            } else {
+                error "input.timepoints: cannot parse segment '${part}' " +
+                      "(use integers, comma-separated lists, and/or a-b ranges)"
+            }
+        }
+        return result as List
+    }
+    error "input.timepoints must be a number, a JSON list, or a string " +
+          "(got ${spec.getClass().simpleName})"
+}
+def selected_timepoints = parseTimepoints(config.input?.timepoints)
+if (selected_timepoints != null) {
+    log.info "Selecting timepoints: ${selected_timepoints} (from input.timepoints)"
 }
 
 // When preprocessing is skipped, raw acquisitions are typically anisotropic
@@ -331,6 +398,7 @@ def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stit
 def tracking_info = skip_tracking ? "SKIPPED" : "Enabled (ultrack)"
 def debug_info = run_debug_preprocessing ? "ENABLED (nuclei tracking per stage)" : "Disabled"
 def preproc_info = skip_preprocessing ? (preprocessed_dir ? "SKIPPED (using ${preprocessed_dir})" : "SKIPPED (using raw input)") : "Enabled"
+def aydin_info = aydin_cfg.enabled ? "Enabled (method=${aydin_cfg.method})" : "Disabled"
 
 log.info """
 ================================================
@@ -344,6 +412,7 @@ Voxel Size   : ${voxel_info}
 Merge        : ${merge_info}
 Downscale    : ${downscale_info}
 Seg mode     : ${seg_mode_info}
+Aydin        : ${aydin_info}
 Preprocess   : ${preproc_info}
 Tracking     : ${tracking_info}
 Debug preproc: ${debug_info}
@@ -1099,6 +1168,125 @@ tifffile.imwrite(
 )
 print(f"Wrote {out_name}")
 PYTHON_EOF
+    """
+}
+
+// ============================================================================
+// PROCESS: Aydin self-supervised denoising (optional, runs before deconvolution)
+// ============================================================================
+// Denoises one timepoint with the aydin library (Royer's lab). The output is
+// a uint16 ZYX TIFF with the input's ImageJ metadata preserved, ready to be
+// fed into PREPROCESS_DECONVOLVE / PREPROCESS_SELFNET. The aydin script
+// reuses helpers from spim_pipeline_fixed.py (same pattern as Self-Net), so
+// the shared library is staged into the work dir alongside the script.
+
+process AYDIN_DENOISE {
+    tag "t${String.format('%04d', timepoint)}"
+
+    maxRetries 1
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    publishDir "${params.output_dir}/00a_denoised",
+        mode: 'copy',
+        pattern: "*_denoised.tif"
+
+    publishDir "${params.output_dir}/logs/aydin",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    tuple val(timepoint), path(image_file)
+    path aydin_script
+    path shared_lib       // spim_pipeline_fixed.py (shared helpers)
+    val aydin_config
+
+    output:
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_*_denoised.tif"), emit: denoised
+    path "t${String.format('%04d', timepoint)}_aydin.log", emit: log
+
+    script:
+    def cfg = aydin_config
+    def t_formatted = String.format('%04d', timepoint)
+    def filename = image_file.name
+    def config_json_str = groovy.json.JsonOutput.toJson(cfg).replace("'", "\\'")
+    def script_name = aydin_script.name
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    # Activate micromamba environment
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    echo "============================================"
+    echo "Aydin self-supervised denoising"
+    echo "Timepoint: ${timepoint}"
+    echo "File:      ${filename}"
+    echo "Method:    ${cfg.method}"
+    echo "============================================"
+
+    if [ ! -f "${script_name}" ]; then
+        echo "ERROR: Aydin script not found: ${script_name}"
+        ls -lh
+        exit 1
+    fi
+
+    # Fail fast with a clear message if aydin isn't installed in the container.
+    # Otherwise the Python script aborts later with a less obvious ImportError.
+    if ! python3 -c "import aydin" 2>/dev/null; then
+        echo "ERROR: aydin is not installed in this container."
+        echo "Add 'aydin' to the pip: section of microscopy_env.yml and rebuild."
+        exit 1
+    fi
+
+    python3 << PYEOF
+import json
+import sys
+import subprocess
+
+config = json.loads('${config_json_str}')
+
+cmd = [
+    'python3', '${script_name}',
+    '--input_file', '${filename}',
+    '--outdir', '.',
+    '--method', str(config.get('method', 'nlm')),
+]
+if config.get('tile_shape'):
+    cmd.extend(['--tile_shape', str(config['tile_shape'])])
+if config.get('max_memory_mb'):
+    cmd.extend(['--max_memory_mb', str(int(config['max_memory_mb']))])
+
+print("Aydin command:", ' '.join(cmd))
+print()
+
+result = subprocess.run(cmd, capture_output=True, text=True)
+
+with open('t${t_formatted}_aydin.log', 'w') as f:
+    f.write("STDOUT:\\n")
+    f.write(result.stdout)
+    f.write("\\n\\nSTDERR:\\n")
+    f.write(result.stderr)
+
+print(result.stdout)
+if result.stderr:
+    print("STDERR:", result.stderr, file=sys.stderr)
+
+if result.returncode != 0:
+    print(f"ERROR: aydin failed with exit code {result.returncode}")
+    sys.exit(result.returncode)
+PYEOF
+
+    # Find the denoised output (script appends _denoised to the base name).
+    DENOISED_OUTPUT=\$(find . -maxdepth 1 -name "t${t_formatted}_*_denoised.tif" | head -1)
+    if [ -z "\$DENOISED_OUTPUT" ]; then
+        echo "ERROR: aydin did not produce a _denoised.tif output"
+        ls -lh
+        exit 1
+    fi
+    echo "Aydin output: \$DENOISED_OUTPUT"
     """
 }
 
@@ -2907,9 +3095,9 @@ workflow {
             .toSortedList { a, b -> a[0] <=> b[0] }
             .flatMap { it }
 
-        if (max_timepoints != null) {
-            log.info "Limiting input to first ${max_timepoints} timepoint(s) (input.max_timepoints)"
-            input_channel = input_channel.take(max_timepoints)
+        if (selected_timepoints != null) {
+            log.info "Selecting timepoints ${selected_timepoints} (input.timepoints)"
+            input_channel = input_channel.filter { tp, _ -> selected_timepoints.contains(tp as Integer) }
         }
 
         input_channel.subscribe { timepoint, f ->
@@ -3000,9 +3188,12 @@ workflow {
             file_tuples = file_tuples.sort { it[0] }
         }
 
-        if (max_timepoints != null && file_tuples.size() > max_timepoints) {
-            log.info "Limiting input to first ${max_timepoints} of ${file_tuples.size()} timepoint(s) (input.max_timepoints)"
-            file_tuples = file_tuples.take(max_timepoints)
+        if (selected_timepoints != null) {
+            int n_before = file_tuples.size()
+            file_tuples = file_tuples.findAll { tp, _ ->
+                selected_timepoints.contains(tp as Integer)
+            }
+            log.info "Selecting timepoints ${selected_timepoints} (input.timepoints): ${file_tuples.size()} of ${n_before} matched"
         }
 
         input_channel = Channel
@@ -3043,6 +3234,33 @@ workflow {
         was_cropped = false
     }
 
+    // 0b. OPTIONAL: Aydin self-supervised denoising (runs before deconvolution /
+    //     Self-Net; output replaces processing_input). Independent of
+    //     `preprocessing.enabled` so the user can also run "aydin only".
+    if (aydin_cfg.enabled) {
+        log.info "Aydin self-supervised denoising ENABLED — method=${aydin_cfg.method}"
+        if (aydin_cfg.tile_shape) {
+            log.info "  Tile shape:  ${aydin_cfg.tile_shape}"
+        }
+        if (aydin_cfg.max_memory_mb) {
+            log.info "  RAM budget:  ${aydin_cfg.max_memory_mb} MB"
+        }
+
+        aydin_script_ch = Channel.fromPath(params.aydin_script, checkIfExists: true)
+        shared_lib_ch   = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+
+        AYDIN_DENOISE(
+            processing_input,
+            aydin_script_ch.collect(),
+            shared_lib_ch.collect(),
+            aydin_cfg
+        )
+
+        processing_input = AYDIN_DENOISE.out.denoised
+    } else {
+        log.info "Aydin self-supervised denoising DISABLED"
+    }
+
     // 1. Extract/Configure metadata from FIRST timepoint
     first_timepoint = processing_input.first()
     EXTRACT_METADATA(first_timepoint, was_cropped)
@@ -3071,7 +3289,7 @@ workflow {
 
             log.info "Found ${preproc_files.size()} preprocessed files in: ${preprocessed_dir}"
 
-            // Sort by extracted timepoint and apply max_timepoints limit
+            // Sort by extracted timepoint and apply the timepoints filter
             // before building the channel.
             def preproc_tuples = preproc_files.collect { f ->
                 def m = (f.name =~ /(?i)t(\d+)/)
@@ -3082,9 +3300,12 @@ workflow {
                 return [tp, f]
             }.findAll { it[0] != null }.sort { it[0] }
 
-            if (max_timepoints != null && preproc_tuples.size() > max_timepoints) {
-                log.info "Limiting preprocessed input to first ${max_timepoints} of ${preproc_tuples.size()} timepoint(s) (input.max_timepoints)"
-                preproc_tuples = preproc_tuples.take(max_timepoints)
+            if (selected_timepoints != null) {
+                int n_before = preproc_tuples.size()
+                preproc_tuples = preproc_tuples.findAll { tp, _ ->
+                    selected_timepoints.contains(tp as Integer)
+                }
+                log.info "Selecting timepoints ${selected_timepoints} (input.timepoints): ${preproc_tuples.size()} of ${n_before} matched"
             }
 
             segmentation_input = Channel
@@ -3388,6 +3609,8 @@ workflow.onComplete {
     def benchmark_status = (config.benchmark?.enabled ?: false) ? "ENABLED" : "DISABLED"
     def tracking_status = (config.tracking?.enabled ?: false) ? "ENABLED (ultrack)" : "DISABLED"
     def debug_status = (config.preprocessing?.debug_preprocessing?.enabled ?: false) ? "ENABLED" : "DISABLED"
+    def aydin_status = (config.preprocessing?.aydin?.enabled ?: false) \
+        ? "ENABLED (${config.preprocessing.aydin.method})" : "DISABLED"
 
     log.info """
     ============================================================================
@@ -3399,6 +3622,7 @@ workflow.onComplete {
     ROI cropping : ${roi_status}
     Segmentation : ${seg_status}
     Voxel mode   : ${voxel_mode}
+    Aydin        : ${aydin_status}
     Merge        : ${merge_status}
     Downscale    : ${downscale_status}
     Tracking     : ${tracking_status}
@@ -3408,6 +3632,7 @@ workflow.onComplete {
 
     Results:
       ${config.roi_cropping?.enabled ? "- Cropped images     : ${params.output_dir}/00_cropped/" : ""}
+      ${(config.preprocessing?.aydin?.enabled ?: false) ? "- Denoised images    : ${params.output_dir}/00a_denoised/" : ""}
       - Preprocessed images : ${params.output_dir}/01_preprocessed/
       - Segmented masks     : ${params.output_dir}/02_segmented/
       ${ds_factor < 1.0 ? "- Downscaled labels  : ${params.output_dir}/02_segmented_downscaled/" : ""}
