@@ -206,7 +206,7 @@ python ultrack_viewer.py `
     --segments  03_tracking\results\segments.zarr `
     --processed 01_preprocessed\4D_hyperstack_processed.tif `
     --preload `
-    --load_downsample 2
+    --load-downsample 2
 ```
 
 Flag cheatsheet:
