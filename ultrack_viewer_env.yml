@@ -38,14 +38,15 @@ dependencies:
 
   # ---- napari viewer + Qt backend --------------------------------------
   # napari on conda-forge pulls in pyqt + qtpy; the script also imports
-  # qtpy directly (qtpy.QtWidgets / qtpy.QtCore).
+  # qtpy directly (qtpy.QtWidgets / qtpy.QtCore). pyqt is pulled in
+  # transitively by napari — don't pin it here, the loose version
+  # constraint fails on Windows builds.
   - napari>=0.5
-  - pyqt>=6.6
   - qtpy>=2.4
 
   # ---- Plotting ---------------------------------------------------------
   - matplotlib>=3.8
-  - matplotlib-base>=3.8
+  - matplotlib-base>=3.8z
 
   # ---- Lazy / chunked image IO -----------------------------------------
   - dask>=2024.1
