@@ -26,7 +26,7 @@
     "_comment_correct_y": "Flip Y axis to fix microscope orientation.",
     "correct_y": false,
     "_comment_skip_merge": "Skip the final 4D merge. Recommended for large data; you only need per-timepoint TIFFs for the viewer.",
-    "skip_merge": true
+    "skip_merge": false
   },
 
   "seqera_tower": {
