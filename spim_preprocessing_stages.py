@@ -548,8 +548,20 @@ def _run_cellpose(image: np.ndarray, cfg: dict, log: Callable[[str], None]) -> n
     diameter, thresholds, anisotropy, stitch_threshold) so nuclei counts
     are directly comparable to what the full pipeline produces.
     """
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    import torch
     from cellpose import models
+    cuda_available = torch.cuda.is_available()
+    device_str = f"  device={torch.cuda.get_device_name(0)}" if cuda_available else ""
+    log(f"  GPU requested={cfg['use_gpu']}  torch.cuda.is_available()={cuda_available}{device_str}")
+    if cfg["use_gpu"] and not cuda_available:
+        log("  WARNING: GPU was requested but CUDA is not visible to PyTorch — "
+            "Cellpose will silently fall back to CPU (much slower). Check "
+            "apptainer --nv passthrough and the SLURM GPU allocation "
+            "(--gres=gpu:1) for this task.")
     model = models.CellposeModel(gpu=cfg["use_gpu"])
+    log(f"  model.gpu={model.gpu} (Cellpose's own post-init device check)")
     log(f"  Cellpose: model={cfg['model']} diameter={cfg['diameter']} "
         f"do_3d={cfg['do_3d']} "
         f"anisotropy={cfg.get('anisotropy')} "

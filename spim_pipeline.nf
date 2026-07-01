@@ -2462,6 +2462,16 @@ process SIM_ONE_EXPERIMENT_TP {
 
     exec > >(tee sim_${exp_name}_t${String.format('%04d', timepoint)}.log) 2>&1
 
+    # GPU passthrough check — proves whether apptainer's --nv flag actually
+    # exposed the SLURM-allocated GPU inside the container, independent of
+    # what PyTorch/Cellpose report later. If this fails or shows no devices,
+    # the problem is in the SLURM allocation / apptainer runOptions, not the
+    # Python code.
+    echo "=== GPU passthrough check (nvidia-smi) ==="
+    nvidia-smi || echo "  nvidia-smi failed or found no GPU — passthrough is NOT working"
+    echo "CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES:-<unset>}"
+    echo "============================================"
+
     # Stage the sweep file under a stable name so the Python script can
     # reference it via --sweep_file (relative path). preproc_script and
     # stages_lib are already staged directly into the work dir root under
