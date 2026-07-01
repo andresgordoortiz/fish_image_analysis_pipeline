@@ -639,6 +639,15 @@ def run_one_experiment_tp(
     """
     cfg_pp = _deep_merge(pp_template, overrides)
     cfg_pp["image_scaling"] = cfg_pp.get("downscale_xy", {}).get("factor", 1.0)
+    # This function's own `save_intermediates` argument must be authoritative
+    # over whatever pp_template/base_config carries (that flag is typically
+    # set for the main pipeline's separate debug-preprocessing feature, and
+    # is unrelated to this sweep run). Without this override, run_pipeline()'s
+    # `save_intermediates or config.get("save_intermediates")` OR-check can
+    # force save_ints=True from the inherited config even when this call
+    # explicitly asked for False — and then crash because `ints_dir` below
+    # was never computed for that case.
+    cfg_pp["save_intermediates"] = save_intermediates
 
     exp_dir = os.path.join(output_dir, exp_name)
     os.makedirs(exp_dir, exist_ok=True)
