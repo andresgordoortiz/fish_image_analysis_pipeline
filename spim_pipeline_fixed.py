@@ -50,15 +50,14 @@ from tqdm import tqdm
 from typing import Optional, Tuple
 import subprocess
 
-# Stage pipeline (modular runner + simulation).
-from spim_preprocessing_stages import (
-    PIPELINE_STAGES,
-    STAGE_NAMES,
-    load_psf,
-    run_pipeline,
-    run_simulation,
-    save_intermediate,
-)
+# NOTE: spim_preprocessing_stages (PIPELINE_STAGES, run_pipeline, etc.) is
+# deliberately NOT imported here at module top-level. It has a circular
+# dependency back on this module's own helpers (image_scaling_intens et al.,
+# imported below in its own top-level import), so importing it eagerly here
+# raises "ImportError: cannot import name ... from partially initialized
+# module" whenever either module is the first one loaded fresh. The import
+# is deferred to inside main() below (its only use site), which guarantees
+# both modules have finished executing their top-level code first.
 
 
 # --- INICIO DE FUNCIONES ORIGINALES (HELPERS REUSED BY STAGES + SELF-NET) ---
@@ -537,6 +536,18 @@ def _build_argparser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 def main():
+    # Deferred/lazy import — see note near the top of this file explaining
+    # why this cannot be a module-level import (circular dependency with
+    # spim_preprocessing_stages, which itself imports helpers from here).
+    from spim_preprocessing_stages import (
+        PIPELINE_STAGES,
+        STAGE_NAMES,
+        load_psf,
+        run_pipeline,
+        run_simulation,
+        save_intermediate,
+    )
+
     parser = _build_argparser()
     args = parser.parse_args()
 
