@@ -3095,7 +3095,8 @@ workflow {
             : "t*_Channel *.tif"
         def matcher = FileSystems.getDefault().getPathMatcher("glob:${glob_pattern}")
         def all_tp_tuples = []
-        Files.list(input_dir.toPath()).each { p ->
+        // input_dir IS already a java.nio.Path (Nextflow's file() returns Path).
+        Files.list(input_dir).each { p ->
             if (matcher.matches(p.getFileName())) {
                 def m = (p.getFileName().toString() =~ /(?i)t(\d+)/)
                 def tp = m.find() ? m.group(1).toInteger() : 0
