@@ -3145,18 +3145,19 @@ workflow {
             [exp_name, overrides, tp, f]
         }
 
-        // Scaling factor per-experiment. The merged preprocessing config
-        // (base + overrides) determines the actual factor; if an experiment
-        // doesn't override downscale_xy.factor, the base config's factor
-        // (e.g. 0.33) is used. This MUST match the suffix the per-task
-        // Python script writes to disk — otherwise the rename pipeline in
-        // PREPROCESS_DECONVOLVE / Nextflow's emit: pattern can't find it.
+        // Scaling factor for the output filename suffix. None of the current
+        // 16 experiments override downscale_xy.factor in the sweep, so we
+        // just use the base config's factor. The per-task Python script
+        // computes the actual merged factor (base + overrides) for the
+        // processing itself; this scaling_pct only needs to match what
+        // run_pipeline writes to disk.
         def base_pp = config.preprocessing ?: [:]
         def base_factor = (base_pp.downscale_xy?.factor as BigDecimal)?.toDouble() ?: 1.0
+        // Emit base_factor for every (exp, tp) pair — same scaling across
+        // the whole sweep unless an experiment explicitly overrides
+        // downscale_xy.factor (none do today).
         def scaling_ch = sim_ch.map { tup ->
-            def overrides = tup[1]
-            def factor = (overrides?.downscale_xy?.factor as BigDecimal)?.toDouble() ?: base_factor
-            (int) round(factor * 100)
+            (int) round(base_factor * 100)
         }
 
         def exp_name_ch  = sim_ch.map { it[0] }
