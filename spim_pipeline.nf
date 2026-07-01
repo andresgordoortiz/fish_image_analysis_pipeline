@@ -3113,7 +3113,7 @@ workflow {
         // else 1.0). Used to make output filenames match the CLI convention.
         def scaling_ch = sim_ch.map { exp_name, overrides, tp, f ->
             def factor = (overrides?.downscale_xy?.factor as BigDecimal)?.toDouble() ?: 1.0
-            int(round(factor * 100))
+            (int) round(factor * 100)
         }
 
         def exp_name_ch  = sim_ch.map { it[0] }
