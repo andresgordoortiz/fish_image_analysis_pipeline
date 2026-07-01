@@ -3157,7 +3157,7 @@ workflow {
         // the whole sweep unless an experiment explicitly overrides
         // downscale_xy.factor (none do today).
         def scaling_ch = sim_ch.map { tup ->
-            (int) round(base_factor * 100)
+            (int) Math.round(base_factor * 100)
         }
 
         def exp_name_ch  = sim_ch.map { it[0] }
