@@ -2446,6 +2446,7 @@ process SIM_ONE_EXPERIMENT_TP {
 
     script:
     def overrides_str = exp_overrides_json.replace("'", "\\'")
+    def filename = image_file.name
     """
     #!/bin/bash
     set -euo pipefail
@@ -2455,7 +2456,7 @@ process SIM_ONE_EXPERIMENT_TP {
 
     echo "============================================"
     echo "Simulation: experiment=${exp_name}  timepoint=${timepoint}"
-    echo "  Input  : ${image_file}"
+    echo "  Input  : ${filename}"
     echo "  Scaling: ${scaling_pct}%"
     echo "============================================"
 
@@ -2478,7 +2479,7 @@ with open('sweep.json') as f:
     sweep = json.load(f)
 
 # Override input to the single staged file (path relative to cwd).
-staged_input = '${image_file}'
+staged_input = '${filename}'
 sweep['input'] = [os.path.basename(staged_input)]
 
 # Inject per-experiment overrides (already a JSON string from Groovy).
