@@ -1,16 +1,44 @@
 #!/usr/bin/env python3
 """
-SPIM Image Preprocessing Pipeline
-IMP Vienna - Andrés Gordo & Guilherme Ventura
+SPIM Image Preprocessing Pipeline — driver script
+==================================================
 
 Deconvolution and preprocessing for lightsheet microscopy data.
+
+This is the script invoked by Nextflow's PREPROCESS_DECONVOLVE process.
+It loads the input image, reads voxel sizes from metadata, runs the
+modular preprocessing pipeline defined in ``spim_preprocessing_stages.py``,
+and writes the result as a uint16 TIFF.
+
+CLI
+---
+    python3 spim_pipeline_fixed.py \
+        --input_file t0001.tif \
+        --outdir . \
+        --config_json preprocessing_config.json
+
+``--config_json`` is the canonical entry point. ``--metadata_json`` is
+optional and only used by the Nextflow wrapper (it overrides voxel sizes
+in the config). For interactive parameter tuning, use ``--simulate`` with
+a ``--sweep_file``.
+
+For backwards compatibility the legacy ``--no_clahe`` / ``--no_z_correction``
+/ ``--no_shading`` flags are still accepted and translated into config
+overrides. They are deprecated and will be removed.
+
+Helper functions in this file (image_scaling_intens, z_intensity_correction,
+shading_correct_xy_estimated, clahe_3d_stack, reslice, image_postprocessing,
+getNormalizationThresholds, remove_outliers_image, print_resource_usage,
+read_tiff_voxel_size, read_nd2_voxel_size) are imported by
+``spim_preprocessing_stages.py`` and ``spim_selfnet_preprocess.py`` and
+should not be moved or renamed without updating both.
 """
 
 import argparse
-import psutil
-import time
+import json
 import os
 import sys
+import time
 import numpy as np
 import tifffile
 import scipy.ndimage as ndi
@@ -18,11 +46,22 @@ from skimage.transform import rescale, resize
 import cv2
 import pims
 from WBNS import WBNS_image
-import RedLionfishDeconv as rl
 from tqdm import tqdm
 from typing import Optional, Tuple
 import subprocess
 
+# Stage pipeline (modular runner + simulation).
+from spim_preprocessing_stages import (
+    PIPELINE_STAGES,
+    STAGE_NAMES,
+    load_psf,
+    run_pipeline,
+    run_simulation,
+    save_intermediate,
+)
+
+
+# --- INICIO DE FUNCIONES ORIGINALES (HELPERS REUSED BY STAGES + SELF-NET) ---
 
 def image_scaling_intens(img, min_val, max_val, print_res=False):
     """Normalize image intensity to given range."""
@@ -284,7 +323,14 @@ def reslice(img, position, x_res, z_res):
 
 
 def image_postprocessing(img, resolution_px, resolution_pz, noise_lvl, sigma):
-    """Apply background subtraction and Gaussian smoothing."""
+    """Apply background subtraction and Gaussian smoothing.
+
+    Kept for backward compatibility with the Self-Net script, which calls
+    it directly. The modular pipeline (``spim_preprocessing_stages.py``)
+    uses ``stage_wbns`` and ``stage_gaussian`` instead — those respect
+    ``enabled`` toggles in the config, while this legacy helper is gated by
+    sentinel values (resolution_px > 0, sigma > 0).
+    """
     steps = []
     if resolution_px > 0:
         steps.append("Remove Background/Noise")
@@ -337,6 +383,7 @@ def remove_outliers_image(img, low_thres, high_thres, print_res=False):
 
 def print_resource_usage():
     """Print current CPU, RAM, and GPU usage."""
+    import psutil
     vm = psutil.virtual_memory()
     cpu_pct = psutil.cpu_percent(interval=0.1)
     print(
@@ -364,370 +411,233 @@ def print_resource_usage():
         pass
 
 
+# --- FIN DE FUNCIONES ORIGINALES ---
+
+
+# ---------------------------------------------------------------------------
+# CLI / config helpers
+# ---------------------------------------------------------------------------
+
+def _load_config(path: str) -> dict:
+    """Load a JSON config file. Strips UTF-8 BOM (Windows-edited files)."""
+    with open(path) as f:
+        raw = f.read()
+    if raw.startswith("﻿"):
+        raw = raw[1:]
+    return json.loads(raw)
+
+
+def _apply_legacy_flag_overrides(config_pp: dict, args: argparse.Namespace) -> dict:
+    """Translate deprecated ``--no_*`` flags into per-stage ``enabled: false``
+    overrides so old CLI invocations keep working while we transition."""
+    if getattr(args, "no_clahe", False):
+        config_pp.setdefault("clahe", {})["enabled"] = False
+    if getattr(args, "no_z_correction", False):
+        config_pp.setdefault("z_intensity_correction", {})["enabled"] = False
+    if getattr(args, "no_shading", False):
+        config_pp.setdefault("shading_correction", {})["enabled"] = False
+    return config_pp
+
+
+def _resolve_voxel_size(args, config_pp: dict, metadata: Optional[dict] = None):
+    """Pick the voxel size to use, in priority order:
+
+    1. ``--xy_pixel`` / ``--z_pixel`` CLI overrides (standalone use)
+    2. ``metadata.json`` (Nextflow path)
+    3. ``preprocessing.voxel_size`` from config (manual mode)
+    4. ``voxel_size`` from config (top-level — the Nextflow pipeline
+       writes voxel sizes there from auto_detect)
+    5. Auto-detect from the TIFF / ND2 file
+
+    Returns (x_um, y_um, z_um).
+    """
+    # CLI overrides
+    if getattr(args, "xy_pixel", 0.0) and float(args.xy_pixel) > 0:
+        x = float(args.xy_pixel)
+        y = float(args.y_pixel or args.xy_pixel)
+        z = float(args.z_pixel or 2.0)
+        return (x, y, z)
+
+    # metadata.json
+    if metadata:
+        x = metadata.get("x_resolution_um")
+        y = metadata.get("y_resolution_um")
+        z = (metadata.get("imagej") or {}).get("spacing")
+        if x and y and z:
+            return (float(x), float(y), float(z))
+
+    # config.voxel_size (the location the Nextflow pipeline writes to)
+    voxel_cfg = config_pp.get("voxel_size") or {}
+    if voxel_cfg.get("x_um") and voxel_cfg.get("z_um"):
+        return (
+            float(voxel_cfg["x_um"]),
+            float(voxel_cfg.get("y_um", voxel_cfg["x_um"])),
+            float(voxel_cfg["z_um"]),
+        )
+
+    # fall back to file metadata
+    ext = os.path.splitext(args.input_file)[1].lower()
+    if ext in (".tif", ".tiff"):
+        voxel = read_tiff_voxel_size(args.input_file)
+    elif ext == ".nd2":
+        img = pims.open(args.input_file)
+        voxel = read_nd2_voxel_size(img)
+    else:
+        voxel = (0.347, 0.347, 2.0)
+    return tuple(float(v) for v in voxel)
+
+
+def _load_input_image(path: str) -> np.ndarray:
+    """Load a TIFF or ND2 file as a uint16 numpy array."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".tif", ".tiff"):
+        return tifffile.imread(path).astype(np.uint16)
+    if ext == ".nd2":
+        img = pims.open(path)
+        return np.array(img, dtype=np.uint16, copy=False)
+    raise ValueError(f"Unsupported input format: {ext}")
+
+
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="SPIM Image Preprocessing — modular pipeline driver.",
+    )
+    p.add_argument("--input_file", type=str,
+                   help="Path to input image (not required for --simulate).")
+    p.add_argument("--outdir", type=str,
+                   help="Output directory (not required for --simulate).")
+    p.add_argument("--metadata_json", type=str,
+                   help="Optional metadata JSON (Nextflow wrapper uses this "
+                        "to inject per-timepoint voxel sizes).")
+    p.add_argument("--config_json", type=str,
+                   help="Path to a JSON file with the full preprocessing "
+                        "config (canonical entry point).")
+    # Legacy flags (deprecated; translated into config overrides).
+    p.add_argument("--xy_pixel", type=float, default=0.0,
+                   help="[deprecated] Force XY pixel size (µm). Use "
+                        "config.voxel_size instead.")
+    p.add_argument("--z_pixel", type=float, default=0.0,
+                   help="[deprecated] Force Z pixel size (µm).")
+    p.add_argument("--no_clahe", action="store_true",
+                   help="[deprecated] Disable CLAHE. Use config.clahe.enabled.")
+    p.add_argument("--no_z_correction", action="store_true",
+                   help="[deprecated] Disable Z-intensity correction.")
+    p.add_argument("--no_shading", action="store_true",
+                   help="[deprecated] Disable shading correction.")
+    # Simulation mode
+    p.add_argument("--simulate", action="store_true",
+                   help="Run parameter sweep / Cellpose benchmark mode.")
+    p.add_argument("--sweep_file", type=str,
+                   help="Path to sweep JSON (required for --simulate).")
+    return p
+
+
+# ---------------------------------------------------------------------------
+# main()
+# ---------------------------------------------------------------------------
+
 def main():
-    """Main preprocessing pipeline — vanilla notebook flow."""
-    parser = argparse.ArgumentParser(description="SPIM Image Preprocessing")
-
-    # Paths
-    parser.add_argument(
-        "--input_file", type=str, required=True, help="Path to input image"
-    )
-    parser.add_argument("--outdir", type=str, required=True, help="Output directory")
-    parser.add_argument("--psf_path", type=str, required=True, help="Path to PSF model")
-
-    # Image Parameters
-    parser.add_argument(
-        "--image_scaling", type=float, default=1.0, help="Image scaling factor"
-    )
-    parser.add_argument(
-        "--xy_pixel",
-        type=float,
-        default=0.0,
-        help="Force XY pixel size (um). 0 to read from metadata",
-    )
-    parser.add_argument(
-        "--z_pixel",
-        type=float,
-        default=0.0,
-        help="Force Z pixel size (um). 0 to read from metadata",
-    )
-
-    # Processing Flags
-    parser.add_argument("--no_clahe", action="store_true", help="Disable CLAHE")
-    parser.add_argument(
-        "--no_z_correction", action="store_true", help="Disable Z intensity correction"
-    )
-    parser.add_argument(
-        "--no_shading", action="store_true", help="Disable Shading correction"
-    )
-
-    # Deconvolution Params
-    parser.add_argument(
-        "--padding", type=int, default=32, help="Padding for deconvolution"
-    )
-    parser.add_argument(
-        "--niter", type=int, default=3, help="Iterations for 3D Deconvolution"
-    )
-    parser.add_argument(
-        "--niterz", type=int, default=3, help="Iterations for 2D XZ Deconvolution"
-    )
-
-    # Normalization Params
-    parser.add_argument(
-        "--min_v", type=float, default=0, help="Min value for normalization"
-    )
-    parser.add_argument(
-        "--max_v", type=float, default=65535, help="Max value for normalization"
-    )
-    parser.add_argument(
-        "--percentile_low",
-        type=float,
-        default=40,
-        help="Low percentile for outlier removal",
-    )
-    parser.add_argument(
-        "--percentile_high",
-        type=float,
-        default=99.99,
-        help="High percentile for outlier removal",
-    )
-
-    # Background / Post-processing
-    parser.add_argument(
-        "--resolution_px0", type=float, default=10, help="BG Subtraction resolution"
-    )
-    parser.add_argument(
-        "--resolution_pz0", type=float, default=10, help="BG Subtraction resolution Z"
-    )
-    parser.add_argument(
-        "--noise_lvl", type=int, default=2, help="Noise level (MUST BE INTEGER)"
-    )
-    parser.add_argument(
-        "--sigma", type=float, default=1.0, help="Gaussian smoothing sigma"
-    )
-
+    parser = _build_argparser()
     args = parser.parse_args()
 
-    # Validate inputs
-    if not os.path.isfile(args.input_file):
-        print(f"ERROR: Input file does not exist: {args.input_file}")
-        sys.exit(1)
+    # Simulation mode — separate code path.
+    if args.simulate:
+        if not args.sweep_file:
+            parser.error("--simulate requires --sweep_file")
+        print(f"[Simulation mode] Sweep file: {args.sweep_file}")
+        run_simulation(args.sweep_file, log=print)
+        return
 
-    if args.niter > 0 or args.niterz > 0:
-        if not os.path.isfile(args.psf_path):
-            print(f"ERROR: PSF file does not exist: {args.psf_path}")
-            sys.exit(1)
+    # Standard mode — require input/output/config.
+    if not args.input_file:
+        parser.error("--input_file is required (unless --simulate)")
+    if not args.outdir:
+        parser.error("--outdir is required (unless --simulate)")
+    if not args.config_json:
+        parser.error("--config_json is required (canonical)")
 
-    # Log parameters for reproducibility
-    print("\n" + "=" * 60)
-    print("SPIM PREPROCESSING PIPELINE (vanilla)")
-    print("=" * 60)
-    print(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"\nParameters:")
-    for arg, value in sorted(vars(args).items()):
-        print(f"  {arg}: {value}")
-    print("=" * 60 + "\n")
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # Mapping boolean flags
-    apply_clahe = not args.no_clahe
-    apply_z_intensity_correction = not args.no_z_correction
-    apply_shading_correct = not args.no_shading
-    percentiles_source = (args.percentile_low, args.percentile_high)
+    # Load config + apply legacy flag overrides for backward compatibility.
+    config = _load_config(args.config_json)
+    config_pp = (config.get("preprocessing") or {}).copy()
+    _apply_legacy_flag_overrides(config_pp, args)
 
-    if not os.path.exists(args.outdir):
-        try:
-            os.makedirs(args.outdir)
-        except FileExistsError:
-            pass
+    # Backward-compat alias for downstream consumers (merge_hyperstack.py
+    # reads ``config.preprocessing.image_scaling`` directly).
+    config_pp["image_scaling"] = config_pp.get("downscale_xy", {}).get("factor", 1.0)
 
-    if args.xy_pixel > 0:
-        tempScale = args.z_pixel / args.xy_pixel
-    else:
-        tempScale = 0
+    # Resolve voxel size.
+    metadata = None
+    if args.metadata_json and os.path.isfile(args.metadata_json):
+        with open(args.metadata_json) as f:
+            metadata = json.load(f)
+    voxel_size = _resolve_voxel_size(args, config_pp, metadata)
+    print(f"Voxel size (µm): {voxel_size}")
 
-    # PSF Loading
-    if args.niter > 0 or args.niterz > 0:
-        t0 = time.time()
-        print(f"Loading PSF from {args.psf_path}")
-        psf = tifffile.imread(args.psf_path)
-        psf_shape = psf.shape
-        if args.image_scaling > 0 and args.image_scaling != 1.0:
-            psf = rescale(
-                psf,
-                (args.image_scaling, args.image_scaling, args.image_scaling),
-                order=3,
-                preserve_range=True,
-                anti_aliasing=True,
-            )
-            print(f"     -PSF dimension from : {psf_shape} to {psf.shape}")
-        psf_f = psf.astype(np.float32)
-        psf = psf_f / psf_f.sum()
-        print(f"[Timer] PSF preparation took {time.time() - t0:.2f} seconds")
-
-    # Processing Single Image
-    image_path = args.input_file
-    image_name = os.path.basename(image_path)
-
-    print(f"\n[Processing] {image_name}")
+    # Load image.
+    print(f"\n[Processing] {os.path.basename(args.input_file)}")
+    print_resource_usage()
+    t0 = time.time()
+    img = _load_input_image(args.input_file)
+    print(f"  Loaded shape={img.shape} dtype={img.dtype} "
+          f"size={img.nbytes/(1024**3):.3f} GB  ({time.time()-t0:.2f}s)")
     print_resource_usage()
 
-    start_time_total = time.time()
+    # Intermediates directory.
+    save_ints = bool(config_pp.get("save_intermediates", False))
+    intermediates_dir = None
+    if save_ints:
+        subdir = config_pp.get("intermediates_subdir", "intermediates")
+        intermediates_dir = os.path.join(args.outdir, subdir)
 
-    # Load Image
-    t0 = time.time()
-    ext = os.path.splitext(image_name)[1].lower()
-
-    try:
-        if ext in [".tif", ".tiff"]:
-            print("  Loading TIFF image...")
-            img = tifffile.imread(image_path).astype(np.uint16)
-            voxel_size = read_tiff_voxel_size(image_path)
-        elif ext == ".nd2":
-            print("  Loading ND2 image...")
-            img = pims.open(image_path)
-            voxel_size = read_nd2_voxel_size(img)
-            img = np.array(img, dtype=np.uint16, copy=False)
+    # Run the modular pipeline.
+    print("\n=== Running modular preprocessing pipeline ===")
+    print(f"  Method         : {config_pp.get('method', 'deconvolution')}")
+    print(f"  Save ints      : {save_ints}")
+    enabled_stages = []
+    for stage_name, _fn, cfg_key in PIPELINE_STAGES[1:]:
+        if cfg_key is None:
+            enabled_stages.append(stage_name)
+            continue
+        sub_cfg = config_pp.get(cfg_key, {}) or {}
+        is_enabled = sub_cfg.get("enabled", True) if cfg_key != "downscale_xy" else True
+        if cfg_key == "downscale_xy":
+            enabled_stages.append(f"{stage_name} (factor={config_pp.get('downscale_xy',{}).get('factor',1.0)})")
+        elif is_enabled:
+            enabled_stages.append(stage_name)
         else:
-            print(f"ERROR: Unsupported format: {ext}")
-            sys.exit(1)
-    except Exception as e:
-        print(f"ERROR: Failed to load image: {e}")
-        sys.exit(1)
+            enabled_stages.append(f"{stage_name} [DISABLED]")
+    print("  Stages:")
+    for s in enabled_stages:
+        print(f"    - {s}")
 
-    t1 = time.time()
-    print(f"[Timer] Image loading took {t1 - t0:.2f} seconds")
-    print(f"  - shape: {img.shape}, dtype: {img.dtype}")
-    print(f"  - estimated size (GB): {img.nbytes / (1024**3):.3f}")
-    print_resource_usage()
-
-    physical_pixel_sizeX, physical_pixel_sizeY, physical_pixel_sizeZ = voxel_size
-
-    if tempScale > 0:
-        physical_pixel_sizeX = args.xy_pixel
-        physical_pixel_sizeZ = args.z_pixel
-
-    print(f"  - voxel sizes (um): {voxel_size}")
-
-    # Image scaling (XY only)
-    if args.image_scaling > 0 and args.image_scaling != 1.0:
-        t0 = time.time()
-        img_shape = img.shape
-        print(f"  - image dimension : {img.shape}, scaling {args.image_scaling}")
-        img = rescale(
-            img,
-            (1.0, args.image_scaling, args.image_scaling),
-            order=3,
-            preserve_range=True,
-            anti_aliasing=True,
-        )
-        physical_pixel_sizeX /= args.image_scaling
-        print(f"  - image dimension from : {img_shape} to {img.shape}")
-        t1 = time.time()
-        print(f"[Timer] Image rescaling took {t1 - t0:.2f} seconds")
-        print_resource_usage()
-
-    # Store original shape BEFORE reslicing
-    img_shape = img.shape
-
-    scale = physical_pixel_sizeX / physical_pixel_sizeZ
-
-    # Pre-processing: shading correction
-    if apply_shading_correct:
-        t0 = time.time()
-        print("[Check-in] Running shading_correct_xy_estimated...")
-        img, field = shading_correct_xy_estimated(
-            img, sigma_xy=96, z_axis=0, per_slice=False
-        )
-        t1 = time.time()
-        print(f"[Timer] Shading correction took {t1 - t0:.2f} seconds")
-        print_resource_usage()
-
-    # Pre-processing: z-intensity correction
-    if apply_z_intensity_correction:
-        t0 = time.time()
-        print("[Check-in] Running z_intensity_correction...")
-        img, scales = z_intensity_correction(
-            img, z_axis=0, method="p95", smooth_window=11
-        )
-        t1 = time.time()
-        print(f"[Timer] Z-intensity correction took {t1 - t0:.2f} seconds")
-        print_resource_usage()
-
-    # Isotropic Reslicing
-    if abs(1.0 - scale) > 1e-4:
-        t0 = time.time()
-        print("[Check-in] Reslicing to isotropic...")
-        img = reslice(img, "xy", physical_pixel_sizeX, physical_pixel_sizeZ)
-        t1 = time.time()
-        print(f"[Timer] Reslicing took {t1 - t0:.2f} seconds")
-
-    img = img.astype(np.float32)
-    new_img_shape = img.shape
-
-    # Recalculate voxel size after reslicing
-    new_physical_pixel_sizeZ = img_shape[0] * physical_pixel_sizeZ / new_img_shape[0]
-    print(
-        f"  - image dimension from : {img_shape} to {new_img_shape} after isotropic interpolation"
+    start_time = time.time()
+    processed, ctx = run_pipeline(
+        img,
+        voxel_size,
+        config_pp,
+        psf=None,
+        intermediates_dir=intermediates_dir,
+        save_intermediates=save_ints,
     )
-    print(f"  - z-space from : {physical_pixel_sizeZ} to {new_physical_pixel_sizeZ}")
-    physical_pixel_sizeZ = new_physical_pixel_sizeZ
-    print_resource_usage()
+    elapsed = time.time() - start_time
+    print(f"\n[Done] Preprocessing finished in {elapsed:.1f}s")
+    print(f"  Final shape: {processed.shape}  dtype: {processed.dtype}")
+    if "timings" in ctx:
+        print("  Per-stage timings:")
+        for stage_name, t in ctx["timings"].items():
+            print(f"    {stage_name}: {t:.2f}s")
 
-    # Recalculate resolution for BG subtraction
-    resolution_px = int(args.resolution_px0 / new_physical_pixel_sizeZ)
-    resolution_pz = int(args.resolution_pz0 / new_physical_pixel_sizeZ)
-    print(f"  BG subtraction : {resolution_px},  {resolution_pz}")
-
-    # 3D Deconvolution
-    if args.niter > 0:
-        t0 = time.time()
-        print("[Check-in] Running 3D deconvolution...")
-        img = image_scaling_intens(img, args.min_v, args.max_v, True)
-        img = np.pad(img, args.padding, mode='reflect')
-        imgSizeGB = img.nbytes / (1024**3)
-        print(f"    -size(GB) : {imgSizeGB:.3f}")
-        print_resource_usage()
-        res_gpu = rl.doRLDeconvolutionFromNpArrays(
-            img, psf, niter=args.niter, resAsUint8=False
-        )
-        img = res_gpu[
-            args.padding : -args.padding,
-            args.padding : -args.padding,
-            args.padding : -args.padding,
-        ]
-        t1 = time.time()
-        print(f"[Timer] 3D deconvolution took {t1 - t0:.2f} seconds")
-        print_resource_usage()
-
-    # 2D (XZ) Deconvolution
-    if args.niterz > 0:
-        t0 = time.time()
-        print("[Check-in] Running 2D (XZ) deconvolution...")
-        img = image_scaling_intens(img, args.min_v, args.max_v, True)
-        img_xz = np.transpose(img, [1, 0, 2])
-        psf_xz = np.transpose(psf, [1, 0, 2])
-        img_xz = np.pad(img_xz, args.padding, mode='reflect')
-        imgSizeGB = img_xz.nbytes / (1024**3)
-        print(f"    img_xz -size(GB) : {imgSizeGB:.3f}")
-        print_resource_usage()
-        res_gpu = rl.doRLDeconvolutionFromNpArrays(
-            img_xz, psf_xz, niter=args.niterz, resAsUint8=False
-        )
-        img_xz = res_gpu[
-            args.padding : -args.padding,
-            args.padding : -args.padding,
-            args.padding : -args.padding,
-        ]
-        img = np.transpose(img_xz, [1, 0, 2])
-        psf = np.transpose(psf_xz, [1, 0, 2])
-        t1 = time.time()
-        print(f"[Timer] 2D (XZ) deconvolution took {t1 - t0:.2f} seconds")
-        print_resource_usage()
-
-    # Post-processing (WBNS + Gaussian smoothing)
-    t0 = time.time()
-    print("[Check-in] Running post-processing...")
-    img = image_postprocessing(
-        img, resolution_px, resolution_pz, args.noise_lvl, args.sigma
-    )
-    t1 = time.time()
-    print(f"[Timer] Post-processing took {t1 - t0:.2f} seconds")
-    print_resource_usage()
-
-    # CLAHE on XZ transposed (matching notebook)
-    if apply_clahe:
-        t0 = time.time()
-        print("[Check-in] Applying CLAHE...")
-        img_xz = np.transpose(img, [1, 0, 2])
-        img_xz = clahe_3d_stack(
-            img_xz, clip_limit=0.01, kernel_size=(64, 64), axis=0
-        )
-        img = np.transpose(img_xz, [1, 0, 2])
-        t1 = time.time()
-        print(f"[Timer] CLAHE took {t1 - t0:.2f} seconds")
-        print_resource_usage()
-
-    # Normalization
-    if percentiles_source[0] > 0 or percentiles_source[1] < 100:
-        t0 = time.time()
-        print("[Check-in] Removing outliers and normalizing intensities...")
-        low_thres, high_thres = getNormalizationThresholds(img, percentiles_source)
-        img = remove_outliers_image(img, low_thres, high_thres)
-        t1 = time.time()
-        print(f"[Timer] Outlier removal and normalization took {t1 - t0:.2f} seconds")
-        print_resource_usage()
-
-    # Final Save
-    t0 = time.time()
-    print("[Check-in] Final intensity scaling and saving...")
-    img = image_scaling_intens(img, args.min_v, args.max_v, True)
-    img = img.astype(np.uint16)
-    t1 = time.time()
-    print(f"[Timer] Final scaling and conversion took {t1 - t0:.2f} seconds")
-
-    # Save image
-    t0 = time.time()
-    base_name = os.path.splitext(image_name)[0]
-    image_out_name = f"{base_name}_{int(100 * args.image_scaling)}.tif"
-    img_out_path = os.path.join(args.outdir, image_out_name)
-    tifffile.imwrite(img_out_path, img)
-    t1 = time.time()
-    print(f"  Saved processed image to: {img_out_path}")
-    print(f"[Timer] Saving image took {t1 - t0:.2f} seconds")
-
-    # Validate output
-    if not os.path.isfile(img_out_path):
-        print(f"ERROR: Output file was not created: {img_out_path}")
-        sys.exit(1)
-
-    output_size = os.path.getsize(img_out_path)
-    if output_size == 0:
-        print(f"ERROR: Output file is empty: {img_out_path}")
-        sys.exit(1)
-
-    print(f"[Success] Output size: {output_size / (1024**2):.2f} MB")
-    elapsed_time = time.time() - start_time_total
-    print(f"[Done] Elapsed Time: {elapsed_time:.4f} seconds")
+    # Save the final processed image with the legacy naming convention that
+    # Nextflow expects: {base}_{int(100*factor)}.tif
+    base_name = os.path.splitext(os.path.basename(args.input_file))[0]
+    factor = float(config_pp.get("downscale_xy", {}).get("factor", 1.0))
+    scaling_pct = int(round(factor * 100))
+    out_name = f"{base_name}_{scaling_pct}.tif"
+    out_path = os.path.join(args.outdir, out_name)
+    tifffile.imwrite(out_path, processed.astype(np.uint16))
+    print(f"  Saved: {out_path}")
     print_resource_usage()
 
 

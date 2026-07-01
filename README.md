@@ -67,11 +67,80 @@ Toggles to control what runs (set to `true` / `false`):
 
 | Section | What it does |
 | --- | --- |
-| `preprocessing.enabled` | Shading + Z correction + deconvolution (or Self-Net) |
+| `preprocessing.enabled` | Modular preprocessing pipeline (shading + Z correction + deconv + …) |
+| `preprocessing.method` | `"deconvolution"` (GPU Richardson-Lucy) or `"selfnet"` |
 | `roi_cropping.enabled`  | Crop every timepoint to a Fiji `.roi` rectangle |
 | `segmentation.enabled`  | Cellpose 3D segmentation |
 | `tracking.enabled`      | ultrack cell tracking (needs segmentation on) |
 | `benchmark.enabled`     | Per-timepoint timing/memory report |
+
+#### Preprocessing sub-stages (all individually toggleable)
+
+Each step in the modular preprocessing pipeline has its own `enabled` flag and its own parameters under `preprocessing`:
+
+```json
+"preprocessing": {
+  "enabled": true,
+  "method": "deconvolution",
+
+  "downscale_xy":           { "factor": 0.33 },
+  "shading_correction":     { "enabled": true, "sigma_xy": 96.0, "max_amplification": 2.0 },
+  "z_intensity_correction": { "enabled": true, "method": "p95", "smooth_window": 11 },
+  "isotropic_reslice":      { "enabled": true },
+  "deconvolution_3d":       { "enabled": true, "psf_path": "/path/psf.tif", "niter": 3, "padding": 64 },
+  "deconvolution_xz":       { "enabled": true, "niter": 3, "padding": 64 },
+  "background_subtraction": { "enabled": true, "resolution_xy": 10, "resolution_xz": 10, "noise_lvl": 2 },
+  "gaussian_smooth":        { "enabled": true, "sigma": 1.2 },
+  "clahe":                  { "enabled": true, "clip_limit": 0.01, "kernel_size": 64, "p_low": 0.5, "p_high": 99.5 },
+  "percentile_normalization": { "enabled": true, "percentile_low": 10.0, "percentile_high": 99.9 },
+  "final_cast":             { "min_v": 0, "max_v": 65535, "dtype": "uint16" },
+
+  "save_intermediates": true
+}
+```
+
+To turn off a stage (e.g. CLAHE for a quick test), set `preprocessing.clahe.enabled: false`. The pipeline skips that stage entirely and skips its intermediate save.
+
+#### `--simulate` mode — parameter sweep + Cellpose benchmark
+
+For tuning preprocessing parameters on a single image without spinning up the full Nextflow pipeline:
+
+```bash
+# 1. Write a sweep file describing the experiments to try
+cat > sweep.json <<'EOF'
+{
+  "base_config": "./config.json",
+  "input": ["./subset/t0001.tif"],
+  "output_dir": "./simulation_results/",
+  "save_intermediates": false,
+  "experiments": [
+    { "name": "no_clahe",  "overrides": { "clahe":  { "enabled": false } } },
+    { "name": "clahe_005", "overrides": { "clahe":  { "clip_limit": 0.005 } } },
+    { "name": "clahe_020", "overrides": { "clahe":  { "clip_limit": 0.020 } } },
+    { "name": "no_smooth", "overrides": { "gaussian_smooth": { "enabled": false } } },
+    { "name": "tight_norm","overrides": { "percentile_normalization": { "percentile_low": 20, "percentile_high": 99.5 } } }
+  ]
+}
+EOF
+
+# 2. Run the sweep — each experiment is preprocessed, segmented with Cellpose,
+#    and nuclei are counted.
+python3 spim_pipeline_fixed.py --simulate --sweep_file sweep.json
+
+# 3. Compare results
+cat simulation_results/summary.md
+```
+
+Per experiment you get:
+
+```
+simulation_results/<exp_name>/
+├── t0001_33.tif            # preprocessed image (uint16)
+├── t0001_33_mask.tif       # Cellpose segmentation mask (uint16)
+└── t0001_33_metadata.json  # config used + per-stage timings + intensity stats
+```
+
+Plus a `summary.csv` and `summary.md` ranking experiments by runtime, mean intensity, and **detected nuclei count** (from Cellpose). Open each `_33.tif` in napari/Fiji for visual inspection.
 
 **Path tips:**
 

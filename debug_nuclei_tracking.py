@@ -15,8 +15,8 @@ JSON outputs and generates comparison plots.
 Usage (standalone — normally called by Nextflow)
 -------------------------------------------------
     python debug_nuclei_tracking.py \
-        --input_file intermediates/07_after_wbns.tif \
-        --stage_name 07_after_wbns \
+        --input_file intermediates/08_after_wbns.tif \
+        --stage_name 08_after_wbns \
         --cellpose_model /path/to/model \
         --diameter 30 \
         --outdir ./debug_results/ \

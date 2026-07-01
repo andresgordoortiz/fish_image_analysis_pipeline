@@ -16,18 +16,31 @@ self-contained and wired into the SPIM Nextflow pipeline.
 
 All the surrounding correction / post-processing steps (shading, Z-intensity,
 WBNS background subtraction, Gaussian smoothing, CLAHE, percentile
-normalisation) are reused from ``spim_pipeline_fixed.py`` so the output is a
-drop-in replacement for the deconvolution path: same intensity range, same
+normalisation) are reused from ``spim_preprocessing_stages.py`` so the output
+is a drop-in replacement for the deconvolution path: same intensity range, same
 isotropic geometry and the same ``{base}_{int(100*image_scaling)}.tif`` naming
 expected by the Nextflow ``PREPROCESS_*`` rename/metadata steps.
 
 The architecture below is copied (trimmed to the ``deblur_net`` generator) from
 ``Self_net_architecture.py`` so this script has no dependency on the training
 codebase; it only needs the trained ``.pkl`` state-dict.
+
+CLI
+---
+    python3 spim_selfnet_preprocess.py \
+        --input_file t0001.tif \
+        --outdir . \
+        --config_json preprocessing_config.json
+
+``--config_json`` is the canonical entry point and is shared with
+``spim_pipeline_fixed.py``. The Self-Net-specific knobs live under
+``preprocessing.selfnet`` in the config. Set ``preprocessing.method =
+"selfnet"`` to select this front-end.
 """
 
 import argparse
 import functools
+import json
 import os
 import sys
 import time
@@ -40,22 +53,20 @@ import torch.nn as nn
 from scipy import stats
 from skimage.transform import rescale
 
-# Shared correction / post-processing helpers. These live in
-# spim_pipeline_fixed.py (staged next to this script by the Nextflow process,
-# together with WBNS.py). Reusing them guarantees the Self-Net path produces
-# output that is identical, step-for-step, to the deconvolution path except for
-# the deblurring stage itself.
+# Shared helpers and stage functions. Same import path as
+# spim_pipeline_fixed.py so the Nextflow process can stage both scripts
+# together with WBNS.py.
 from spim_pipeline_fixed import (
-    clahe_3d_stack,
-    getNormalizationThresholds,
-    image_postprocessing,
     image_scaling_intens,
     print_resource_usage,
     read_nd2_voxel_size,
     read_tiff_voxel_size,
     remove_outliers_image,
-    shading_correct_xy_estimated,
-    z_intensity_correction,
+)
+from spim_preprocessing_stages import (
+    PIPELINE_STAGES,
+    STAGE_NAMES,
+    save_intermediate,
 )
 
 
@@ -559,8 +570,97 @@ def main():
     parser.add_argument(
         "--sigma", type=float, default=1.0, help="Gaussian smoothing sigma"
     )
+    # Canonical config-driven entry point (shared with spim_pipeline_fixed.py).
+    # When provided, values from the JSON config populate the args namespace
+    # (only if not already set on the CLI, so explicit CLI overrides still win).
+    parser.add_argument(
+        "--config_json", type=str, default=None,
+        help="Path to JSON preprocessing config. When provided, the config "
+             "populates parameters that were not set on the CLI."
+    )
+    parser.add_argument(
+        "--metadata_json", type=str, default=None,
+        help="Optional metadata JSON (Nextflow wrapper uses this to inject "
+             "per-timepoint voxel sizes)."
+    )
 
     args = parser.parse_args()
+
+    # If --config_json was passed, populate unset args from it. CLI values
+    # win over config (only None / defaults get overridden).
+    if args.config_json:
+        with open(args.config_json) as f:
+            _raw = f.read()
+        if _raw.startswith("﻿"):
+            _raw = _raw[1:]
+        _config = json.loads(_raw)
+        _pp = (_config.get("preprocessing") or {})
+        _sn = (_pp.get("selfnet") or {})
+
+        def _set_if_default(name, value):
+            """Set ``args.name = value`` only if the current value matches the
+            argparse default (or is None). We rely on the fact that argparse
+            only fills in defaults; explicitly-set CLI values are kept."""
+            current = getattr(args, name, None)
+            if current is None:
+                setattr(args, name, value)
+
+        if _pp.get("downscale_xy", {}).get("factor") is not None:
+            _set_if_default("image_scaling", float(_pp["downscale_xy"]["factor"]))
+        if _sn.get("ngf") is not None:
+            _set_if_default("ngf", int(_sn["ngf"]))
+        if _sn.get("n_blocks") is not None:
+            _set_if_default("n_blocks", int(_sn["n_blocks"]))
+        if _sn.get("norm") is not None:
+            _set_if_default("norm", str(_sn["norm"]))
+        if _sn.get("batch_size") is not None:
+            _set_if_default("batch_size", int(_sn["batch_size"]))
+        if _sn.get("net_min_v") is not None:
+            _set_if_default("net_min_v", float(_sn["net_min_v"]))
+        if _sn.get("net_max_v") is not None:
+            _set_if_default("net_max_v", float(_sn["net_max_v"]))
+        if _sn.get("net_percentile_low") is not None:
+            _set_if_default("net_percentile_low", float(_sn["net_percentile_low"]))
+        if _sn.get("net_percentile_high") is not None:
+            _set_if_default("net_percentile_high", float(_sn["net_percentile_high"]))
+        if _sn.get("net_thres_scale") is not None:
+            _set_if_default("net_thres_scale", float(_sn["net_thres_scale"]))
+        if _sn.get("model_path"):
+            _set_if_default("model_path", _sn["model_path"])
+        if _sn.get("model_path_xz"):
+            _set_if_default("model_path_xz", _sn["model_path_xz"])
+        if _sn.get("model_path_yz"):
+            _set_if_default("model_path_yz", _sn["model_path_yz"])
+
+        # No_net_normalization is a flag (False by default); only set if True.
+        if _sn.get("no_net_normalization"):
+            args.no_net_normalization = True
+
+        # Apply legacy toggle flags (no_clahe / no_shading / no_z_correction).
+        if _pp.get("clahe", {}).get("enabled") is False:
+            args.no_clahe = True
+        if _pp.get("shading_correction", {}).get("enabled") is False:
+            args.no_shading = True
+        if _pp.get("z_intensity_correction", {}).get("enabled") is False:
+            args.no_z_correction = True
+
+        # Voxel sizes: prefer metadata.json (Nextflow path) over config.
+        if args.metadata_json and os.path.isfile(args.metadata_json):
+            with open(args.metadata_json) as f:
+                _meta = json.load(f)
+            if _meta.get("x_resolution_um"):
+                _set_if_default("xy_pixel", float(_meta["x_resolution_um"]))
+            if _meta.get("y_resolution_um"):
+                # legacy script had no y_pixel flag; z_pixel is fine
+                pass
+            if (_meta.get("imagej") or {}).get("spacing"):
+                _set_if_default("z_pixel", float(_meta["imagej"]["spacing"]))
+        else:
+            _v = _pp.get("voxel_size") or {}
+            if _v.get("x_um") is not None:
+                _set_if_default("xy_pixel", float(_v["x_um"]))
+            if _v.get("z_um") is not None:
+                _set_if_default("z_pixel", float(_v["z_um"]))
 
     if not os.path.isfile(args.input_file):
         print(f"ERROR: Input file does not exist: {args.input_file}")

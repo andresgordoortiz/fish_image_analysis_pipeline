@@ -50,15 +50,97 @@
   },
 
   "preprocessing": {
-    "_comment": "Shading + Z-intensity correction + deblurring. Produces an isotropic, intensity-normalised stack ready for segmentation.",
+    "_comment": "Modular preprocessing pipeline. Each stage has its own 'enabled' toggle and its own params. Stages run in the order listed below. Infrastructure stages (load, downscale_xy, final_cast) are always on; the actual processing steps are toggleable.",
     "enabled": true,
-    "_comment_isotropic_reslice": "Resample Z so voxels become isotropic. Recommended for segmentation / tracking / viewer overlay.",
-    "isotropic_reslice": true,
-    "_comment_method": "'deconvolution' (GPU Richardson-Lucy, uses psf_path) or 'selfnet' (deep-learning deblurring, uses selfnet.model_path).",
+    "_comment_method": "'deconvolution' (GPU Richardson-Lucy, uses deconvolution_3d.psf_path) or 'selfnet' (deep-learning deblurring, uses selfnet.model_path).",
     "method": "deconvolution",
 
+    "voxel_size": {
+      "_comment": "Voxel size (µm). For standalone use only — the Nextflow wrapper overwrites this from the per-timepoint metadata. To auto-detect from file metadata, leave auto_detect=true.",
+      "auto_detect": false,
+      "x_um": 0.347,
+      "y_um": 0.347,
+      "z_um": 2.0
+    },
+
+    "downscale_xy": {
+      "_comment": "XY downscale (skimage.rescale). 1.0 = no downscale. 0.33 trades resolution for speed/RAM. Always on; 'factor' is the only knob.",
+      "factor": 0.33
+    },
+
+    "shading_correction": {
+      "_comment": "XY illumination flat-field correction (gaussian-blurred mean projection).",
+      "enabled": true,
+      "sigma_xy": 96.0,
+      "max_amplification": 2.0
+    },
+
+    "z_intensity_correction": {
+      "_comment": "Multiplicative per-slice Z intensity correction (compensates depth attenuation / bleaching).",
+      "enabled": true,
+      "method": "p95",
+      "smooth_window": 11
+    },
+
+    "isotropic_reslice": {
+      "_comment": "Resample Z so voxels become isotropic (match XY pixel size). Required for downstream 3D ops.",
+      "enabled": true
+    },
+
+    "deconvolution_3d": {
+      "_comment": "GPU Richardson-Lucy on PSF. Skipped silently if niter <= 0 even when enabled=true.",
+      "enabled": true,
+      "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
+      "niter": 3,
+      "padding": 64
+    },
+
+    "deconvolution_xz": {
+      "_comment": "GPU Richardson-Lucy on transposed XZ view. Skipped silently if niter <= 0 even when enabled=true.",
+      "enabled": true,
+      "niter": 3,
+      "padding": 64
+    },
+
+    "background_subtraction": {
+      "_comment": "Wavelet-based background subtraction (WBNS) on XY then on transposed XZ stack. Set enabled=false to skip.",
+      "enabled": true,
+      "resolution_xy": 10,
+      "resolution_xz": 10,
+      "noise_lvl": 2
+    },
+
+    "gaussian_smooth": {
+      "_comment": "Final Gaussian smoothing on the preprocessed volume.",
+      "enabled": true,
+      "sigma": 1.2
+    },
+
+    "clahe": {
+      "_comment": "Slice-wise adaptive histogram equalisation (CLAHE) on the transposed XZ stack.",
+      "enabled": true,
+      "clip_limit": 0.01,
+      "kernel_size": 64,
+      "p_low": 0.5,
+      "p_high": 99.5
+    },
+
+    "percentile_normalization": {
+      "_comment": "Percentile-based outlier removal before final cast. Set p_low=0 and p_high=100 to effectively disable without changing the enabled flag.",
+      "enabled": true,
+      "percentile_low": 10.0,
+      "percentile_high": 99.9
+    },
+
+    "final_cast": {
+      "_comment": "Final rescale to [min_v, max_v] and cast to dtype.",
+      "min_v": 0,
+      "max_v": 65535,
+      "dtype": "uint16"
+    },
+
     "selfnet": {
-      "_comment": "Only used when method = 'selfnet'.",
+      "_comment": "Only used when method = 'selfnet'. Neural-net deblurring replaces deconvolution_3d + deconvolution_xz.",
       "model_path": "/groups/pinheiro/user/andres.gordo/selfnet_models/deblur_net.pkl",
       "_comment_per_view": "Optional per-view models. Leave null to reuse model_path for both XZ and YZ.",
       "model_path_xz": null,
@@ -76,39 +158,14 @@
       "no_net_normalization": false
     },
 
-    "_comment_psf": "Point spread function .tif used by Richardson-Lucy. Only used when method = 'deconvolution'.",
-    "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
-    "_comment_image_scaling": "Downscale input by this factor before deconvolution. 1.0 = no downscale. 0.33 trades resolution for speed/RAM.",
-    "image_scaling": 0.33,
     "save_intermediates": true,
-    "deconvolution": {
-      "niter": 3,
-      "niterz": 3,
-      "padding": 64
-    },
+    "intermediates_subdir": "intermediates",
 
-    "normalization": {
-      "_comment": "Output intensity normalisation (percentile clip + rescale to [min_v, max_v]).",
-      "min_v": 0,
-      "max_v": 65535,
-      "percentile_low": 10.0,
-      "percentile_high": 99.9
-    },
-    "background_subtraction": {
-      "_comment": "Rolling-ball background subtraction after deconvolution.",
-      "resolution_px0": 10,
-      "resolution_pz0": 10,
-      "noise_lvl": 2
-    },
-    "postprocessing": {
-      "_comment": "Final Gaussian smoothing on the preprocessed volume.",
-      "sigma": 1.2
-    },
-    "correction_flags": {
-      "_comment": "Force-disable individual correction steps (debugging only).",
-      "no_clahe": false,
-      "no_z_correction": false,
-      "no_shading": false
+    "_comment_image_scaling_alias": "Deprecated. Downscale factor is now downscale_xy.factor. This top-level alias is read by older code (e.g. merge_hyperstack.py) — keep it in sync with downscale_xy.factor or leave it out and the Python driver will populate it from downscale_xy.factor at runtime.",
+    "image_scaling": 0.33,
+
+    "simulation": {
+      "_comment": "Used only by --simulate mode. Each experiment runs preprocessing + Cellpose on the preprocessed image and counts nuclei as an objective quality metric. The Cellpose params (model, diameter, thresholds, etc.) are read from the top-level `segmentation` block so the simulation always uses the same Cellpose config as the real segmentation. To override per-sweep, set `cellpose` in the sweep JSON."
     },
 
     "debug_preprocessing": {

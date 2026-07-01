@@ -12,6 +12,22 @@ that keep deep nuclei visible without amplifying noise.
 Requires:  intermediates directory from a pipeline run with
            --save_intermediates (or save_intermediates: true in config.json).
 
+The pipeline (spim_pipeline_fixed.py) writes intermediates using the new
+dense stage numbering:
+
+  01_after_load.tif
+  02_after_downscale_xy.tif
+  03_after_shading.tif
+  04_after_z_correction.tif
+  05_after_isotropic_reslice.tif
+  06_after_deconv3d.tif
+  07_after_deconv_xz.tif
+  08_after_wbns.tif
+  09_after_gaussian.tif
+  10_after_clahe.tif
+  11_after_percentile_norm.tif
+  12_after_final_cast.tif
+
 Usage
 -----
     # Minimal — sweep on one timepoint's intermediates
@@ -253,16 +269,21 @@ def compute_metrics(img, label):
 
 def find_best_intermediate(inter_dir):
     """Find the best intermediate to use as CLAHE input.
-    Priority: 07_after_wbns > 06_after_hotpix_floor > 05_after_deconvXZ > 04_after_deconv3d > 03_after_z_correction
+
+    Priority (deepest stage available wins): post-WBNS > post-deconv > post-reslice > post-z-correction > post-shading > post-downscale > raw.
+
+    Filenames match the canonical stage names produced by
+    ``spim_preprocessing_stages.run_pipeline``.
     """
     candidates = [
-        "07_after_wbns.tif",
-        "06_after_hotpix_floor.tif",
-        "05_after_deconvXZ.tif",
-        "04_after_deconv3d.tif",
-        "03_after_z_correction.tif",
-        "02_after_shading.tif",
-        "01_after_camera_bg.tif",
+        "08_after_wbns.tif",
+        "06_after_deconv3d.tif",
+        "07_after_deconv_xz.tif",
+        "05_after_isotropic_reslice.tif",
+        "04_after_z_correction.tif",
+        "03_after_shading.tif",
+        "02_after_downscale_xy.tif",
+        "01_after_load.tif",
     ]
     for c in candidates:
         p = os.path.join(inter_dir, c)

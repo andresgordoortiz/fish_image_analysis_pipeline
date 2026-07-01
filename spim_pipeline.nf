@@ -1408,8 +1408,8 @@ config = json.loads('${config_json_str}')
 
 # Get voxel sizes from metadata (these are already configured - auto-detected or manual)
 # NOTE: ROI cropping does not change voxel sizes, only image dimensions
-xy_pixel = metadata['x_resolution_um']  # Use configured X resolution
-z_pixel = metadata['imagej']['spacing']  # Use configured Z spacing
+xy_pixel = metadata['x_resolution_um']
+z_pixel = metadata['imagej']['spacing']
 
 print(f"Using voxel sizes from metadata:")
 print(f"  XY pixel size: {xy_pixel:.4f} µm")
@@ -1419,35 +1419,33 @@ if metadata.get('was_roi_cropped', False):
     print(f"  Note: Image was ROI-cropped (voxel size unchanged)")
 print("")
 
-# Build command for preprocessing script
+# Write a per-timepoint preprocessing config that injects the metadata
+# voxel sizes into the canonical preprocessing config. The Python script
+# reads this single file (no flag-flattening in Nextflow).
+preproc_config = dict(config)
+preproc_config.setdefault('voxel_size', {})
+preproc_config['voxel_size']['x_um'] = float(xy_pixel)
+preproc_config['voxel_size']['y_um'] = float(metadata.get('y_resolution_um', xy_pixel))
+preproc_config['voxel_size']['z_um'] = float(z_pixel)
+preproc_config['voxel_size']['auto_detect'] = False
+
+# Backward-compat alias (merge_hyperstack.py reads this directly).
+preproc_config.setdefault('image_scaling',
+                          preproc_config.get('downscale_xy', {}).get('factor', 1.0))
+
+with open('preprocessing_config.json', 'w') as f:
+    json.dump(preproc_config, f, indent=2)
+print(f"Wrote preprocessing_config.json with voxel sizes from metadata.")
+
+# Build command — config is the only knob now (legacy CLI flags are accepted
+# by the script but optional).
 cmd = [
     'python3', '${script_name}',
     '--input_file', '${filename}',
     '--outdir', '.',
-    '--psf_path', config['psf_path'],
-    '--image_scaling', str(config['image_scaling']),
-    '--xy_pixel', str(xy_pixel),  # Pass configured XY voxel size
-    '--z_pixel', str(z_pixel),    # Pass configured Z voxel size
-    '--niter', str(config['deconvolution']['niter']),
-    '--niterz', str(config['deconvolution']['niterz']),
-    '--percentile_low', str(config['normalization']['percentile_low']),
-    '--percentile_high', str(config['normalization']['percentile_high']),
-    '--sigma', str(config['postprocessing']['sigma']),
-    '--min_v', str(config['normalization']['min_v']),
-    '--max_v', str(config['normalization']['max_v']),
-    '--resolution_px0', str(config['background_subtraction']['resolution_px0']),
-    '--resolution_pz0', str(config['background_subtraction']['resolution_pz0']),
-    '--noise_lvl', str(config['background_subtraction']['noise_lvl']),
-    '--padding', str(config['deconvolution']['padding']),
+    '--metadata_json', '${metadata_json}',
+    '--config_json', 'preprocessing_config.json',
 ]
-
-# Add optional flags from correction_flags
-if config['correction_flags'].get('no_clahe', False):
-    cmd.append('--no_clahe')
-if config['correction_flags'].get('no_z_correction', False):
-    cmd.append('--no_z_correction')
-if config['correction_flags'].get('no_shading', False):
-    cmd.append('--no_shading')
 
 print("Preprocessing command:", ' '.join(cmd))
 print("\\n" + "="*60)
@@ -1677,50 +1675,29 @@ print(f"  Z pixel size: {z_pixel:.4f} um")
 print(f"  Source: {metadata.get('voxel_size_source', 'unknown')}")
 print("")
 
+# Write a per-timepoint preprocessing config that injects the metadata
+# voxel sizes into the canonical preprocessing config.
+preproc_config = dict(config)
+preproc_config.setdefault('voxel_size', {})
+preproc_config['voxel_size']['x_um'] = float(xy_pixel)
+preproc_config['voxel_size']['y_um'] = float(metadata.get('y_resolution_um', xy_pixel))
+preproc_config['voxel_size']['z_um'] = float(z_pixel)
+preproc_config['voxel_size']['auto_detect'] = False
+
+preproc_config.setdefault('image_scaling',
+                          preproc_config.get('downscale_xy', {}).get('factor', 1.0))
+
+with open('preprocessing_config.json', 'w') as f:
+    json.dump(preproc_config, f, indent=2)
+print(f"Wrote preprocessing_config.json with voxel sizes from metadata.")
+
 cmd = [
     'python3', '${script_name}',
     '--input_file', '${filename}',
     '--outdir', '.',
-    '--model_path', str(selfnet['model_path']),
-    '--image_scaling', str(config['image_scaling']),
-    '--xy_pixel', str(xy_pixel),
-    '--z_pixel', str(z_pixel),
-    '--ngf', str(selfnet.get('ngf', 64)),
-    '--n_blocks', str(selfnet.get('n_blocks', 6)),
-    '--norm', str(selfnet.get('norm', 'instance')),
-    '--batch_size', str(selfnet.get('batch_size', 8)),
-    '--net_min_v', str(selfnet.get('net_min_v', 0)),
-    '--net_max_v', str(selfnet.get('net_max_v', 65535)),
-    '--net_percentile_low', str(selfnet.get('net_percentile_low', 30)),
-    '--net_percentile_high', str(selfnet.get('net_percentile_high', 99.999)),
-    '--net_thres_scale', str(selfnet.get('net_thres_scale', 1.5)),
-    '--percentile_low', str(config['normalization']['percentile_low']),
-    '--percentile_high', str(config['normalization']['percentile_high']),
-    '--sigma', str(config['postprocessing']['sigma']),
-    '--min_v', str(config['normalization']['min_v']),
-    '--max_v', str(config['normalization']['max_v']),
-    '--resolution_px0', str(config['background_subtraction']['resolution_px0']),
-    '--resolution_pz0', str(config['background_subtraction']['resolution_pz0']),
-    '--noise_lvl', str(config['background_subtraction']['noise_lvl']),
+    '--metadata_json', '${metadata_json}',
+    '--config_json', 'preprocessing_config.json',
 ]
-
-# Optional separate per-view models
-if selfnet.get('model_path_xz'):
-    cmd.extend(['--model_path_xz', str(selfnet['model_path_xz'])])
-if selfnet.get('model_path_yz'):
-    cmd.extend(['--model_path_yz', str(selfnet['model_path_yz'])])
-
-# Correction flags
-if config['correction_flags'].get('no_clahe', False):
-    cmd.append('--no_clahe')
-if config['correction_flags'].get('no_z_correction', False):
-    cmd.append('--no_z_correction')
-if config['correction_flags'].get('no_shading', False):
-    cmd.append('--no_shading')
-
-# Self-Net specific: optionally disable the training-matched input normalization
-if selfnet.get('no_net_normalization', False):
-    cmd.append('--no_net_normalization')
 
 print("Self-Net command:", ' '.join(cmd))
 print("\\n" + "="*60)
