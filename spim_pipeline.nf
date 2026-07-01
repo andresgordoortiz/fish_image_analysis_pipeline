@@ -2541,6 +2541,7 @@ process SIMULATION_AGGREGATE {
     path preproc_script
     path sweep_file
     path meta_jsons
+    val inputs_count
 
     output:
     path "summary.csv", emit: csv, optional: true
@@ -2548,12 +2549,6 @@ process SIMULATION_AGGREGATE {
     path "aggregate.log", emit: log
 
     script:
-    def n_inputs = 0
-    try {
-        n_inputs = ((meta_jsons instanceof List) ? meta_jsons.size() : 1) / (new groovy.json.JsonSlurper().parseText(file(sweep_file).text).experiments.size() ?: 1)
-    } catch (Exception e) {
-        n_inputs = 0
-    }
     """
     #!/bin/bash
     set -euo pipefail
@@ -2571,7 +2566,7 @@ process SIMULATION_AGGREGATE {
     cp '${preproc_script}' spim_pipeline_fixed.py
 
     python3 << 'PYTHON_EOF'
-import glob, json, os, sys
+import glob, os, sys
 sys.path.insert(0, '.')
 
 from spim_preprocessing_stages import aggregate_simulation_metadata
@@ -2580,13 +2575,9 @@ from spim_preprocessing_stages import aggregate_simulation_metadata
 paths = sorted(glob.glob('*_metadata.json'))
 print(f"Found {len(paths)} metadata JSON(s) to aggregate", flush=True)
 
-# Count distinct input timepoints from the sweep file.
-with open('${sweep_file}') as f:
-    sweep = json.load(f)
-inputs = sweep.get('input', [])
-if isinstance(inputs, str):
-    inputs = [inputs]
-n_inputs = len(inputs)
+# inputs_count is passed in as a Nextflow val so we don't need to re-read
+# the sweep file (avoids encoding issues on HPC login nodes where LANG=C).
+n_inputs = ${inputs_count}
 print(f"Sweep declared {n_inputs} input timepoint(s)", flush=True)
 
 aggregate_simulation_metadata(paths, output_dir='.', inputs_count=n_inputs)
@@ -3077,9 +3068,13 @@ workflow {
         log.info "  sweep_file: ${sweep_path}"
         log.info "================================================"
 
-        // Parse the sweep JSON to build the cartesian product of
-        // experiments × input timepoints.
-        def sweep_data = new groovy.json.JsonSlurper().parseText(file(sweep_path).text)
+        // Parse the sweep JSON. Read as bytes + decode UTF-8 explicitly to
+        // avoid "Unable to decode string" errors when the default platform
+        // encoding is not UTF-8 (e.g. on HPC login nodes where LANG=C).
+        def sweep_bytes = file(sweep_path).getBytes()
+        def sweep_data = new groovy.json.JsonSlurper().parseText(
+            new String(sweep_bytes, java.nio.charset.StandardCharsets.UTF_8)
+        )
         def experiments = sweep_data.experiments.collect { exp ->
             [exp.name as String, exp.overrides as Map]
         }
@@ -3139,6 +3134,7 @@ workflow {
             preproc_script_ch.collect(),
             sweep_file_ch,
             SIM_ONE_EXPERIMENT_TP.out.meta.flatten().collect(),
+            input_paths.size(),
         )
 
         return
