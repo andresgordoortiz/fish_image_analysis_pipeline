@@ -3172,11 +3172,14 @@ workflow {
 
         // Aggregate after all per-task tasks complete. The aggregator reads
         // every metadata JSON and writes summary.csv / summary.md.
+        // `tp_tuples.size()` is the count of timepoints that survived the
+        // config.input.timepoints filter (Nextflow can serialise this
+        // because tp_tuples is built at script-compile time).
         SIMULATION_AGGREGATE(
             preproc_script_ch.collect(),
             sweep_file_ch,
             SIM_ONE_EXPERIMENT_TP.out.meta.flatten().collect(),
-            input_paths.size(),
+            tp_tuples.size(),
         )
 
         return
