@@ -1,0 +1,162 @@
+{
+  "_comment": "SPIM preprocessing sweep — for manually comparing the effect of each stage on nuclei detection. No deconvolution (set deconvolution_3d.enabled=false and deconvolution_xz.enabled=false). Each experiment runs the full preprocessing pipeline on each input, then runs Cellpose with the same model and params as the main segmentation process, and counts nuclei.",
+  "_comment_usage": "1. Edit `input` to point at 2 of your timepoint TIFFs. 2. python3 spim_pipeline_fixed.py --simulate --sweep_file sweep_preprocessing_v1.json  3. Open simulation_results/<exp>/t<T>_33.tif + t<T>_33_mask.tif in napari/Fiji. 4. Compare summary.md for nuclei counts.",
+
+  "base_config": "./config.json",
+
+  "input": [
+    "/scratch-cbe/users/me/data/my_experiment/t0001.tif",
+    "/scratch-cbe/users/me/data/my_experiment/t0002.tif"
+  ],
+  "output_dir": "./simulation_results/",
+  "save_intermediates": false,
+
+  "experiments": [
+    {
+      "_comment": "BASELINES — disable everything / enable everything (no deconv). These two set the reference extremes.",
+      "name": "01_raw_minimal",
+      "overrides": {
+        "shading_correction":     { "enabled": false },
+        "z_intensity_correction": { "enabled": false },
+        "isotropic_reslice":      { "enabled": false },
+        "deconvolution_3d":       { "enabled": false },
+        "deconvolution_xz":       { "enabled": false },
+        "background_subtraction": { "enabled": false },
+        "gaussian_smooth":        { "enabled": false },
+        "clahe":                  { "enabled": false },
+        "percentile_normalization": { "enabled": false }
+      }
+    },
+    {
+      "name": "02_all_stages",
+      "overrides": {
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+
+    {
+      "_comment": "SINGLE-STAGE TOGGLES — disable ONE stage from the all-on baseline to isolate its effect.",
+      "name": "03_no_clahe",
+      "overrides": {
+        "clahe":           { "enabled": false },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "name": "04_no_wbns",
+      "overrides": {
+        "background_subtraction": { "enabled": false },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "name": "05_no_gaussian",
+      "overrides": {
+        "gaussian_smooth": { "enabled": false },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "name": "06_no_z_correction",
+      "overrides": {
+        "z_intensity_correction": { "enabled": false },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "name": "07_no_shading",
+      "overrides": {
+        "shading_correction": { "enabled": false },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+
+    {
+      "_comment": "CLAHE sweep — the stage that most often needs tuning. Same baseline, only CLAHE clip/kernel vary.",
+      "name": "08_clahe_clip_003",
+      "overrides": {
+        "clahe": { "clip_limit": 0.003 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "name": "09_clahe_clip_030",
+      "overrides": {
+        "clahe": { "clip_limit": 0.030 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "name": "10_clahe_kernel_32",
+      "overrides": {
+        "clahe": { "kernel_size": 32 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "name": "11_clahe_kernel_128",
+      "overrides": {
+        "clahe": { "kernel_size": 128 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+
+    {
+      "_comment": "PERCENTILE NORM sweep — how aggressively to clip outliers before final scaling.",
+      "name": "12_pct_tight",
+      "overrides": {
+        "percentile_normalization": { "percentile_low": 20.0, "percentile_high": 99.5 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "name": "13_pct_loose",
+      "overrides": {
+        "percentile_normalization": { "percentile_low": 0.0, "percentile_high": 99.99 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+
+    {
+      "_comment": "GAUSSIAN smoothing sweep.",
+      "name": "14_sigma_strong",
+      "overrides": {
+        "gaussian_smooth": { "sigma": 2.5 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+
+    {
+      "_comment": "COMBINED likely-winners — common choices for nuclei segmentation.",
+      "name": "15_conservative",
+      "overrides": {
+        "clahe": { "enabled": false },
+        "gaussian_smooth": { "enabled": false },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "name": "16_aggressive",
+      "overrides": {
+        "clahe": { "clip_limit": 0.005, "kernel_size": 128 },
+        "gaussian_smooth": { "sigma": 0.8 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    }
+  ]
+}

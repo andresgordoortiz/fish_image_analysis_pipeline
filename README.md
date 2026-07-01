@@ -103,44 +103,67 @@ To turn off a stage (e.g. CLAHE for a quick test), set `preprocessing.clahe.enab
 
 #### `--simulate` mode — parameter sweep + Cellpose benchmark
 
-For tuning preprocessing parameters on a single image without spinning up the full Nextflow pipeline:
+For tuning preprocessing parameters on a single image (or a few) without spinning up the full Nextflow pipeline. Each experiment in the sweep runs the full preprocessing pipeline, then runs Cellpose with the same model + params as the real segmentation process, and counts nuclei as an objective quality metric.
+
+A starter sweep file is shipped with the repo — [sweep_preprocessing_v1.json](sweep_preprocessing_v1.json). It defines 16 experiments that isolate each preprocessing stage's contribution and sweep the most-tunable parameters (CLAHE clip + kernel, percentile norm, Gaussian sigma). Deconvolution is disabled everywhere.
 
 ```bash
-# 1. Write a sweep file describing the experiments to try
-cat > sweep.json <<'EOF'
-{
-  "base_config": "./config.json",
-  "input": ["./subset/t0001.tif"],
-  "output_dir": "./simulation_results/",
-  "save_intermediates": false,
-  "experiments": [
-    { "name": "no_clahe",  "overrides": { "clahe":  { "enabled": false } } },
-    { "name": "clahe_005", "overrides": { "clahe":  { "clip_limit": 0.005 } } },
-    { "name": "clahe_020", "overrides": { "clahe":  { "clip_limit": 0.020 } } },
-    { "name": "no_smooth", "overrides": { "gaussian_smooth": { "enabled": false } } },
-    { "name": "tight_norm","overrides": { "percentile_normalization": { "percentile_low": 20, "percentile_high": 99.5 } } }
-  ]
-}
-EOF
+# 1. Edit the sweep file: point `input` at 2 of your timepoint TIFFs
+$EDITOR sweep_preprocessing_v1.json
+#   e.g.
+#   "input": [
+#     "/scratch-cbe/users/me/data/my_experiment/t0001_Channel 2.tif",
+#     "/scratch-cbe/users/me/data/my_experiment/t0005_Channel 2.tif"
+#   ]
 
-# 2. Run the sweep — each experiment is preprocessed, segmented with Cellpose,
-#    and nuclei are counted.
-python3 spim_pipeline_fixed.py --simulate --sweep_file sweep.json
+# 2. Activate the conda env that has cellpose, tifffile, RedLionfishDeconv, etc.
+micromamba activate microscopy_env
 
-# 3. Compare results
+# 3. Run the sweep
+python3 spim_pipeline_fixed.py --simulate --sweep_file sweep_preprocessing_v1.json
+
+# 4. While it runs, watch the per-experiment log lines scroll past:
+#    [Simulation] Experiment: 03_no_clahe
+#      Output: ./simulation_results/03_no_clahe/
+#      t=t0001_Channel 2 runtime=11.2s nuclei=412 mean_intensity=1209.7
+#      t=t0005_Channel 2 runtime=11.4s nuclei=389 mean_intensity=1187.2
+
+# 5. When it finishes, read the summary
 cat simulation_results/summary.md
+
+# 6. Open the top candidates in napari/Fiji for visual inspection
+napari simulation_results/02_all_stages/t0001_Channel\ 2_33.tif \
+       simulation_results/02_all_stages/t0001_Channel\ 2_33_mask.tif
 ```
 
-Per experiment you get:
+**Customising the sweep.** Edit `sweep_preprocessing_v1.json` directly:
+
+- `input` — list of one or more TIFFs. Absolute paths are safest.
+- `experiments` — add / remove / edit entries. Each entry has a `name` and an `overrides` dict that gets deep-merged into the base config.
+- `cellpose` (optional, top-level) — override the segmentation params per sweep (model, diameter, thresholds, etc.).
+- `save_intermediates` — set `true` to keep per-stage TIFFs for visual debugging.
+
+Per experiment you get a self-contained folder:
 
 ```
 simulation_results/<exp_name>/
-├── t0001_33.tif            # preprocessed image (uint16)
-├── t0001_33_mask.tif       # Cellpose segmentation mask (uint16)
-└── t0001_33_metadata.json  # config used + per-stage timings + intensity stats
+├── t0001_Channel 2_33.tif            # preprocessed image (uint16)
+├── t0001_Channel 2_33_mask.tif       # Cellpose segmentation mask (uint16)
+└── t0001_Channel 2_33_metadata.json  # config used + per-stage timings + intensity stats
 ```
 
-Plus a `summary.csv` and `summary.md` ranking experiments by runtime, mean intensity, and **detected nuclei count** (from Cellpose). Open each `_33.tif` in napari/Fiji for visual inspection.
+Plus a comparison summary at `simulation_results/summary.md`:
+
+```
+experiment          runtime_s   mean_intensity   p99   nuclei_mean   nuclei_std
+01_raw_minimal       8.2        1234.5          5832    287           12
+02_all_stages       12.1         987.3          6045    412           28   ↑
+03_no_clahe         11.9        1011.7          6021    398           31
+...
+16_aggressive       12.5         945.2          5988    425           22   ↑
+```
+
+The arrows show nuclei count relative to the median across experiments. Open the preprocessed `.tif` + its mask side-by-side in napari / Fiji for visual verification — nuclei count alone doesn't catch everything (e.g. a stage might give the same count but with very different mask quality).
 
 **Path tips:**
 
