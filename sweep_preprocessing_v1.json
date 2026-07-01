@@ -1,13 +1,11 @@
 {
-  "_comment": "SPIM preprocessing sweep — for manually comparing the effect of each stage on nuclei detection. No deconvolution (set deconvolution_3d.enabled=false and deconvolution_xz.enabled=false). Each experiment runs the full preprocessing pipeline on each input, then runs Cellpose with the same model and params as the main segmentation process, and counts nuclei.",
-  "_comment_usage": "1. Edit `input` to point at 2 of your timepoint TIFFs. 2. python3 spim_pipeline_fixed.py --simulate --sweep_file sweep_preprocessing_v1.json  3. Open simulation_results/<exp>/t<T>_33.tif + t<T>_33_mask.tif in napari/Fiji. 4. Compare summary.md for nuclei counts.",
+  "_comment": "SPIM preprocessing sweep — for manually comparing the effect of each stage on nuclei detection. Each experiment runs the full preprocessing pipeline on each input timepoint, then runs Cellpose with the same model and params as the main segmentation process, and counts nuclei.",
+  "_comment_inputs": "INPUTS are NOT defined here. The Nextflow simulation workflow reads them from config.json (config.input.directory + config.input.timepoints). When running --simulate CLI locally (without Nextflow), set the sweep's `input` array instead — both code paths still work.",
+  "_comment_usage_nextflow": "1. Set config.json: input.directory = path to your per-timepoint TIFFs; input.timepoints = [list of indices or filename stems] (or null = all). 2. sbatch submit_pipeline.sh config.json",
 
   "base_config": "./config.json",
 
-  "input": [
-    "/scratch-cbe/users/me/data/my_experiment/t0001.tif",
-    "/scratch-cbe/users/me/data/my_experiment/t0002.tif"
-  ],
+  "input": [],
   "output_dir": "./simulation_results/",
   "save_intermediates": false,
 

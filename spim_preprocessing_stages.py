@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from typing import Callable, Optional
@@ -498,6 +499,22 @@ def _resolve_cellpose_config(sweep_cfg: dict, full_config: dict) -> dict:
     }
 
 
+def _matches_timepoint_filter(tp: int, filepath: str, sel) -> bool:
+    """Mirror of the Nextflow workflow's `_matchesTimepoint` helper. Used
+    by ``run_simulation`` (CLI mode) to filter input files against the
+    same ``config.input.timepoints`` selection the Nextflow path uses."""
+    stem = os.path.basename(filepath)
+    stem = re.sub(r"\.(tif|tiff|czi)$", "", stem)
+    if sel is None:
+        return True
+    if isinstance(sel, (int, float)) and int(sel) == tp:
+        return True
+    if isinstance(sel, str):
+        if sel == str(tp) or sel == stem or sel == os.path.basename(filepath):
+            return True
+    return False
+
+
 def _deep_merge(base: dict, overrides: dict) -> dict:
     """Recursively merge ``overrides`` into ``base``, returning a new dict."""
     out = dict(base)
@@ -788,6 +805,28 @@ def run_simulation(sweep_path: str, log: Callable[[str], None] = print) -> dict:
     inputs = sweep["input"]
     if isinstance(inputs, str):
         inputs = [inputs]
+    # If the sweep didn't list inputs directly, fall back to config.json's
+    # input.directory (with optional input.timepoints filter). This keeps a
+    # single source of truth for inputs.
+    if not inputs:
+        input_dir = (base_config.get("input") or {}).get("directory")
+        if input_dir and os.path.isdir(input_dir):
+            import glob as _glob
+            # Match the same glob pattern as the Nextflow workflow.
+            channel = (base_config.get("input") or {}).get("channel", 0)
+            glob_pat = f"t*_Channel {channel}.tif" if channel else "t*_Channel *.tif"
+            timepoints_filter = (base_config.get("input") or {}).get("timepoints")
+            for f in sorted(_glob.glob(os.path.join(input_dir, glob_pat))):
+                m = re.match(r"(?i)t(\d+)", os.path.basename(f))
+                if not m:
+                    continue
+                tp = int(m.group(1))
+                if timepoints_filter and not any(
+                    _matches_timepoint_filter(tp, f, sel) for sel in timepoints_filter
+                ):
+                    continue
+                inputs.append(f)
+            log(f"[Simulation] Discovered {len(inputs)} input(s) from config.input.directory")
     output_dir = sweep["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
 

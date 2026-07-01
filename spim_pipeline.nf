@@ -3063,6 +3063,8 @@ workflow {
         log.info "================================================"
         log.info "Simulation mode (one SLURM job per experiment × timepoint)"
         log.info "  sweep_file: ${sweep_path}"
+        log.info "  input_dir : ${config.input?.directory}"
+        log.info "  timepoints: ${config.input?.timepoints}"
         log.info "================================================"
 
         // Parse the sweep JSON. Read as bytes + decode UTF-8 explicitly to
@@ -3075,19 +3077,34 @@ workflow {
         def experiments = sweep_data.experiments.collect { exp ->
             [exp.name as String, exp.overrides as Map]
         }
-        def input_paths = (sweep_data.input as List).collect { it as String }
-        if (experiments.isEmpty() || input_paths.isEmpty()) {
-            error "sweep must define at least one experiment and one input"
+        if (experiments.isEmpty()) {
+            error "sweep must define at least one experiment"
         }
 
-        // Build (tp, file) tuples by extracting the numeric timepoint from
-        // each filename. Fall back to index if extraction fails.
-        def all_tp_tuples = input_paths.collect { String path ->
-            def f = new File(path)
-            if (!f.exists()) error "Simulation input not found: ${path}"
-            def m = (f.name =~ /(?i)t(\d+)/)
-            def tp = m.find() ? m.group(1).toInteger() : 0
-            [tp, f.absoluteFile]
+        // Read input files from config.input.directory (NOT from the sweep
+        // file). This way users configure inputs in one place — config.json —
+        // and the sweep only defines the experiments to run.
+        def input_dir = file(config.input?.directory)
+        if (!input_dir.exists()) {
+            error "config.input.directory not found: ${config.input?.directory}"
+        }
+        // Match the same glob pattern the main pipeline uses: t*_Channel *.tif
+        // (or t*_Channel <N>.tif when channel is explicit).
+        def glob_pattern = config.channel > 0
+            ? "t*_Channel ${config.channel}.tif"
+            : "t*_Channel *.tif"
+        def matcher = FileSystems.getDefault().getPathMatcher("glob:${glob_pattern}")
+        def all_tp_tuples = []
+        Files.list(input_dir.toPath()).each { p ->
+            if (matcher.matches(p.getFileName())) {
+                def m = (p.getFileName().toString() =~ /(?i)t(\d+)/)
+                def tp = m.find() ? m.group(1).toInteger() : 0
+                all_tp_tuples << [tp, p.toFile()]
+            }
+        }
+        all_tp_tuples = all_tp_tuples.sort { it[0] }
+        if (all_tp_tuples.isEmpty()) {
+            error "no per-timepoint TIFFs found in ${config.input?.directory} (pattern: ${glob_pattern})"
         }
 
         // Filter to config.input.timepoints (same filter the main pipeline uses).
