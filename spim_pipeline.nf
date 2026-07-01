@@ -3090,10 +3090,12 @@ workflow {
 
         // Filter to config.input.timepoints (same filter the main pipeline uses).
         // Each entry can be a Number (numeric tp) or String (filename stem).
-        def timepoints_selection = config.input?.timepoints
+        // NOTE: locally renamed to `sim_timepoints` to avoid shadowing the
+        // top-level `timepoints_selection` defined earlier in this file.
+        def sim_timepoints = config.input?.timepoints
         def tp_tuples = all_tp_tuples
-        if (timepoints_selection != null && (timepoints_selection as List).size() > 0) {
-            def sel = (timepoints_selection as List).collect { it }
+        if (sim_timepoints != null && (sim_timepoints as List).size() > 0) {
+            def sel = (sim_timepoints as List).collect { it }
             tp_tuples = all_tp_tuples.findAll { tp, f ->
                 sel.any { _matchesTimepoint(tp, f, it) }
             }
