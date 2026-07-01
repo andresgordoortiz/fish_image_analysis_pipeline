@@ -561,6 +561,15 @@ def _run_cellpose(image: np.ndarray, cfg: dict, log: Callable[[str], None]) -> n
         do_3D=cfg["do_3d"],
         min_size=cfg["min_size"],
     )
+    # `image` is always a plain (Z, Y, X) array with no channel axis (this
+    # pipeline's ZYX convention throughout). Newer Cellpose (v4+/cpsam) can't
+    # disambiguate a bare ndim==3 array between a 3D single-channel volume
+    # and a 2D multi-channel image, and raises "z_axis must be specified
+    # when segmenting 3D images of ndim=3" unless told explicitly. Mirrors
+    # the same do_3d-conditional handling already used in
+    # debug_nuclei_tracking.py's run_cellpose().
+    if cfg["do_3d"] and image.ndim == 3:
+        eval_kwargs["z_axis"] = 0
     # Anisotropy (Z/Y ratio) is set only when explicitly provided — Cellpose
     # auto-derives it from voxel sizes otherwise.
     if cfg.get("anisotropy") is not None:
