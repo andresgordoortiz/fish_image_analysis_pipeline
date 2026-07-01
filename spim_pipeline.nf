@@ -3134,7 +3134,12 @@ workflow {
         def tp_ch  = Channel.fromList(tp_tuples)
 
         // Expand into the (exp_name, overrides, tp, file) tuple the process expects.
-        def sim_ch = exp_ch.combine(tp_ch).map { exp, tp_file ->
+        // Note: take a single positional arg (it) and index into it. Nextflow
+        // invokes closures via MetaClass.invokeMethod which doesn't auto-spread
+        // a List arg into multiple positional params — so destructuring must
+        // happen INSIDE the closure body.
+        def sim_ch = exp_ch.combine(tp_ch).map { tup ->
+            def (exp, tp_file) = tup
             def (exp_name, overrides) = exp
             def (tp, f) = tp_file
             [exp_name, overrides, tp, f]
@@ -3148,13 +3153,16 @@ workflow {
         // PREPROCESS_DECONVOLVE / Nextflow's emit: pattern can't find it.
         def base_pp = config.preprocessing ?: [:]
         def base_factor = (base_pp.downscale_xy?.factor as BigDecimal)?.toDouble() ?: 1.0
-        def scaling_ch = sim_ch.map { exp_name, overrides, tp, f ->
+        def scaling_ch = sim_ch.map { tup ->
+            def overrides = tup[1]
             def factor = (overrides?.downscale_xy?.factor as BigDecimal)?.toDouble() ?: base_factor
             (int) round(factor * 100)
         }
 
         def exp_name_ch  = sim_ch.map { it[0] }
-        def tp_file_ch   = sim_ch.map { [it[2], it[3]] }
+        // tp_file_ch must emit Nextflow tuples (not generic lists) so the
+        // `tuple val(timepoint), path(image_file)` input of the process matches.
+        def tp_file_ch   = sim_ch.map { tup -> tuple(tup[2], tup[3]) }
         def overrides_ch = sim_ch.map { groovy.json.JsonOutput.toJson(it[1] as Map) }
 
         // Stage the same preprocessing script + sweep file to every task.
