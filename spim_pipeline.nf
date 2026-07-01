@@ -3080,13 +3080,32 @@ workflow {
 
         // Build (tp, file) tuples by extracting the numeric timepoint from
         // each filename. Fall back to index if extraction fails.
-        def tp_tuples = input_paths.collect { String path ->
+        def all_tp_tuples = input_paths.collect { String path ->
             def f = new File(path)
             if (!f.exists()) error "Simulation input not found: ${path}"
             def m = (f.name =~ /(?i)t(\d+)/)
             def tp = m.find() ? m.group(1).toInteger() : 0
             [tp, f.absoluteFile]
-        }.sort { it[0] }
+        }
+
+        // Filter to config.input.timepoints (same filter the main pipeline uses).
+        // Each entry can be a Number (numeric tp) or String (filename stem).
+        def timepoints_selection = config.input?.timepoints
+        def tp_tuples = all_tp_tuples
+        if (timepoints_selection != null && (timepoints_selection as List).size() > 0) {
+            def sel = (timepoints_selection as List).collect { it }
+            tp_tuples = all_tp_tuples.findAll { tp, f ->
+                sel.any { _matchesTimepoint(tp, f, it) }
+            }
+            if (tp_tuples.isEmpty()) {
+                log.error "None of the requested timepoints (${sel}) matched any of the sweep's input files."
+                log.error "Available timepoints: ${all_tp_tuples.collect { it[0] }}"
+                error "config.input.timepoints did not match any sweep input"
+            }
+            log.info "Filtered to ${tp_tuples.size()} of ${all_tp_tuples.size()} timepoint(s) (config.input.timepoints)"
+        }
+
+        tp_tuples = tp_tuples.sort { it[0] }
 
         // Cartesian product: experiments × timepoints.
         def exp_ch = Channel.fromList(experiments)
