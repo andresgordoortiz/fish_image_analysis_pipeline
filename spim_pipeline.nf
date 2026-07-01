@@ -3040,15 +3040,19 @@ process DEBUG_PREPROCESS_REPORT {
 
 workflow {
     // ---- Simulation branch ----
-    // Enabled ONLY via config.json's top-level `simulation` block. CLI flags
-    // would require nested JSON quoting through bash + sbatch + Nextflow,
-    // which is too fragile to be reliable. Edit config.json to set:
+    // Enabled ONLY via config.json's `simulation` block. CLI flags would
+    // require nested JSON quoting through bash + sbatch + Nextflow, which is
+    // too fragile to be reliable. The simulation block can live in either of
+    // two locations (preprocessing.simulation is preferred, top-level is the
+    // legacy location). Edit config.json to set:
     //
-    //   "simulation": { "enabled": true, "sweep_file": "./sweep_xxx.json" }
+    //   "preprocessing": { ..., "simulation": { "enabled": true, "sweep_file": "..." } }
     //
     // and submit with just: sbatch submit_pipeline.sh config.json
-    if (config.simulation?.enabled && config.simulation?.sweep_file) {
-        def sim_cfg = config.simulation
+    def sim_cfg = config.preprocessing?.simulation?.enabled
+        ? config.preprocessing.simulation
+        : (config.simulation?.enabled ? config.simulation : null)
+    if (sim_cfg?.enabled && sim_cfg?.sweep_file) {
         def sweep_path_obj = file(sim_cfg.sweep_file)
         if (!sweep_path_obj.exists()) {
             error "simulation.sweep_file not found: ${sim_cfg.sweep_file}"
@@ -3095,10 +3099,16 @@ workflow {
             [exp_name, overrides, tp, f]
         }
 
-        // Scaling factor per-experiment (from overrides.downscale_xy.factor,
-        // else 1.0). Used to make output filenames match the CLI convention.
+        // Scaling factor per-experiment. The merged preprocessing config
+        // (base + overrides) determines the actual factor; if an experiment
+        // doesn't override downscale_xy.factor, the base config's factor
+        // (e.g. 0.33) is used. This MUST match the suffix the per-task
+        // Python script writes to disk — otherwise the rename pipeline in
+        // PREPROCESS_DECONVOLVE / Nextflow's emit: pattern can't find it.
+        def base_pp = config.preprocessing ?: [:]
+        def base_factor = (base_pp.downscale_xy?.factor as BigDecimal)?.toDouble() ?: 1.0
         def scaling_ch = sim_ch.map { exp_name, overrides, tp, f ->
-            def factor = (overrides?.downscale_xy?.factor as BigDecimal)?.toDouble() ?: 1.0
+            def factor = (overrides?.downscale_xy?.factor as BigDecimal)?.toDouble() ?: base_factor
             (int) round(factor * 100)
         }
 

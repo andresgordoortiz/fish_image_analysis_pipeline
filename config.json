@@ -166,10 +166,6 @@
     "_comment_image_scaling_alias": "Deprecated. Downscale factor is now downscale_xy.factor. This top-level alias is read by older code (e.g. merge_hyperstack.py) — keep it in sync with downscale_xy.factor or leave it out and the Python driver will populate it from downscale_xy.factor at runtime.",
     "image_scaling": 0.33,
 
-    "simulation": {
-      "_comment": "Used only by --simulate mode. Each experiment runs preprocessing + Cellpose on the preprocessed image and counts nuclei as an objective quality metric. The Cellpose params (model, diameter, thresholds, etc.) are read from the top-level `segmentation` block so the simulation always uses the same Cellpose config as the real segmentation. To override per-sweep, set `cellpose` in the sweep JSON."
-    },
-
     "debug_preprocessing": {
       "_comment": "Optional per-timepoint QA. Saves side-by-side raw vs preprocessed for the first timepoints.",
       "enabled": true,
@@ -217,10 +213,10 @@
   },
 
   "simulation": {
-    "_comment": "Optional. When enabled=true with a sweep_file, Nextflow fans out one SLURM job per (experiment × timepoint) instead of running the main pipeline. CLI fallback still works: python3 spim_pipeline_fixed.py --simulate --sweep_file X.json.",
-    "enabled": false,
-    "sweep_file": null,
-    "save_intermediates": false,
+    "_comment": "When enabled=true with a sweep_file, Nextflow fans out one SLURM job per (experiment × timepoint) instead of running the main pipeline. CLI fallback still works: python3 spim_pipeline_fixed.py --simulate --sweep_file X.json.",
+    "enabled": true,
+    "sweep_file": "./sweep_preprocessing_v1.json",
+    "save_intermediates": true,
     "max_timepoints": null
   },
 
