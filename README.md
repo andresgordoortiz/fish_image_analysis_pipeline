@@ -149,6 +149,37 @@ Plus a `summary.csv` and `summary.md` ranking experiments by runtime, mean inten
 - Relative paths are resolved against the repo directory (e.g. `./data/`).
 - For tracking, make sure `voxel_size` is correct (in micrometres). Try not to use the automatic detection, as the metadata is oftentimes wrong.
 
+**Picking which timepoints to process.** Three fields under `input` control this; they compose (later filters apply on top of earlier ones):
+
+| Field | Behaviour |
+| --- | --- |
+| `input.timepoints` | Process ONLY these timepoints. Each entry can be a 1-based numeric index (`5`), the same as a string (`"5"`), or a filename stem (`"t0005"`) or full filename (`"t0005.tif"`). `null` = no filter. |
+| `input.max_timepoints` | After the `timepoints` filter, keep only the first N. `null` = no limit. |
+
+Examples:
+
+```json
+"input": {
+  "directory": "/scratch-cbe/users/me/data/my_experiment/",
+
+  "_comment_timepoints": "Just t0001 and t0005 (e.g. two timepoints to debug).",
+  "timepoints": [1, 5],
+
+  "_comment_max_timepoints": "Limit to first 10 timepoints from the filtered list.",
+  "max_timepoints": 10
+}
+```
+
+```json
+"input": {
+  "directory": "/scratch-cbe/users/me/data/my_experiment/",
+  "timepoints": ["t0001_Channel 2.tif", "t0005_Channel 2.tif", "t0010_Channel 2.tif"],
+  "max_timepoints": null
+}
+```
+
+If a requested timepoint isn't in the input directory, the run fails fast with a list of available timepoints.
+
 **Seqera token (optional but recommended).** Create a free account at [tower.nf](https://tower.nf), go to **Settings → Your tokens**, generate a token, and paste it into `seqera_tower.access_token`. This lets you watch the run live in the browser under **Runs**.
 
 ### 1.5 Submit the pipeline

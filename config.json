@@ -14,8 +14,10 @@
     "directory": "./subset/",
     "_comment_channel": "1-based channel index. Ignored for folder inputs (channel is in the filename).",
     "channel": 2,
-    "_comment_max_timepoints": "Optional. Only process the first N timepoints. null = use all.",
-    "max_timepoints": null
+    "_comment_max_timepoints": "Process only the first N timepoints (after any timepoints filter below). null = use all matching timepoints.",
+    "max_timepoints": null,
+    "_comment_timepoints": "Process ONLY these specific timepoints. Each entry can be a numeric timepoint index (1-based: 1, 5, 10) or a filename stem ('t0001', 't0005'). null = use all timepoints (subject to max_timepoints). When set, max_timepoints is applied AFTER this filter.",
+    "timepoints": null
   },
 
   "output": {

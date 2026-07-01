@@ -194,15 +194,47 @@ if (!skip_preprocessing && preprocess_method == 'selfnet') {
     log.info "Preprocessing method: DECONVOLUTION"
 }
 
-// Optional: limit input to the first N timepoints (after sorting). Useful when
-// late timepoints in an acquisition are unusable (sample drift, photodamage,
-// etc.) and you want to discard them without rebuilding the input dataset.
+// Optional: limit input to the first N timepoints (after any timepoints filter
+// below). Useful when late timepoints in an acquisition are unusable (sample
+// drift, photodamage, etc.) and you want to discard them without rebuilding
+// the input dataset.
 // Accepts an integer >= 1; null/missing/<=0 means "use all timepoints".
 def max_timepoints = config.input?.max_timepoints != null \
     ? (config.input.max_timepoints as Integer) \
     : null
 if (max_timepoints != null && max_timepoints <= 0) {
     max_timepoints = null
+}
+
+// Optional: process ONLY these specific timepoints. Each entry can be a
+// numeric timepoint index (1-based: 1, 5, 10) or a filename stem
+// ('t0001', 't0005', 't0001_Channel 2'). null/missing means "use all".
+// `max_timepoints` is applied AFTER this filter (so e.g.
+// timepoints=[1..100] + max_timepoints=3 → the first 3 of those 100).
+// Invalid entries (no matching file) fail the run fast.
+def timepoints_selection = config.input?.timepoints != null \
+    ? (config.input.timepoints as List) \
+    : null
+if (timepoints_selection != null && timepoints_selection.size() == 0) {
+    timepoints_selection = null
+}
+
+// Match a single (tp, file) tuple against the timepoints_selection list.
+// A selection entry matches when it equals:
+//   - the numeric timepoint (e.g. 5 == 5)
+//   - the numeric timepoint as a string (e.g. "5" == 5)
+//   - the filename stem without extension (e.g. "t0005" matches "t0005.tif")
+//   - the full filename (e.g. "t0005.tif")
+def _matchesTimepoint = { tp, f, sel ->
+    def stem = f.name.replaceAll(/\.(tif|tiff|czi)$/, '')
+    if (sel == null) return true
+    if (tp != null) {
+        if (sel instanceof Number && sel == tp) return true
+        if (sel instanceof String && (sel == tp.toString() || sel == stem || sel == f.name)) return true
+    } else {
+        if (sel == stem || sel == f.name) return true
+    }
+    return false
 }
 
 // When preprocessing is skipped, raw acquisitions are typically anisotropic
@@ -2884,6 +2916,20 @@ workflow {
             .toSortedList { a, b -> a[0] <=> b[0] }
             .flatMap { it }
 
+        if (timepoints_selection != null && timepoints_selection.size() > 0) {
+            def sel_list = timepoints_selection
+            log.info "Filtering split input to specific timepoints: ${sel_list} (input.timepoints)"
+            def collected = input_channel.toList()
+            def matched = collected.findAll { tp, f -> sel_list.any { _matchesTimepoint(tp, f, it) } }
+            if (matched.isEmpty()) {
+                log.error "None of the requested timepoints (${sel_list}) were found after splitting ${hyperstack_input.name}"
+                log.error "Available timepoints: ${collected.collect { it[0] }}"
+                exit 1
+            }
+            log.info "  matched ${matched.size()} of ${collected.size()} timepoint(s)"
+            input_channel = Channel.fromList(matched)
+        }
+
         if (max_timepoints != null) {
             log.info "Limiting input to first ${max_timepoints} timepoint(s) (input.max_timepoints)"
             input_channel = input_channel.take(max_timepoints)
@@ -2977,6 +3023,24 @@ workflow {
             file_tuples = file_tuples.sort { it[0] }
         }
 
+        if (timepoints_selection != null && timepoints_selection.size() > 0) {
+            def sel_list = timepoints_selection
+            log.info "Filtering input to specific timepoints: ${sel_list} (input.timepoints)"
+            def before = file_tuples.size()
+            file_tuples = file_tuples.findAll { tp, f ->
+                sel_list.any { _matchesTimepoint(tp, f, it) }
+            }
+            if (file_tuples.isEmpty()) {
+                log.error "None of the requested timepoints (${sel_list}) were found in ${params.input_dir}"
+                log.error "Available timepoints: ${file_tuples.collect { it[0] }}"
+                exit 1
+            }
+            // Re-sort the selected timepoints in numeric order so the
+            // pipeline processes them consistently.
+            file_tuples = file_tuples.sort { it[0] ?: 0 }
+            log.info "  matched ${file_tuples.size()} of ${before} timepoint(s)"
+        }
+
         if (max_timepoints != null && file_tuples.size() > max_timepoints) {
             log.info "Limiting input to first ${max_timepoints} of ${file_tuples.size()} timepoint(s) (input.max_timepoints)"
             file_tuples = file_tuples.take(max_timepoints)
@@ -3058,6 +3122,18 @@ workflow {
                 }
                 return [tp, f]
             }.findAll { it[0] != null }.sort { it[0] }
+
+            if (timepoints_selection != null && timepoints_selection.size() > 0) {
+                def sel_list = timepoints_selection
+                log.info "Filtering preprocessed input to specific timepoints: ${sel_list} (input.timepoints)"
+                def before = preproc_tuples.size()
+                preproc_tuples = preproc_tuples.findAll { tp, f -> sel_list.any { _matchesTimepoint(tp, f, it) } }
+                if (preproc_tuples.isEmpty()) {
+                    log.error "None of the requested timepoints (${sel_list}) were found in ${preprocessed_dir}"
+                    exit 1
+                }
+                log.info "  matched ${preproc_tuples.size()} of ${before} timepoint(s)"
+            }
 
             if (max_timepoints != null && preproc_tuples.size() > max_timepoints) {
                 log.info "Limiting preprocessed input to first ${max_timepoints} of ${preproc_tuples.size()} timepoint(s) (input.max_timepoints)"
