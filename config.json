@@ -216,6 +216,14 @@
     }
   },
 
+  "simulation": {
+    "_comment": "Optional. When enabled=true with a sweep_file, Nextflow fans out one SLURM job per (experiment × timepoint) instead of running the main pipeline. CLI fallback still works: python3 spim_pipeline_fixed.py --simulate --sweep_file X.json.",
+    "enabled": false,
+    "sweep_file": null,
+    "save_intermediates": false,
+    "max_timepoints": null
+  },
+
   "system": {
     "_comment": "Container images and resume behaviour. Most users never need to touch this.",
     "container_image": "library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559",

@@ -107,6 +107,8 @@ For tuning preprocessing parameters on a single image (or a few) without spinnin
 
 A starter sweep file is shipped with the repo — [sweep_preprocessing_v1.json](sweep_preprocessing_v1.json). It defines 16 experiments that isolate each preprocessing stage's contribution and sweep the most-tunable parameters (CLAHE clip + kernel, percentile norm, Gaussian sigma). Deconvolution is disabled everywhere.
 
+##### Run locally (single node, sequential)
+
 ```bash
 # 1. Edit the sweep file: point `input` at 2 of your timepoint TIFFs
 $EDITOR sweep_preprocessing_v1.json
@@ -124,9 +126,8 @@ python3 spim_pipeline_fixed.py --simulate --sweep_file sweep_preprocessing_v1.js
 
 # 4. While it runs, watch the per-experiment log lines scroll past:
 #    [Simulation] Experiment: 03_no_clahe
-#      Output: ./simulation_results/03_no_clahe/
-#      t=t0001_Channel 2 runtime=11.2s nuclei=412 mean_intensity=1209.7
-#      t=t0005_Channel 2 runtime=11.4s nuclei=389 mean_intensity=1187.2
+#      [03_no_clahe] t0001_Channel 2.tif runtime=11.2s nuclei=412 ...
+#      [03_no_clahe] t0005_Channel 2.tif runtime=11.4s nuclei=389 ...
 
 # 5. When it finishes, read the summary
 cat simulation_results/summary.md
@@ -136,14 +137,61 @@ napari simulation_results/02_all_stages/t0001_Channel\ 2_33.tif \
        simulation_results/02_all_stages/t0001_Channel\ 2_33_mask.tif
 ```
 
+##### Run on the cluster (Nextflow + SLURM, parallelised)
+
+For 16+ experiments × 2+ timepoints, run via Nextflow. One SLURM job per `(experiment × timepoint)` is dispatched in parallel on the GPU queue (queue 'g'), then a single aggregator task writes `summary.csv` / `summary.md`.
+
+```bash
+# Edit sweep_preprocessing_v1.json as above, then:
+sbatch submit_pipeline.sh config.json --simulation '{"enabled":true,"sweep_file":"sweep_preprocessing_v1.json"}'
+```
+
+Or set the simulation block in `config.json`:
+
+```json
+{
+  "input":  { "directory": "..." },
+  "output": { "directory": "..." },
+  "simulation": {
+    "enabled": true,
+    "sweep_file": "./sweep_preprocessing_v1.json"
+  }
+}
+
+# Then just:
+sbatch submit_pipeline.sh config.json
+```
+
+Outputs land under `<output_dir>/simulation/`:
+
+```
+<output_dir>/simulation/
+├── 01_raw_minimal/
+│   ├── t0001_Channel 2_33.tif
+│   ├── t0001_Channel 2_33_mask.tif
+│   ├── t0001_Channel 2_33_metadata.json
+│   ├── t0005_Channel 2_33.tif
+│   ├── t0005_Channel 2_33_mask.tif
+│   └── t0005_Channel 2_33_metadata.json
+├── 02_all_stages/
+│   └── ...
+├── ...
+├── 16_aggressive/
+│   └── ...
+├── summary.csv     # per-experiment row (runtime, mean intensity, nuclei mean/std)
+└── summary.md      # human-readable ranking
+```
+
+Per-task logs go to `<output_dir>/logs/simulation/`. One failed experiment does NOT abort the sweep — the aggregator reports missing metadata in `summary.md` and the rest of the experiments still complete.
+
 **Customising the sweep.** Edit `sweep_preprocessing_v1.json` directly:
 
 - `input` — list of one or more TIFFs. Absolute paths are safest.
 - `experiments` — add / remove / edit entries. Each entry has a `name` and an `overrides` dict that gets deep-merged into the base config.
 - `cellpose` (optional, top-level) — override the segmentation params per sweep (model, diameter, thresholds, etc.).
-- `save_intermediates` — set `true` to keep per-stage TIFFs for visual debugging.
+- `save_intermediates` — set `true` to keep per-stage TIFFs for visual debugging (CLI mode only — Nextflow runs don't currently expose this).
 
-Per experiment you get a self-contained folder:
+Per experiment you get a self-contained folder (CLI mode):
 
 ```
 simulation_results/<exp_name>/

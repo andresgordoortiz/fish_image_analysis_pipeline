@@ -2385,6 +2385,219 @@ process BENCHMARK {
 }
 
 // ============================================================================
+// PROCESS: Simulation — One Experiment × One Timepoint
+// (parallelised body of `python3 spim_pipeline_fixed.py --simulate`)
+// ============================================================================
+
+process SIM_ONE_EXPERIMENT_TP {
+    tag "${exp_name}/t${String.format('%04d', timepoint)}"
+
+    maxRetries 1
+    // One bad experiment must NOT kill the entire sweep — the aggregator
+    // will report missing metadata in summary.md.
+    errorStrategy 'ignore'
+
+    publishDir "${params.output_dir}/simulation/${exp_name}",
+        mode: 'copy',
+        pattern: "*_${scaling_pct}.tif"
+
+    publishDir "${params.output_dir}/simulation/${exp_name}",
+        mode: 'copy',
+        pattern: "*_metadata.json"
+
+    publishDir "${params.output_dir}/logs/simulation",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    val exp_name
+    tuple val(timepoint), path(image_file)
+    path preproc_script
+    path sweep_file
+    val exp_overrides_json
+    val scaling_pct
+
+    output:
+    path "*_${scaling_pct}.tif", emit: tif, optional: true
+    path "*_${scaling_pct}_mask.tif", emit: mask, optional: true
+    path "*_${scaling_pct}_metadata.json", emit: meta, optional: true
+    path "sim_${exp_name}_t${String.format('%04d', timepoint)}.log", emit: log
+
+    script:
+    def overrides_str = exp_overrides_json.replace("'", "\\'")
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    echo "============================================"
+    echo "Simulation: experiment=${exp_name}  timepoint=${timepoint}"
+    echo "  Input  : ${image_file}"
+    echo "  Scaling: ${scaling_pct}%"
+    echo "============================================"
+
+    exec > >(tee sim_${exp_name}_t${String.format('%04d', timepoint)}.log) 2>&1
+
+    # Stage inputs into the workdir under stable names so the Python script
+    # can reference them via --sweep_file (relative path).
+    cp '${sweep_file}' sweep.json
+    cp '${preproc_script}' spim_pipeline_fixed.py
+    cp '${preproc_script}' .  # ensures the module is importable from cwd
+
+    # The sweep file's `input` array gets rewritten to the staged file path
+    # for this timepoint only, so the per-task run touches exactly one image.
+    python3 << 'PYTHON_EOF'
+import json, os, sys
+sys.path.insert(0, '.')
+
+with open('sweep.json') as f:
+    sweep = json.load(f)
+
+# Override input to the single staged file (path relative to cwd).
+staged_input = '${image_file}'
+sweep['input'] = [os.path.basename(staged_input)]
+
+# Inject per-experiment overrides (already a JSON string from Groovy).
+overrides = json.loads('${overrides_str}')
+# Embed overrides into the experiment entry with the same name.
+exp_name = '${exp_name}'
+for exp in sweep['experiments']:
+    if exp.get('name') == exp_name:
+        exp['overrides'] = overrides
+        break
+else:
+    sweep['experiments'].append({'name': exp_name, 'overrides': overrides})
+
+# Save updated sweep next to the staged inputs.
+with open('sweep_one.json', 'w') as f:
+    json.dump(sweep, f, indent=2)
+
+# Run only this experiment on this one timepoint.
+from spim_preprocessing_stages import (
+    _load_image, _resolve_cellpose_config, _deep_merge,
+    run_one_experiment_tp,
+)
+
+with open(sweep['base_config']) as f:
+    base_config_path = sweep['base_config']
+    if not os.path.isabs(base_config_path):
+        base_config_path = os.path.join('.', base_config_path)
+    base_config = json.load(f)
+
+pp = base_config.get('preprocessing', {}) or {}
+cp_cfg = _resolve_cellpose_config(sweep.get('cellpose', {}) or {}, base_config)
+
+raw_stack, voxel = _load_image(staged_input)
+print(f"Loaded {staged_input}: shape={raw_stack.shape} voxel={voxel}", flush=True)
+
+meta = run_one_experiment_tp(
+    exp_name=exp_name,
+    overrides=overrides,
+    raw_path=staged_input,
+    raw_stack=raw_stack,
+    voxel_size=voxel,
+    cellpose_cfg=cp_cfg,
+    pp_template=pp,
+    output_dir='.',  # results land next to the staged inputs in the workdir
+    save_intermediates=False,
+    log=print,
+)
+print(f"Done: nuclei={meta['nuclei_count']} runtime={meta['runtime_s']:.1f}s", flush=True)
+PYTHON_EOF
+
+    # Rename the per-task outputs so Nextflow's emit patterns can match them
+    # by timepoint + scaling suffix.
+    base_name="\$(basename '${image_file}' | sed 's/\\.[^.]*\$//')"
+    for f in *_\${scaling_pct}.tif *_\${scaling_pct}_mask.tif *_\${scaling_pct}_metadata.json; do
+        [ -e "\$f" ] || continue
+    done
+
+    echo ""
+    echo "✓ Sim task done: \${exp_name} on t\${timepoint}"
+    """
+}
+
+// ============================================================================
+// PROCESS: Simulation — Aggregate per-task metadata into summary.csv/md
+// ============================================================================
+
+process SIMULATION_AGGREGATE {
+    tag "aggregate_simulation"
+
+    maxRetries 1
+    errorStrategy 'ignore'
+
+    publishDir "${params.output_dir}/simulation",
+        mode: 'copy',
+        pattern: "summary_*"
+
+    container params.container
+
+    input:
+    path preproc_script
+    path sweep_file
+    path meta_jsons
+
+    output:
+    path "summary.csv", emit: csv, optional: true
+    path "summary.md", emit: md, optional: true
+    path "aggregate.log", emit: log
+
+    script:
+    def n_inputs = 0
+    try {
+        n_inputs = ((meta_jsons instanceof List) ? meta_jsons.size() : 1) / (new groovy.json.JsonSlurper().parseText(file(sweep_file).text).experiments.size() ?: 1)
+    } catch (Exception e) {
+        n_inputs = 0
+    }
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    exec > >(tee aggregate.log) 2>&1
+
+    echo "============================================"
+    echo "Aggregating simulation metadata"
+    echo "============================================"
+
+    # Stage the script for import.
+    cp '${preproc_script}' spim_pipeline_fixed.py
+
+    python3 << 'PYTHON_EOF'
+import glob, json, os, sys
+sys.path.insert(0, '.')
+
+from spim_preprocessing_stages import aggregate_simulation_metadata
+
+# Collect every metadata JSON staged into the workdir.
+paths = sorted(glob.glob('*_metadata.json'))
+print(f"Found {len(paths)} metadata JSON(s) to aggregate", flush=True)
+
+# Count distinct input timepoints from the sweep file.
+with open('${sweep_file}') as f:
+    sweep = json.load(f)
+inputs = sweep.get('input', [])
+if isinstance(inputs, str):
+    inputs = [inputs]
+n_inputs = len(inputs)
+print(f"Sweep declared {n_inputs} input timepoint(s)", flush=True)
+
+aggregate_simulation_metadata(paths, output_dir='.', inputs_count=n_inputs)
+PYTHON_EOF
+
+    echo ""
+    echo "✓ Aggregation done"
+    """
+}
+
+// ============================================================================
 // PROCESS: Prepare ultrack input (foreground + contours zarrs)
 // ============================================================================
 
@@ -2835,6 +3048,102 @@ process DEBUG_PREPROCESS_REPORT {
 // ============================================================================
 
 workflow {
+    // ---- Simulation branch ----
+    // When `params.simulation` is set (either via config.json's "simulation"
+    // block or via `--simulation '{"enabled":true,...}'` on the CLI), skip
+    // the entire pipeline and run the sweep instead: one SLURM job per
+    // (experiment × timepoint), then aggregate the metadata.
+    def sim_cfg = null
+    if (params.simulation != null) {
+        if (params.simulation instanceof String) {
+            // CLI passed a JSON string like --simulation '{"enabled":true,...}'
+            sim_cfg = new groovy.json.JsonSlurper().parseText(params.simulation)
+        } else {
+            sim_cfg = params.simulation
+        }
+    }
+    // Fall back to config.json's top-level "simulation" block if it set
+    // enabled=true and points at a sweep_file.
+    if (sim_cfg == null && config.simulation?.enabled && config.simulation?.sweep_file) {
+        sim_cfg = config.simulation
+    }
+    if (sim_cfg?.enabled && sim_cfg?.sweep_file) {
+        def sweep_path = sim_cfg.sweep_file
+        if (!file(sweep_path).exists()) {
+            error "simulation.sweep_file not found: ${sweep_path}"
+        }
+        log.info "================================================"
+        log.info "Simulation mode (one SLURM job per experiment × timepoint)"
+        log.info "  sweep_file: ${sweep_path}"
+        log.info "================================================"
+
+        // Parse the sweep JSON to build the cartesian product of
+        // experiments × input timepoints.
+        def sweep_data = new groovy.json.JsonSlurper().parseText(file(sweep_path).text)
+        def experiments = sweep_data.experiments.collect { exp ->
+            [exp.name as String, exp.overrides as Map]
+        }
+        def input_paths = (sweep_data.input as List).collect { it as String }
+        if (experiments.isEmpty() || input_paths.isEmpty()) {
+            error "sweep must define at least one experiment and one input"
+        }
+
+        // Build (tp, file) tuples by extracting the numeric timepoint from
+        // each filename. Fall back to index if extraction fails.
+        def tp_tuples = input_paths.collect { String path ->
+            def f = new File(path)
+            if (!f.exists()) error "Simulation input not found: ${path}"
+            def m = (f.name =~ /(?i)t(\d+)/)
+            def tp = m.find() ? m.group(1).toInteger() : 0
+            [tp, f.absoluteFile]
+        }.sort { it[0] }
+
+        // Cartesian product: experiments × timepoints.
+        def exp_ch = Channel.fromList(experiments)
+        def tp_ch  = Channel.fromList(tp_tuples)
+
+        // Expand into the (exp_name, overrides, tp, file) tuple the process expects.
+        def sim_ch = exp_ch.combine(tp_ch).map { exp, tp_file ->
+            def (exp_name, overrides) = exp
+            def (tp, f) = tp_file
+            [exp_name, overrides, tp, f]
+        }
+
+        // Scaling factor per-experiment (from overrides.downscale_xy.factor,
+        // else 1.0). Used to make output filenames match the CLI convention.
+        def scaling_ch = sim_ch.map { exp_name, overrides, tp, f ->
+            def factor = (overrides?.downscale_xy?.factor as BigDecimal)?.toDouble() ?: 1.0
+            int(round(factor * 100))
+        }
+
+        def exp_name_ch  = sim_ch.map { it[0] }
+        def tp_file_ch   = sim_ch.map { [it[2], it[3]] }
+        def overrides_ch = sim_ch.map { groovy.json.JsonOutput.toJson(it[1] as Map) }
+
+        // Stage the same preprocessing script + sweep file to every task.
+        preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+        sweep_file_ch     = Channel.fromPath(sweep_path, checkIfExists: true).collect()
+
+        SIM_ONE_EXPERIMENT_TP(
+            exp_name_ch,
+            tp_file_ch,
+            preproc_script_ch.collect(),
+            sweep_file_ch,
+            overrides_ch,
+            scaling_ch,
+        )
+
+        // Aggregate after all per-task tasks complete. The aggregator reads
+        // every metadata JSON and writes summary.csv / summary.md.
+        SIMULATION_AGGREGATE(
+            preproc_script_ch.collect(),
+            sweep_file_ch,
+            SIM_ONE_EXPERIMENT_TP.out.meta.flatten().collect(),
+        )
+
+        return
+    }
+
     // Parse input files with pattern: t####_Channel #.tif
     // Use java.nio.file.FileSystems to handle paths with spaces correctly
     // (Nextflow's fromPath glob can break on spaces in directory names)

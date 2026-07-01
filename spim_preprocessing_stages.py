@@ -574,23 +574,206 @@ def _image_stats(image: np.ndarray) -> dict:
     }
 
 
-def run_simulation(sweep_path: str, log: Callable[[str], None] = print) -> dict:
-    """Run a Cellpose-benchmarked preprocessing parameter sweep.
+def run_one_experiment_tp(
+    exp_name: str,
+    overrides: dict,
+    raw_path: str,
+    raw_stack: np.ndarray,
+    voxel_size: tuple,
+    cellpose_cfg: dict,
+    pp_template: dict,
+    output_dir: str,
+    save_intermediates: bool = False,
+    log: Callable[[str], None] = print,
+) -> dict:
+    """Run ONE experiment on ONE input timepoint.
+
+    This is the per-task body used by both the local ``--simulate`` CLI
+    orchestrator and the Nextflow ``SIM_ONE_EXPERIMENT_TP`` process. It
+    deep-merges ``overrides`` into ``pp_template``, runs the modular
+    preprocessing pipeline, then runs Cellpose on the result. Writes the
+    preprocessed TIFF, the Cellpose mask, and a metadata JSON to
+    ``<output_dir>/<exp_name>/``. Returns the metadata dict.
 
     Parameters
     ----------
-    sweep_path : str
-        Path to a JSON file in the shape documented in the README. The
-        file must contain ``base_config``, ``input``, ``output_dir``,
-        ``experiments`` (list of ``{name, overrides}``) and optionally
-        ``cellpose`` and ``save_intermediates``.
+    exp_name : str
+        Experiment identifier (used as a subdirectory name).
+    overrides : dict
+        Per-experiment config overrides, deep-merged onto ``pp_template``.
+    raw_path : str
+        Path to the source TIFF (used to derive the output basename).
+    raw_stack : np.ndarray
+        Already-loaded ZYX image. The caller is responsible for loading
+        it (in CLI mode) or passing the staged file path (in Nextflow mode).
+    voxel_size : (vx, vy, vz) in micrometres
+        Voxel size of ``raw_stack``.
+    cellpose_cfg : dict
+        Cellpose params (from ``_resolve_cellpose_config``).
+    pp_template : dict
+        The base ``preprocessing`` sub-block from the config.json.
+    output_dir : str
+        Top-level output directory (the sweep's ``output_dir``).
+    save_intermediates : bool
+        Whether to write per-stage TIFFs under
+        ``<output_dir>/<exp_name>/intermediates_<tp_label>/``.
     log : callable
         Progress logger.
+    """
+    cfg_pp = _deep_merge(pp_template, overrides)
+    cfg_pp["image_scaling"] = cfg_pp.get("downscale_xy", {}).get("factor", 1.0)
 
-    Returns
-    -------
-    summary : dict
-        ``{"summary_csv": path, "summary_md": path, "per_experiment": {...}}``
+    exp_dir = os.path.join(output_dir, exp_name)
+    os.makedirs(exp_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(raw_path))[0]
+    scaling_pct = int(round(float(cfg_pp.get("downscale_xy", {}).get("factor", 1.0)) * 100))
+    out_name = f"{base_name}_{scaling_pct}.tif"
+    ints_dir = (
+        os.path.join(exp_dir, f"intermediates_{base_name}") if save_intermediates else None
+    )
+
+    t0 = time.time()
+    processed, ctx = run_pipeline(
+        raw_stack,
+        voxel_size,
+        cfg_pp,
+        psf=None,
+        intermediates_dir=ints_dir,
+        save_intermediates=save_intermediates,
+        log=lambda msg: None,  # quieter per-stage log inside per-task
+        base_stack=raw_stack,
+        base_voxel_size=voxel_size,
+    )
+    runtime = time.time() - t0
+
+    tifffile.imwrite(os.path.join(exp_dir, out_name), processed.astype(np.uint16))
+
+    mask = _run_cellpose(processed, cellpose_cfg, log)
+    mask_name = f"{base_name}_{scaling_pct}_mask.tif"
+    tifffile.imwrite(os.path.join(exp_dir, mask_name), mask)
+    nuclei = _nuclei_count(mask)
+    stats = _image_stats(processed)
+
+    meta = {
+        "experiment": exp_name,
+        "input_file": raw_path,
+        "voxel_size_um": list(voxel_size),
+        "config": cfg_pp,
+        "cellpose_config": cellpose_cfg,
+        "runtime_s": runtime,
+        "stage_timings": ctx.get("timings", {}),
+        "stage_notes": ctx.get("stage_notes", {}),
+        "intensity_stats": stats,
+        "nuclei_count": nuclei,
+    }
+    with open(os.path.join(exp_dir, f"{base_name}_{scaling_pct}_metadata.json"), "w") as f:
+        json.dump(meta, f, indent=2, default=str)
+
+    log(
+        f"  [{exp_name}] {os.path.basename(raw_path)} "
+        f"runtime={runtime:.1f}s nuclei={nuclei} "
+        f"mean_intensity={stats['mean']:.1f}"
+    )
+    return meta
+
+
+def aggregate_simulation_metadata(
+    metadata_paths,
+    output_dir: str,
+    inputs_count: int,
+    log: Callable[[str], None] = print,
+) -> dict:
+    """Aggregate per-task metadata JSONs into summary.csv + summary.md.
+
+    Reads each metadata JSON, groups by experiment, computes per-experiment
+    mean/std over timepoints, and writes the two summary files into
+    ``output_dir``. Returns the same dict shape as ``run_simulation``.
+
+    Parameters
+    ----------
+    metadata_paths : iterable of str
+        Paths to ``*_metadata.json`` files (typically one per
+        ``(experiment, timepoint)`` pair). Order doesn't matter.
+    output_dir : str
+        Where to write ``summary.csv`` / ``summary.md``.
+    inputs_count : int
+        Number of input timepoints (used in the summary header).
+    log : callable
+        Progress logger.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Group per-experiment rows.
+    per_exp = {}
+    for p in metadata_paths:
+        with open(p) as f:
+            meta = json.load(f)
+        per_exp.setdefault(meta["experiment"], []).append(meta)
+
+    summary_rows = []
+    for exp_name, rows in per_exp.items():
+        summary_rows.append({
+            "experiment": exp_name,
+            "n_tps": len(rows),
+            "runtime_s_mean": float(np.mean([r["runtime_s"] for r in rows])),
+            "mean_intensity": float(np.mean([r["intensity_stats"]["mean"] for r in rows])),
+            "p99_intensity": float(np.mean([r["intensity_stats"]["p99"] for r in rows])),
+            "nuclei_count_mean": float(np.mean([r["nuclei_count"] for r in rows])),
+            "nuclei_count_std": float(np.std([r["nuclei_count"] for r in rows])) if len(rows) > 1 else 0.0,
+        })
+
+    summary_csv = os.path.join(output_dir, "summary.csv")
+    summary_md = os.path.join(output_dir, "summary.md")
+
+    if summary_rows:
+        keys = list(summary_rows[0].keys())
+        with open(summary_csv, "w") as f:
+            f.write(",".join(keys) + "\n")
+            for row in summary_rows:
+                f.write(",".join(str(row[k]) for k in keys) + "\n")
+
+        median_nuclei = float(np.median([r["nuclei_count_mean"] for r in summary_rows]))
+        with open(summary_md, "w") as f:
+            f.write("# Simulation summary\n\n")
+            f.write(f"Inputs: {inputs_count} timepoint(s)\n\n")
+            f.write(
+                f"{'experiment':<24} {'runtime_s':>10} {'mean_int':>10} "
+                f"{'p99':>8} {'nuclei_mean':>14} {'nuclei_std':>12}\n"
+            )
+            f.write("-" * 90 + "\n")
+            for row in summary_rows:
+                rel = row["nuclei_count_mean"] - median_nuclei
+                arrow = "↑" if rel > 0 else ("↓" if rel < 0 else "·")
+                f.write(
+                    f"{row['experiment']:<24} "
+                    f"{row['runtime_s_mean']:>10.1f} "
+                    f"{row['mean_intensity']:>10.1f} "
+                    f"{row['p99_intensity']:>8.1f} "
+                    f"{row['nuclei_count_mean']:>12.1f} {arrow}  "
+                    f"{row['nuclei_count_std']:>12.1f}\n"
+                )
+
+        log(f"\n[Aggregation] Done. Summary written to:\n  {summary_csv}\n  {summary_md}")
+
+    return {
+        "summary_csv": summary_csv,
+        "summary_md": summary_md,
+        "per_experiment": {row["experiment"]: row for row in summary_rows},
+    }
+
+
+def run_simulation(sweep_path: str, log: Callable[[str], None] = print) -> dict:
+    """Run a Cellpose-benchmarked preprocessing parameter sweep (local CLI).
+
+    Loads all input images, then loops ``run_one_experiment_tp`` over the
+    cartesian product of experiments × timepoints, then aggregates via
+    ``aggregate_simulation_metadata``. This is the entry point for
+    ``python3 spim_pipeline_fixed.py --simulate --sweep_file X.json``.
+
+    For the parallelised cluster workflow, Nextflow calls
+    ``run_one_experiment_tp`` and ``aggregate_simulation_metadata``
+    directly — see ``SIM_ONE_EXPERIMENT_TP`` and ``SIMULATION_AGGREGATE``
+    in ``spim_pipeline.nf``.
     """
     with open(sweep_path) as f:
         sweep = json.load(f)
@@ -619,119 +802,34 @@ def run_simulation(sweep_path: str, log: Callable[[str], None] = print) -> dict:
         raw_stacks.append({"path": path, "stack": stack, "voxel_size": voxel})
         log(f"  Loaded {os.path.basename(path)}: shape={stack.shape} voxel={voxel}")
 
-    summary_rows = []
-
+    all_metadata_paths = []
     for exp in sweep["experiments"]:
         exp_name = exp["name"]
         overrides = exp.get("overrides", {}) or {}
-        cfg_pp = _deep_merge(pp, overrides)
-        # Backward-compat alias for merge_hyperstack.py etc.
-        cfg_pp["image_scaling"] = cfg_pp.get("downscale_xy", {}).get("factor", 1.0)
-
-        exp_dir = os.path.join(output_dir, exp_name)
-        os.makedirs(exp_dir, exist_ok=True)
         log(f"\n[Simulation] Experiment: {exp_name}")
-        log(f"  Output: {exp_dir}")
-
-        per_tp_runtimes = []
-        per_tp_stats = []
-        per_tp_nuclei = []
+        log(f"  Output: {os.path.join(output_dir, exp_name)}")
 
         for raw in raw_stacks:
-            tp_label = os.path.splitext(os.path.basename(raw["path"]))[0]
-            ints_dir = os.path.join(exp_dir, f"intermediates_{tp_label}") if save_ints else None
-
-            t0 = time.time()
-            processed, ctx = run_pipeline(
-                raw["stack"],
-                raw["voxel_size"],
-                cfg_pp,
-                psf=None,
-                intermediates_dir=ints_dir,
+            meta = run_one_experiment_tp(
+                exp_name=exp_name,
+                overrides=overrides,
+                raw_path=raw["path"],
+                raw_stack=raw["stack"],
+                voxel_size=raw["voxel_size"],
+                cellpose_cfg=cp_cfg,
+                pp_template=pp,
+                output_dir=output_dir,
                 save_intermediates=save_ints,
-                log=lambda msg: None,  # quieter per-stage log inside simulation
-                base_stack=raw["stack"],
-                base_voxel_size=raw["voxel_size"],
+                log=log,
             )
-            runtime = time.time() - t0
+            tp_label = os.path.splitext(os.path.basename(raw["path"]))[0]
+            scaling_pct = int(round(
+                float(meta["config"].get("downscale_xy", {}).get("factor", 1.0)) * 100
+            ))
+            all_metadata_paths.append(
+                os.path.join(output_dir, exp_name, f"{tp_label}_{scaling_pct}_metadata.json")
+            )
 
-            # Save the preprocessed image and metadata.
-            base_name = os.path.splitext(os.path.basename(raw["path"]))[0]
-            scaling_pct = int(round(float(cfg_pp.get("downscale_xy", {}).get("factor", 1.0)) * 100))
-            out_name = f"{base_name}_{scaling_pct}.tif"
-            tifffile.imwrite(os.path.join(exp_dir, out_name), processed.astype(np.uint16))
-
-            # Cellpose + nuclei count.
-            mask = _run_cellpose(processed, cp_cfg, log)
-            mask_name = f"{base_name}_{scaling_pct}_mask.tif"
-            tifffile.imwrite(os.path.join(exp_dir, mask_name), mask)
-            nuclei = _nuclei_count(mask)
-            stats = _image_stats(processed)
-
-            meta = {
-                "experiment": exp_name,
-                "input_file": raw["path"],
-                "voxel_size_um": list(raw["voxel_size"]),
-                "config": cfg_pp,
-                "cellpose_config": cp_cfg,
-                "runtime_s": runtime,
-                "stage_timings": ctx.get("timings", {}),
-                "stage_notes": ctx.get("stage_notes", {}),
-                "intensity_stats": stats,
-                "nuclei_count": nuclei,
-            }
-            with open(os.path.join(exp_dir, f"{base_name}_{scaling_pct}_metadata.json"), "w") as f:
-                json.dump(meta, f, indent=2, default=str)
-
-            per_tp_runtimes.append(runtime)
-            per_tp_stats.append(stats)
-            per_tp_nuclei.append(nuclei)
-            log(f"  t={tp_label} runtime={runtime:.1f}s nuclei={nuclei} mean_intensity={stats['mean']:.1f}")
-
-        row = {
-            "experiment": exp_name,
-            "n_tps": len(raw_stacks),
-            "runtime_s_mean": float(np.mean(per_tp_runtimes)),
-            "mean_intensity": float(np.mean([s["mean"] for s in per_tp_stats])),
-            "p99_intensity": float(np.mean([s["p99"] for s in per_tp_stats])),
-            "nuclei_count_mean": float(np.mean(per_tp_nuclei)),
-            "nuclei_count_std": float(np.std(per_tp_nuclei)) if len(per_tp_nuclei) > 1 else 0.0,
-        }
-        summary_rows.append(row)
-
-    # Write summary.csv and summary.md
-    summary_csv = os.path.join(output_dir, "summary.csv")
-    summary_md = os.path.join(output_dir, "summary.md")
-
-    if summary_rows:
-        keys = list(summary_rows[0].keys())
-        with open(summary_csv, "w") as f:
-            f.write(",".join(keys) + "\n")
-            for row in summary_rows:
-                f.write(",".join(str(row[k]) for k in keys) + "\n")
-
-        median_nuclei = float(np.median([r["nuclei_count_mean"] for r in summary_rows]))
-        with open(summary_md, "w") as f:
-            f.write("# Simulation summary\n\n")
-            f.write(f"Inputs: {len(inputs)} timepoint(s)\n\n")
-            f.write(f"{'experiment':<24} {'runtime_s':>10} {'mean_int':>10} {'p99':>8} {'nuclei_mean':>14} {'nuclei_std':>12}\n")
-            f.write("-" * 90 + "\n")
-            for row in summary_rows:
-                rel = row["nuclei_count_mean"] - median_nuclei
-                arrow = "↑" if rel > 0 else ("↓" if rel < 0 else "·")
-                f.write(
-                    f"{row['experiment']:<24} "
-                    f"{row['runtime_s_mean']:>10.1f} "
-                    f"{row['mean_intensity']:>10.1f} "
-                    f"{row['p99_intensity']:>8.1f} "
-                    f"{row['nuclei_count_mean']:>12.1f} {arrow}  "
-                    f"{row['nuclei_count_std']:>12.1f}\n"
-                )
-
-        log(f"\n[Simulation] Done. Summary written to:\n  {summary_csv}\n  {summary_md}")
-
-    return {
-        "summary_csv": summary_csv,
-        "summary_md": summary_md,
-        "per_experiment": {row["experiment"]: row for row in summary_rows},
-    }
+    return aggregate_simulation_metadata(
+        all_metadata_paths, output_dir, inputs_count=len(inputs), log=log
+    )
