@@ -3057,7 +3057,9 @@ workflow {
         if (!sweep_path_obj.exists()) {
             error "simulation.sweep_file not found: ${sim_cfg.sweep_file}"
         }
-        def sweep_path = sweep_path_obj.absolutePath
+        // Nextflow's file() returns a java.nio.Path — call toString() to get
+        // the absolute path string.
+        def sweep_path = sweep_path_obj.toAbsolutePath().toString()
         log.info "================================================"
         log.info "Simulation mode (one SLURM job per experiment × timepoint)"
         log.info "  sweep_file: ${sweep_path}"
