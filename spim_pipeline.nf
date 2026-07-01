@@ -2431,6 +2431,10 @@ process SIM_ONE_EXPERIMENT_TP {
     path stages_lib       // spim_preprocessing_stages.py (mutual import with preproc_script)
     path wbns_lib         // WBNS.py (imported by preproc_script)
     path sweep_file
+    path config_json_file // config.json — sweep['base_config'] is relative to the
+                          // original submission dir, which doesn't exist inside
+                          // this task's isolated work dir, so it's staged and
+                          // referenced directly instead.
     val exp_overrides_json
     val scaling_pct
 
@@ -2498,10 +2502,7 @@ from spim_preprocessing_stages import (
     run_one_experiment_tp,
 )
 
-with open(sweep['base_config']) as f:
-    base_config_path = sweep['base_config']
-    if not os.path.isabs(base_config_path):
-        base_config_path = os.path.join('.', base_config_path)
+with open('${config_json_file}') as f:
     base_config = json.load(f)
 
 pp = base_config.get('preprocessing', {}) or {}
@@ -3202,6 +3203,7 @@ workflow {
         stages_lib_ch     = Channel.fromPath(params.preprocessing_stages_script, checkIfExists: true)
         wbns_lib_ch       = Channel.fromPath(params.wbns_script, checkIfExists: true)
         sweep_file_ch     = Channel.fromPath(sweep_path, checkIfExists: true).collect()
+        config_json_ch    = Channel.fromPath(params.config_json, checkIfExists: true).collect()
 
         SIM_ONE_EXPERIMENT_TP(
             exp_name_ch,
@@ -3210,6 +3212,7 @@ workflow {
             stages_lib_ch.collect(),
             wbns_lib_ch.collect(),
             sweep_file_ch,
+            config_json_ch,
             overrides_ch,
             scaling_ch,
         )
