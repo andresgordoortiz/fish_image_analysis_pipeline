@@ -214,10 +214,9 @@
 
   "simulation": {
     "_comment": "When enabled=true with a sweep_file, Nextflow fans out one SLURM job per (experiment × timepoint) instead of running the main pipeline. CLI fallback still works: python3 spim_pipeline_fixed.py --simulate --sweep_file X.json.",
-    "enabled": true,
+    "enabled": false,
     "sweep_file": "./sweep_preprocessing_v1.json",
-    "save_intermediates": true,
-    "max_timepoints": null
+    "save_intermediates": true
   },
 
   "system": {
