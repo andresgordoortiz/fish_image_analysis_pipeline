@@ -1400,6 +1400,7 @@ process PREPROCESS_DECONVOLVE {
     path metadata_json
     path preproc_script
     path stages_lib       // spim_preprocessing_stages.py (mutual import with preproc_script)
+    path wbns_lib         // WBNS.py (imported by preproc_script)
     val preprocess_config
 
     output:
@@ -2428,6 +2429,7 @@ process SIM_ONE_EXPERIMENT_TP {
     tuple val(timepoint), path(image_file)
     path preproc_script
     path stages_lib       // spim_preprocessing_stages.py (mutual import with preproc_script)
+    path wbns_lib         // WBNS.py (imported by preproc_script)
     path sweep_file
     val exp_overrides_json
     val scaling_pct
@@ -2563,6 +2565,7 @@ process SIMULATION_AGGREGATE {
     input:
     path preproc_script
     path stages_lib       // spim_preprocessing_stages.py (mutual import with preproc_script)
+    path wbns_lib         // WBNS.py (imported by preproc_script)
     path sweep_file
     path meta_jsons
     val inputs_count
@@ -3197,6 +3200,7 @@ workflow {
         // Stage the same preprocessing script + sweep file to every task.
         preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
         stages_lib_ch     = Channel.fromPath(params.preprocessing_stages_script, checkIfExists: true)
+        wbns_lib_ch       = Channel.fromPath(params.wbns_script, checkIfExists: true)
         sweep_file_ch     = Channel.fromPath(sweep_path, checkIfExists: true).collect()
 
         SIM_ONE_EXPERIMENT_TP(
@@ -3204,6 +3208,7 @@ workflow {
             tp_file_ch,
             preproc_script_ch.collect(),
             stages_lib_ch.collect(),
+            wbns_lib_ch.collect(),
             sweep_file_ch,
             overrides_ch,
             scaling_ch,
@@ -3217,6 +3222,7 @@ workflow {
         SIMULATION_AGGREGATE(
             preproc_script_ch.collect(),
             stages_lib_ch.collect(),
+            wbns_lib_ch.collect(),
             sweep_file_ch,
             SIM_ONE_EXPERIMENT_TP.out.meta.flatten().collect(),
             tp_tuples.size(),
@@ -3574,6 +3580,7 @@ workflow {
             // Create channel for preprocessing script
             preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
             stages_lib_ch = Channel.fromPath(params.preprocessing_stages_script, checkIfExists: true)
+            wbns_lib_ch = Channel.fromPath(params.wbns_script, checkIfExists: true)
 
             // 2. Preprocess and deconvolve each timepoint
             PREPROCESS_DECONVOLVE(
@@ -3581,6 +3588,7 @@ workflow {
                 shared_metadata,
                 preproc_script_ch.collect(),
                 stages_lib_ch.collect(),
+                wbns_lib_ch.collect(),
                 config.preprocessing
             )
 
