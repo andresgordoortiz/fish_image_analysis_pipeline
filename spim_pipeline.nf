@@ -17,6 +17,11 @@ import java.nio.file.Paths
 // Parameters - only config_json is required, everything else comes from it
 params.config_json = null
 params.preprocessing_script = './spim_pipeline_fixed.py'
+// spim_pipeline_fixed.py and spim_preprocessing_stages.py have a mutual
+// (circular) top-level import dependency on each other — any process that
+// stages one must also stage the other, or Python raises a
+// ModuleNotFoundError at runtime.
+params.preprocessing_stages_script = './spim_preprocessing_stages.py'
 // Self-Net deblurring front-end (alternative to deconvolution). The Self-Net
 // script reuses helpers from the deconvolution script (spim_pipeline_fixed.py)
 // and WBNS.py, so both are staged alongside it when method='selfnet'.
@@ -48,6 +53,11 @@ if (!params.config_json) {
 
 if (!file(params.preprocessing_script).exists()) {
     log.error "Preprocessing script not found: ${params.preprocessing_script}"
+    exit 1
+}
+
+if (!file(params.preprocessing_stages_script).exists()) {
+    log.error "Preprocessing stages script not found: ${params.preprocessing_stages_script}"
     exit 1
 }
 
@@ -1389,6 +1399,7 @@ process PREPROCESS_DECONVOLVE {
     tuple val(timepoint), path(image_file)
     path metadata_json
     path preproc_script
+    path stages_lib       // spim_preprocessing_stages.py (mutual import with preproc_script)
     val preprocess_config
 
     output:
@@ -1649,6 +1660,7 @@ process PREPROCESS_SELFNET {
     path metadata_json
     path selfnet_script
     path shared_lib       // spim_pipeline_fixed.py (provides shared helpers)
+    path stages_lib       // spim_preprocessing_stages.py (mutual import with shared_lib)
     path wbns_lib         // WBNS.py (imported by the shared lib)
     val preprocess_config
 
@@ -2415,6 +2427,7 @@ process SIM_ONE_EXPERIMENT_TP {
     val exp_name
     tuple val(timepoint), path(image_file)
     path preproc_script
+    path stages_lib       // spim_preprocessing_stages.py (mutual import with preproc_script)
     path sweep_file
     val exp_overrides_json
     val scaling_pct
@@ -2442,11 +2455,12 @@ process SIM_ONE_EXPERIMENT_TP {
 
     exec > >(tee sim_${exp_name}_t${String.format('%04d', timepoint)}.log) 2>&1
 
-    # Stage inputs into the workdir under stable names so the Python script
-    # can reference them via --sweep_file (relative path).
+    # Stage the sweep file under a stable name so the Python script can
+    # reference it via --sweep_file (relative path). preproc_script and
+    # stages_lib are already staged directly into the work dir root under
+    # their own names by Nextflow — no copying needed, they just need to be
+    # present on disk for the `import spim_preprocessing_stages` below.
     cp '${sweep_file}' sweep.json
-    cp '${preproc_script}' spim_pipeline_fixed.py
-    cp '${preproc_script}' .  # ensures the module is importable from cwd
 
     # The sweep file's `input` array gets rewritten to the staged file path
     # for this timepoint only, so the per-task run touches exactly one image.
@@ -2509,15 +2523,24 @@ meta = run_one_experiment_tp(
 print(f"Done: nuclei={meta['nuclei_count']} runtime={meta['runtime_s']:.1f}s", flush=True)
 PYTHON_EOF
 
-    # Rename the per-task outputs so Nextflow's emit patterns can match them
-    # by timepoint + scaling suffix.
-    base_name="\$(basename '${image_file}' | sed 's/\\.[^.]*\$//')"
-    for f in *_\${scaling_pct}.tif *_\${scaling_pct}_mask.tif *_\${scaling_pct}_metadata.json; do
-        [ -e "\$f" ] || continue
+    # run_one_experiment_tp() (invoked above) writes its outputs into
+    # ./${exp_name}/ — it shares that behaviour with the local --simulate
+    # CLI orchestrator, which expects a per-experiment subdirectory under one
+    # shared output_dir. Nextflow's `path` output declarations only match
+    # files directly in the task's work dir (globs are not recursive), so
+    # relocate the three expected outputs up to the work dir root.
+    # NOTE: scaling_pct/exp_name/timepoint below are Groovy process inputs
+    # interpolated at script-generation time — they are NOT bash variables,
+    # so they must NOT be \$-escaped (unlike e.g. SCALING_PCT elsewhere,
+    # which IS a real bash variable assigned via `SCALING_PCT=\$(...)`).
+    shopt -s nullglob
+    for f in "${exp_name}"/*_${scaling_pct}.tif "${exp_name}"/*_${scaling_pct}_mask.tif "${exp_name}"/*_${scaling_pct}_metadata.json; do
+        mv "\$f" .
     done
+    shopt -u nullglob
 
     echo ""
-    echo "✓ Sim task done: \${exp_name} on t\${timepoint}"
+    echo "✓ Sim task done: ${exp_name} on t${timepoint}"
     """
 }
 
@@ -2539,6 +2562,7 @@ process SIMULATION_AGGREGATE {
 
     input:
     path preproc_script
+    path stages_lib       // spim_preprocessing_stages.py (mutual import with preproc_script)
     path sweep_file
     path meta_jsons
     val inputs_count
@@ -2562,8 +2586,9 @@ process SIMULATION_AGGREGATE {
     echo "Aggregating simulation metadata"
     echo "============================================"
 
-    # Stage the script for import.
-    cp '${preproc_script}' spim_pipeline_fixed.py
+    # preproc_script and stages_lib are already staged directly into the
+    # work dir root under their own names by Nextflow (no copy needed) —
+    # they just need to be present on disk for the import below to resolve.
 
     python3 << 'PYTHON_EOF'
 import glob, os, sys
@@ -3096,11 +3121,15 @@ workflow {
         def matcher = FileSystems.getDefault().getPathMatcher("glob:${glob_pattern}")
         def all_tp_tuples = []
         // input_dir IS already a java.nio.Path (Nextflow's file() returns Path).
+        // NOTE: must wrap with Nextflow's file() helper (not raw p.toFile())
+        // before this ever reaches a process `path` input — Nextflow accepts
+        // its own Path type (or String/java.nio.Path via file()) but rejects
+        // plain java.io.File values with "Not a valid path value type".
         Files.list(input_dir).each { p ->
             if (matcher.matches(p.getFileName())) {
                 def m = (p.getFileName().toString() =~ /(?i)t(\d+)/)
                 def tp = m.find() ? m.group(1).toInteger() : 0
-                all_tp_tuples << [tp, p.toFile()]
+                all_tp_tuples << [tp, file(p.toString())]
             }
         }
         all_tp_tuples = all_tp_tuples.sort { it[0] }
@@ -3167,12 +3196,14 @@ workflow {
 
         // Stage the same preprocessing script + sweep file to every task.
         preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+        stages_lib_ch     = Channel.fromPath(params.preprocessing_stages_script, checkIfExists: true)
         sweep_file_ch     = Channel.fromPath(sweep_path, checkIfExists: true).collect()
 
         SIM_ONE_EXPERIMENT_TP(
             exp_name_ch,
             tp_file_ch,
             preproc_script_ch.collect(),
+            stages_lib_ch.collect(),
             sweep_file_ch,
             overrides_ch,
             scaling_ch,
@@ -3185,6 +3216,7 @@ workflow {
         // because tp_tuples is built at script-compile time).
         SIMULATION_AGGREGATE(
             preproc_script_ch.collect(),
+            stages_lib_ch.collect(),
             sweep_file_ch,
             SIM_ONE_EXPERIMENT_TP.out.meta.flatten().collect(),
             tp_tuples.size(),
@@ -3518,11 +3550,12 @@ workflow {
 
         if (preprocess_method == 'selfnet') {
             // Self-Net deblurring front-end. Stage the Self-Net script plus the
-            // shared helper libs (spim_pipeline_fixed.py + WBNS.py) so all
-            // imports resolve inside the task work dir.
+            // shared helper libs (spim_pipeline_fixed.py + spim_preprocessing_stages.py
+            // + WBNS.py) so all imports resolve inside the task work dir.
             log.info "Preprocessing each timepoint with Self-Net deblurring"
             selfnet_script_ch = Channel.fromPath(params.selfnet_script, checkIfExists: true)
             shared_lib_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+            stages_lib_ch = Channel.fromPath(params.preprocessing_stages_script, checkIfExists: true)
             wbns_lib_ch = Channel.fromPath(params.wbns_script, checkIfExists: true)
 
             PREPROCESS_SELFNET(
@@ -3530,6 +3563,7 @@ workflow {
                 shared_metadata,
                 selfnet_script_ch.collect(),
                 shared_lib_ch.collect(),
+                stages_lib_ch.collect(),
                 wbns_lib_ch.collect(),
                 config.preprocessing
             )
@@ -3539,12 +3573,14 @@ workflow {
         } else {
             // Create channel for preprocessing script
             preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
+            stages_lib_ch = Channel.fromPath(params.preprocessing_stages_script, checkIfExists: true)
 
             // 2. Preprocess and deconvolve each timepoint
             PREPROCESS_DECONVOLVE(
                 processing_input,
                 shared_metadata,
                 preproc_script_ch.collect(),
+                stages_lib_ch.collect(),
                 config.preprocessing
             )
 
