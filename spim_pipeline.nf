@@ -3040,29 +3040,20 @@ process DEBUG_PREPROCESS_REPORT {
 
 workflow {
     // ---- Simulation branch ----
-    // When `params.simulation` is set (either via config.json's "simulation"
-    // block or via `--simulation '{"enabled":true,...}'` on the CLI), skip
-    // the entire pipeline and run the sweep instead: one SLURM job per
-    // (experiment × timepoint), then aggregate the metadata.
-    def sim_cfg = null
-    if (params.simulation != null) {
-        if (params.simulation instanceof String) {
-            // CLI passed a JSON string like --simulation '{"enabled":true,...}'
-            sim_cfg = new groovy.json.JsonSlurper().parseText(params.simulation)
-        } else {
-            sim_cfg = params.simulation
+    // Enabled ONLY via config.json's top-level `simulation` block. CLI flags
+    // would require nested JSON quoting through bash + sbatch + Nextflow,
+    // which is too fragile to be reliable. Edit config.json to set:
+    //
+    //   "simulation": { "enabled": true, "sweep_file": "./sweep_xxx.json" }
+    //
+    // and submit with just: sbatch submit_pipeline.sh config.json
+    if (config.simulation?.enabled && config.simulation?.sweep_file) {
+        def sim_cfg = config.simulation
+        def sweep_path_obj = file(sim_cfg.sweep_file)
+        if (!sweep_path_obj.exists()) {
+            error "simulation.sweep_file not found: ${sim_cfg.sweep_file}"
         }
-    }
-    // Fall back to config.json's top-level "simulation" block if it set
-    // enabled=true and points at a sweep_file.
-    if (sim_cfg == null && config.simulation?.enabled && config.simulation?.sweep_file) {
-        sim_cfg = config.simulation
-    }
-    if (sim_cfg?.enabled && sim_cfg?.sweep_file) {
-        def sweep_path = sim_cfg.sweep_file
-        if (!file(sweep_path).exists()) {
-            error "simulation.sweep_file not found: ${sweep_path}"
-        }
+        def sweep_path = sweep_path_obj.absolutePath
         log.info "================================================"
         log.info "Simulation mode (one SLURM job per experiment × timepoint)"
         log.info "  sweep_file: ${sweep_path}"
@@ -3071,7 +3062,7 @@ workflow {
         // Parse the sweep JSON. Read as bytes + decode UTF-8 explicitly to
         // avoid "Unable to decode string" errors when the default platform
         // encoding is not UTF-8 (e.g. on HPC login nodes where LANG=C).
-        def sweep_bytes = file(sweep_path).getBytes()
+        def sweep_bytes = sweep_path_obj.getBytes()
         def sweep_data = new groovy.json.JsonSlurper().parseText(
             new String(sweep_bytes, java.nio.charset.StandardCharsets.UTF_8)
         )

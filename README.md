@@ -141,26 +141,26 @@ napari simulation_results/02_all_stages/t0001_Channel\ 2_33.tif \
 
 For 16+ experiments × 2+ timepoints, run via Nextflow. One SLURM job per `(experiment × timepoint)` is dispatched in parallel on the GPU queue (queue 'g'), then a single aggregator task writes `summary.csv` / `summary.md`.
 
-```bash
-# Edit sweep_preprocessing_v1.json as above, then:
-sbatch submit_pipeline.sh config.json --simulation '{"enabled":true,"sweep_file":"sweep_preprocessing_v1.json"}'
-```
-
-Or set the simulation block in `config.json`:
+**Configure simulation mode via `config.json`'s top-level `simulation` block.** CLI flags for simulation were tried but bash + sbatch + Nextflow quoting of nested JSON strings proved too fragile, so the config.json path is the only supported way:
 
 ```json
 {
-  "input":  { "directory": "..." },
-  "output": { "directory": "..." },
+  "input":  { "directory": "/scratch-cbe/users/me/data/my_experiment/" },
+  "output": { "directory": "/scratch-cbe/users/me/results/my_experiment/" },
   "simulation": {
     "enabled": true,
     "sweep_file": "./sweep_preprocessing_v1.json"
   }
 }
+```
 
-# Then just:
+Then just:
+
+```bash
 sbatch submit_pipeline.sh config.json
 ```
+
+Nextflow will skip the main pipeline entirely and dispatch one SLURM job per `(experiment × timepoint)` to queue 'g'. Monitor in Tower or with `squeue --me`.
 
 Outputs land under `<output_dir>/simulation/`:
 
