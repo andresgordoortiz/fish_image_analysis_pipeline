@@ -3134,14 +3134,13 @@ workflow {
         def tp_ch  = Channel.fromList(tp_tuples)
 
         // Expand into the (exp_name, overrides, tp, file) tuple the process expects.
-        // Note: take a single positional arg (it) and index into it. Nextflow
-        // invokes closures via MetaClass.invokeMethod which doesn't auto-spread
-        // a List arg into multiple positional params — so destructuring must
-        // happen INSIDE the closure body.
+        // IMPORTANT: Nextflow's `combine()` concatenates (flattens) the tuples
+        // emitted by each source channel rather than nesting them — since both
+        // exp_ch ([name, overrides]) and tp_ch ([tp, file]) emit 2-element
+        // tuples, the combined item is the flat 4-element list
+        // [name, overrides, tp, file], NOT [[name, overrides], [tp, file]].
         def sim_ch = exp_ch.combine(tp_ch).map { tup ->
-            def (exp, tp_file) = tup
-            def (exp_name, overrides) = exp
-            def (tp, f) = tp_file
+            def (exp_name, overrides, tp, f) = tup
             [exp_name, overrides, tp, f]
         }
 
