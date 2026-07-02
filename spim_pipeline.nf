@@ -2605,13 +2605,20 @@ process SIMULATION_AGGREGATE {
     maxRetries 1
     errorStrategy 'ignore'
 
-    // CAUTION: output filenames are `summary.csv` / `summary.md` (a literal
-    // dot, NOT underscore) — a `summary_*` glob silently drops both, which
-    // is why summaries previously only appeared in the task's workdir.
-    // Match them explicitly so they actually land in the configured output.
+    // CAUTION: output filenames are `summary.csv` / `summary.md` (literal
+    // dot, NOT underscore). The previous `summary_*` glob silently dropped
+    // both files, which is why summaries landed only in the task's workdir.
+    // Use TWO publishDir blocks (one per filename) — Groovy list syntax
+    // (`pattern: ["..."]` or `["a","b"]`) coerces to a single string
+    // `"[a, b]"` in some Nextflow process-directive paths and stops
+    // matching both. Two blocks with single-glob patterns is portable.
     publishDir "${params.output_dir}/simulation",
         mode: 'copy',
-        pattern: ["summary.csv", "summary.md"],
+        pattern: "summary.csv",
+        overwrite: true
+    publishDir "${params.output_dir}/simulation",
+        mode: 'copy',
+        pattern: "summary.md",
         overwrite: true
 
     container params.container

@@ -704,25 +704,30 @@ def run_one_experiment_tp(
     # preprocessed image without juggling two separate files. Channel 0
     # is the preprocessed intensity stack (uint16), Channel 1 is the
     # Cellpose label mask (cast to uint16 — the per-image nucleus count
-    # is well below 65 535 in practice; if a sweep ever needs more, the
-    # uint16 cast will clip and we fall back to writing the channels as
-    # two separate files).
+    # is well below 65 535 in practice).
+    #
+    # Implementation note: `imagej=True` was previously enabled here, but
+    # passing non-standard metadata keys (`channels`, `channel_0_name`,
+    # `channel_1_name`) caused tifffile to abort the IJMetadata block and
+    # silently emit a header-only ~1 KB TIFF with no pixel data. We now
+    # write a plain multi-channel TIFF — napari/Fiji/ImageJ all read it
+    # correctly via the `axes` metadata, and there's no metadata-key
+    # compatibility risk across tifffile versions.
     hyper_name = f"{base_name}_{scaling_pct}_hyperstack.tif"
     try:
-        hyper_mask = mask.astype(np.uint16) if mask.max() < 65535 else mask
-        hyper_stack = np.stack(
-            [processed.astype(np.uint16), hyper_mask], axis=0
-        )  # shape (2, Z, Y, X) — ImageJ CZYX
+        if processed.ndim == 2:
+            proc_3d = processed.astype(np.uint16)[None]            # (1, Y, X)
+            msk_3d  = mask.astype(np.uint16)[None]                 # (1, Y, X)
+        else:
+            proc_3d = processed.astype(np.uint16)
+            msk_3d  = mask.astype(np.uint16) if mask.max() < 65535 else mask
+        hyper_stack = np.stack([proc_3d, msk_3d], axis=0)          # (2, Z, Y, X)
+        if hyper_stack.size == 0:
+            raise ValueError(f"empty stack (shape={hyper_stack.shape})")
         tifffile.imwrite(
             os.path.join(exp_dir, hyper_name),
             hyper_stack,
-            imagej=True,
-            metadata={
-                'axes': 'CZYX',
-                'channels': 2,
-                'channel_0_name': 'preprocessed',
-                'channel_1_name': 'mask',
-            },
+            metadata={'axes': 'CZYX'},
         )
     except Exception as e:
         # Don't fail the whole experiment just because we couldn't pack
