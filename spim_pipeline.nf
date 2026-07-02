@@ -2424,6 +2424,13 @@ process SIM_ONE_EXPERIMENT_TP {
         mode: 'copy',
         pattern: "*_${scaling_pct}.tif"
 
+    // The hyperstack carries both the preprocessed image and the
+    // segmentation mask as channels (CZYX) so reviewers can flip between
+    // them in ImageJ without juggling two files.
+    publishDir "${params.output_dir}/simulation/${exp_name}",
+        mode: 'copy',
+        pattern: "*_${scaling_pct}_hyperstack.tif"
+
     publishDir "${params.output_dir}/simulation/${exp_name}",
         mode: 'copy',
         pattern: "*_metadata.json"
@@ -2451,6 +2458,7 @@ process SIM_ONE_EXPERIMENT_TP {
     output:
     path "*_${scaling_pct}.tif", emit: tif, optional: true
     path "*_${scaling_pct}_mask.tif", emit: mask, optional: true
+    path "*_${scaling_pct}_hyperstack.tif", emit: hyper, optional: true
     path "*_${scaling_pct}_metadata.json", emit: meta, optional: true
     path "sim_${exp_name}_t${String.format('%04d', timepoint)}.log", emit: log
 
@@ -2577,7 +2585,7 @@ PYTHON_EOF
     # so they must NOT be \$-escaped (unlike e.g. SCALING_PCT elsewhere,
     # which IS a real bash variable assigned via `SCALING_PCT=\$(...)`).
     shopt -s nullglob
-    for f in "${exp_name}"/*_${scaling_pct}.tif "${exp_name}"/*_${scaling_pct}_mask.tif "${exp_name}"/*_${scaling_pct}_metadata.json; do
+    for f in "${exp_name}"/*_${scaling_pct}.tif "${exp_name}"/*_${scaling_pct}_mask.tif "${exp_name}"/*_${scaling_pct}_hyperstack.tif "${exp_name}"/*_${scaling_pct}_metadata.json; do
         mv "\$f" .
     done
     shopt -u nullglob
@@ -2597,9 +2605,14 @@ process SIMULATION_AGGREGATE {
     maxRetries 1
     errorStrategy 'ignore'
 
+    // CAUTION: output filenames are `summary.csv` / `summary.md` (a literal
+    // dot, NOT underscore) — a `summary_*` glob silently drops both, which
+    // is why summaries previously only appeared in the task's workdir.
+    // Match them explicitly so they actually land in the configured output.
     publishDir "${params.output_dir}/simulation",
         mode: 'copy',
-        pattern: "summary_*"
+        pattern: ["summary.csv", "summary.md"],
+        overwrite: true
 
     container params.container
 

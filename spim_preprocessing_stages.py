@@ -698,6 +698,41 @@ def run_one_experiment_tp(
     mask = _run_cellpose(processed, cellpose_cfg, log)
     mask_name = f"{base_name}_{scaling_pct}_mask.tif"
     tifffile.imwrite(os.path.join(exp_dir, mask_name), mask)
+
+    # Combined hyperstack so reviewers can flip channels in ImageJ /
+    # napari / Fiji and visually grade segmentation against the
+    # preprocessed image without juggling two separate files. Channel 0
+    # is the preprocessed intensity stack (uint16), Channel 1 is the
+    # Cellpose label mask (cast to uint16 — the per-image nucleus count
+    # is well below 65 535 in practice; if a sweep ever needs more, the
+    # uint16 cast will clip and we fall back to writing the channels as
+    # two separate files).
+    hyper_name = f"{base_name}_{scaling_pct}_hyperstack.tif"
+    try:
+        hyper_mask = mask.astype(np.uint16) if mask.max() < 65535 else mask
+        hyper_stack = np.stack(
+            [processed.astype(np.uint16), hyper_mask], axis=0
+        )  # shape (2, Z, Y, X) — ImageJ CZYX
+        tifffile.imwrite(
+            os.path.join(exp_dir, hyper_name),
+            hyper_stack,
+            imagej=True,
+            metadata={
+                'axes': 'CZYX',
+                'channels': 2,
+                'channel_0_name': 'preprocessed',
+                'channel_1_name': 'mask',
+            },
+        )
+    except Exception as e:
+        # Don't fail the whole experiment just because we couldn't pack
+        # the mask — the two-channel view is a convenience, not a
+        # correctness requirement. The .tif + _mask.tif pair is still on disk.
+        log(
+            f"  [warn] [{exp_name}] could not write hyperstack "
+            f"{hyper_name} ({type(e).__name__}: {e}); "
+            f"falling back to separate channels"
+        )
     nuclei = _nuclei_count(mask)
     stats = _image_stats(processed)
 
