@@ -865,9 +865,23 @@ def run_simulation(sweep_path: str, log: Callable[[str], None] = print) -> dict:
 
     # Load each input once and keep the raw stack + voxel sizes in memory.
     log(f"[Simulation] Loading {len(inputs)} input image(s)...")
+    # _load_image() always reads voxel size from the TIFF's own embedded
+    # resolution tags, ignoring config.json's voxel_size.auto_detect setting.
+    # Mirror EXTRACT_METADATA (the Nextflow main pipeline's process) and
+    # override with the manual config values whenever auto_detect isn't
+    # explicitly enabled, so simulation results stay comparable to the main
+    # pipeline's (same voxel-dependent calculations throughout run_pipeline).
+    voxel_cfg = base_config.get("voxel_size", {}) or {}
+    manual_voxel_override = not voxel_cfg.get("auto_detect", False)
     raw_stacks = []
     for path in inputs:
         stack, voxel = _load_image(path)
+        if manual_voxel_override:
+            voxel = (
+                float(voxel_cfg.get("x_um", voxel[0])),
+                float(voxel_cfg.get("y_um", voxel[1])),
+                float(voxel_cfg.get("z_um", voxel[2])),
+            )
         raw_stacks.append({"path": path, "stack": stack, "voxel_size": voxel})
         log(f"  Loaded {os.path.basename(path)}: shape={stack.shape} voxel={voxel}")
 

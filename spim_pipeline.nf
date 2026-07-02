@@ -2405,10 +2405,20 @@ process BENCHMARK {
 process SIM_ONE_EXPERIMENT_TP {
     tag "${exp_name}/t${String.format('%04d', timepoint)}"
 
-    maxRetries 1
+    maxRetries 2
     // One bad experiment must NOT kill the entire sweep — the aggregator
-    // will report missing metadata in summary.md.
-    errorStrategy 'ignore'
+    // will report missing metadata in summary.md. IMPORTANT: this must stay
+    // a DYNAMIC closure, not a static 'ignore' — nextflow.config's
+    // `memory = { 48.GB * task.attempt }` for this process (same profile as
+    // CELLPOSE_SEGMENT, since Cellpose's 3D flow-following/mask
+    // reconstruction is the real memory bottleneck here too) only scales up
+    // when Nextflow actually RETRIES. A static 'ignore' never retries at
+    // all, so every OOM (exit 137) was a permanent loss at the lowest
+    // memory tier (48GB) even though the closure was designed to escalate
+    // to 96GB/144GB on subsequent attempts — this is why most tasks OOM'd
+    // while only the lightest-weight experiments (fewest enabled stages)
+    // happened to fit under 48GB and succeeded.
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'ignore' }
 
     publishDir "${params.output_dir}/simulation/${exp_name}",
         mode: 'copy',
@@ -2520,6 +2530,25 @@ pp = base_config.get('preprocessing', {}) or {}
 cp_cfg = _resolve_cellpose_config(sweep.get('cellpose', {}) or {}, base_config)
 
 raw_stack, voxel = _load_image(staged_input)
+
+# _load_image() always reads voxel size directly from the TIFF's own
+# embedded XResolution/YResolution/ImageJ-spacing tags, ignoring
+# config.json's voxel_size.auto_detect setting entirely. When those tags
+# aren't properly calibrated (as with these inputs — TIFFs report
+# ~0.0104/0.0104/1.0 µm instead of the intended manual override) this
+# silently uses the wrong voxel size for every voxel-dependent calculation
+# (WBNS resolution levels, isotropic reslicing, Cellpose anisotropy, ...),
+# invalidating comparisons across sweep experiments. Mirror EXTRACT_METADATA
+# (the main pipeline's process) and override with the manual config values
+# whenever auto_detect is not explicitly enabled.
+voxel_cfg = base_config.get('voxel_size', {}) or {}
+if not voxel_cfg.get('auto_detect', False):
+    voxel = (
+        float(voxel_cfg.get('x_um', voxel[0])),
+        float(voxel_cfg.get('y_um', voxel[1])),
+        float(voxel_cfg.get('z_um', voxel[2])),
+    )
+
 print(f"Loaded {staged_input}: shape={raw_stack.shape} voxel={voxel}", flush=True)
 
 meta = run_one_experiment_tp(
