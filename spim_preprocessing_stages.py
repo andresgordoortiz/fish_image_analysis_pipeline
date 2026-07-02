@@ -713,7 +713,7 @@ def run_one_experiment_tp(
         "intensity_stats": stats,
         "nuclei_count": nuclei,
     }
-    with open(os.path.join(exp_dir, f"{base_name}_{scaling_pct}_metadata.json"), "w") as f:
+    with open(os.path.join(exp_dir, f"{exp_name}_{base_name}_{scaling_pct}_metadata.json"), "w") as f:
         json.dump(meta, f, indent=2, default=str)
 
     log(
@@ -910,7 +910,7 @@ def run_simulation(sweep_path: str, log: Callable[[str], None] = print) -> dict:
                 float(meta["config"].get("downscale_xy", {}).get("factor", 1.0)) * 100
             ))
             all_metadata_paths.append(
-                os.path.join(output_dir, exp_name, f"{tp_label}_{scaling_pct}_metadata.json")
+                os.path.join(output_dir, exp_name, f"{exp_name}_{tp_label}_{scaling_pct}_metadata.json")
             )
 
     return aggregate_simulation_metadata(
