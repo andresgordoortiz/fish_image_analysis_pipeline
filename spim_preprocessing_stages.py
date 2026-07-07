@@ -696,6 +696,32 @@ def run_one_experiment_tp(
     tifffile.imwrite(os.path.join(exp_dir, out_name), processed.astype(np.uint16))
 
     mask = _run_cellpose(processed, cellpose_cfg, log)
+
+    # Cellpose returns instance IDs in the order its flow-field tracker
+    # visits nuclei — that order is neither spatial (top-left-first) nor
+    # guaranteed contiguous. Practical consequences:
+    #   * `mask.max() < nuclei_count` if labels skip values, so
+    #     `mask.max()` (used by `_nuclei_count`) would under-report.
+    #   * Label IDs can exceed 65 535 on dense images, which silently
+    #     wraps around the uint16 cast downstream and reuses IDs for
+    #     different nuclei — that's the "labels loop" the reviewer saw.
+    #   * Viewer colormaps cycle through IDs in label-value order, not
+    #     spatial order, so neighbouring nuclei can end up with wildly
+    #     different colours.
+    # Relabel to a contiguous `{1, 2, ..., N}` range in spatial
+    # (left-to-right, top-to-bottom, front-to-back) order. Skimage is
+    # already pulled in by aydin / Cellpose's own pipeline so this
+    # import is free; the fallback keeps us running if a slimmed-down
+    # env ever drops it.
+    try:
+        from skimage.segmentation import relabel_sequential
+        mask, _, _ = relabel_sequential(mask)
+    except Exception as _rl_err:
+        log(
+            f"  [warn] [{exp_name}] could not relabel mask sequentially "
+            f"({type(_rl_err).__name__}: {_rl_err}); using raw Cellpose IDs"
+        )
+
     mask_name = f"{base_name}_{scaling_pct}_mask.tif"
     tifffile.imwrite(os.path.join(exp_dir, mask_name), mask)
 
@@ -706,13 +732,17 @@ def run_one_experiment_tp(
     # Cellpose label mask (cast to uint16 — the per-image nucleus count
     # is well below 65 535 in practice).
     #
-    # Implementation note: `imagej=True` was previously enabled here, but
-    # passing non-standard metadata keys (`channels`, `channel_0_name`,
-    # `channel_1_name`) caused tifffile to abort the IJMetadata block and
-    # silently emit a header-only ~1 KB TIFF with no pixel data. We now
-    # write a plain multi-channel TIFF — napari/Fiji/ImageJ all read it
-    # correctly via the `axes` metadata, and there's no metadata-key
-    # compatibility risk across tifffile versions.
+    # Implementation note: this MUST use `imagej=True` so the file is a
+    # real ImageJ-format hyperstack (Fiji/ImageJ read it as 2 channels
+    # with per-channel brightness/contrast; napari reads it as 2 channel
+    # layers). Without `imagej=True`, tifffile writes a flat multi-page
+    # TIFF that viewers interpret as a 2Z-page single-channel stack —
+    # exactly the failure mode that motivated this comment.
+    #
+    # The earlier 8-byte stub was caused by passing non-standard
+    # metadata keys (`channels`, `channel_0_name`, `channel_1_name`)
+    # that crashed tifffile's IJMetadata serializer. Pass ONLY the
+    # `axes` key — that's all ImageJ needs to recognise the format.
     hyper_name = f"{base_name}_{scaling_pct}_hyperstack.tif"
     try:
         if processed.ndim == 2:
@@ -724,11 +754,24 @@ def run_one_experiment_tp(
         hyper_stack = np.stack([proc_3d, msk_3d], axis=0)          # (2, Z, Y, X)
         if hyper_stack.size == 0:
             raise ValueError(f"empty stack (shape={hyper_stack.shape})")
+        hyper_path = os.path.join(exp_dir, hyper_name)
         tifffile.imwrite(
-            os.path.join(exp_dir, hyper_name),
+            hyper_path,
             hyper_stack,
+            imagej=True,
             metadata={'axes': 'CZYX'},
         )
+        # Belt-and-braces: if tifffile's IJMetadata write crashes
+        # silently (older versions did this on any non-standard key),
+        # the file ends up as a header-only ~8-byte stub. Detect that
+        # and raise so the catch below logs a clear warning instead of
+        # the user discovering an empty hyperstack in the publish dir.
+        size_bytes = os.path.getsize(hyper_path)
+        if size_bytes < 1024:
+            raise ValueError(
+                f"hyperstack is only {size_bytes} bytes after write "
+                f"(likely a header-only IJMetadata failure)"
+            )
     except Exception as e:
         # Don't fail the whole experiment just because we couldn't pack
         # the mask — the two-channel view is a convenience, not a

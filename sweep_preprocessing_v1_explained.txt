@@ -1,0 +1,112 @@
+SPIM Simulation Mode — Experiment / Output Reference
+======================================================
+
+The simulation mode (run via `python3 spim_pipeline_fixed.py --simulate
+--sweep_file <sweep>.json`, or via the Nextflow `SIM_*` processes) loops
+each named "experiment" over every input timepoint, runs the preprocessing
+pipeline, then runs Cellpose on the result and counts nuclei.
+
+Per-experiment outputs (`<output_dir>/<exp_name>/`):
+  - `<basename>_<pct>.tif`              preprocessed intensity stack (uint16)
+  - `<basename>_<pct>_mask.tif`         Cellpose label mask (uint16)
+  - `<basename>_<pct>_hyperstack.tif`   2-channel CZYX: ch0 = preprocessed,
+                                        ch1 = mask (ImageJ / napari readable)
+  - `<exp>_<basename>_<pct>_metadata.json`  full per-run metadata
+                                        (runtime, stage timings, voxel size,
+                                        intensity stats, nuclei count)
+  - `intermediates_<basename>/<NN>_<stage>.tif`
+                                        per-stage TIFFs (only when
+                                        `save_intermediates=true`)
+
+Top-level summary files (`<output_dir>/`):
+  - `summary.csv` / `summary.md` — per-experiment mean/std of runtime,
+    mean and p99 intensity, and nuclei count over timepoints. The .md
+    marks each row with ↑ / ↓ / · vs the median nuclei count across
+    experiments — handy for picking winners at a glance.
+
+Default stage order (from config.json)
+--------------------------------------
+load -> downscale_xy -> shading_correction -> z_intensity_correction ->
+isotropic_reslice -> deconvolution_3d -> deconvolution_xz ->
+background_subtraction (WBNS) -> gaussian_smooth -> clahe ->
+percentile_normalization -> final_cast
+
+Every experiment keeps the infrastructure stages (`downscale_xy`,
+`final_cast`) on, and keeps BOTH deconvolution stages OFF (they are
+expensive + GPU-bound and are exercised separately). "all_stages" below
+therefore means everything else with config.json defaults.
+
+============================================================================
+Table 1 — what each named experiment means
+============================================================================
+
+| #  | Name             | Overrides on top of the default config.json baseline                                          | Purpose / Notes                                                                 |
+|----|------------------|----------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------|
+| 01 | raw_minimal      | ALL processing stages DISABLED: shading, z_correction, isotropic_reslice, deconv(3D+XZ),     | Lower bound. Segmentation sees the file with literally no preprocessing         |
+|    |                  | WBNS, gaussian_smooth, clahe, percentile_normalization. Only load + downscale + final_cast.  | (apart from the always-on XY downscale).                                        |
+| 02 | all_stages       | Only deconvolution_3d and deconvolution_xz are turned off; everything else at config defaults. | The "default recipe" reference — closest to production behaviour (which never    |
+|    |                  |                                                                                              | relies on deconv when the PSF is unreliable).                                    |
+| 03 | no_clahe         | all_stages + clahe DISABLED.                                                                 | Isolates the contribution of adaptive histogram equalisation.                   |
+| 04 | no_wbns          | all_stages + background_subtraction (WBNS) DISABLED.                                         | Isolates the wavelet-based background subtraction.                              |
+| 05 | no_gaussian      | all_stages + gaussian_smooth DISABLED.                                                       | Isolates the final Gaussian smoothing.                                          |
+| 06 | no_z_correction  | all_stages + z_intensity_correction DISABLED.                                                | Isolates the multiplicative per-slice Z intensity correction                    |
+|    |                  |                                                                                              | (depth attenuation / bleaching).                                                |
+| 07 | no_shading       | all_stages + shading_correction DISABLED.                                                    | Isolates the XY illumination flat-field correction.                             |
+| 08 | clahe_clip_003   | all_stages; clahe.clip_limit = 0.003 (vs default 0.01).                                      | Tighter CLAHE clip — less local contrast boost, fewer speckle artefacts.        |
+| 09 | clahe_clip_030   | all_stages; clahe.clip_limit = 0.030 (vs default 0.01).                                      | Looser CLAHE clip — stronger local contrast, more noise amplification.          |
+| 10 | clahe_kernel_32  | all_stages; clahe.kernel_size = 32  (vs default 64).                                         | Smaller CLAHE tile — finer-grained local adaptation.                            |
+| 11 | clahe_kernel_128 | all_stages; clahe.kernel_size = 128 (vs default 64).                                         | Larger CLAHE tile — smoother / more global local adaptation.                    |
+| 12 | pct_tight        | all_stages; percentile_normalization.percentile_low=20.0, percentile_high=99.5                 | Aggressive outlier clipping before final cast (default is 10.0 / 99.9).         |
+|    |                  | (vs default 10.0 / 99.9).                                                                    |                                                                                 |
+| 13 | pct_loose        | all_stages; percentile_normalization.percentile_low=0.0,  percentile_high=99.99                | Near-no-op percentile clipping (keeps the stage on, just widens the window).    |
+|    |                  | (vs default 10.0 / 99.9).                                                                    |                                                                                 |
+| 14 | sigma_strong     | all_stages; gaussian_smooth.sigma = 2.5 (vs default 1.2).                                    | Heavier smoothing — trades spatial resolution for SNR.                          |
+| 15 | conservative     | all_stages minus clahe and gaussian_smooth.                                                  | Minimum processing — shading + z-correction + reslice + WBNS + percentile       |
+|    |                  |                                                                                              | only. The "safe" baseline that almost never makes things worse.                 |
+| 16 | aggressive       | all_stages; clahe.clip_limit=0.005, clahe.kernel_size=128; gaussian_smooth.sigma=0.8.         | Strong but carefully tuned — heavy CLAHE on a large tile plus light smoothing.  |
+
+============================================================================
+Table 2 — parameter reference (defaults from config.json)
+============================================================================
+
+| Stage                          | Config keys                                | Default values           | What it does                                                                                    |
+|--------------------------------|--------------------------------------------|--------------------------|-------------------------------------------------------------------------------------------------|
+| downscale_xy                   | factor                                     | 0.33                     | XY downsample via skimage.rescale (always on; 1.0 = no-op).                                     |
+| shading_correction             | enabled / sigma_xy / max_amplification     | true / 96.0 / 2.0        | Gaussian-blurred mean projection used as a multiplicative flat field; capped amplification.     |
+| z_intensity_correction         | enabled / method / smooth_window           | true / "p95" / 11        | Multiplicative per-slice scaling with a smoothed trend.                                         |
+| isotropic_reslice              | enabled                                    | true                     | Resamples Z so voxels match XY pixel size (required for downstream 3D ops).                      |
+| deconvolution_3d               | enabled / niter / padding / psf_path       | true / 3 / 64 / (file)   | GPU Richardson-Lucy on PSF. OFF in every sweep experiment.                                     |
+| deconvolution_xz               | enabled / niter / padding                  | true / 3 / 64            | Same, on the transposed XZ view. OFF in every sweep experiment.                                 |
+| background_subtraction (WBNS)  | enabled / resolution_xy / resolution_xz /  | true / 10 / 10 / 2       | Wavelet-based background subtraction, then on the XZ-transposed view.                           |
+|                                |   noise_lvl                                |                          |                                                                                                 |
+| gaussian_smooth                | enabled / sigma                            | true / 1.2               | Final isotropic Gaussian smoothing.                                                             |
+| clahe                          | enabled / clip_limit / kernel_size /       | true / 0.01 / 64 /       | Slice-wise CLAHE on the XZ-transposed stack, with percentile clipping.                          |
+|                                |   p_low / p_high                           |   0.5 / 99.5             |                                                                                                 |
+| percentile_normalization       | enabled / percentile_low / percentile_high | true / 10.0 / 99.9       | Outlier-clip before final cast. Setting 0/100 effectively no-ops without changing the flag.     |
+| final_cast                     | min_v / max_v / dtype                      | 0 / 65535 / "uint16"     | Linear rescale to [min_v, max_v] and dtype cast. Always on.                                     |
+
+============================================================================
+How the sweep is run
+============================================================================
+
+Per-experiment (local CLI):
+    python3 spim_pipeline_fixed.py --simulate --sweep_file <sweep>.json
+
+Nextflow (parallel cluster run, one SLURM job per (experiment x timepoint)):
+    nextflow run spim_pipeline.nf --simulationEnabled --sweepFile <sweep>.json
+
+Inputs are either listed explicitly under `"input": [...]` in the sweep,
+or auto-discovered from `config.input.directory` using the
+`t*_Channel <N>.tif` glob (and optionally filtered by
+`config.input.timepoints`).
+
+Cellpose params for every experiment are resolved by
+`_resolve_cellpose_config()` (in spim_preprocessing_stages.py), with
+priority: per-sweep override -> `preprocessing.simulation` block ->
+canonical `segmentation` block. The model, diameter, flow_threshold,
+cellprob_threshold, do_3d, min_size, use_gpu come from
+`config.segmentation` by default, so nuclei counts are directly comparable
+to the main pipeline's segmentation output.
+
+The `nuclei_count_mean` and `nuclei_count_std` columns in summary.csv
+over timepoints are the headline metric for picking winners.

@@ -155,6 +155,36 @@
         "deconvolution_3d": { "enabled": false },
         "deconvolution_xz": { "enabled": false }
       }
+    },
+
+    {
+      "_comment": "DEEP-CELL preservation sweep — added after the first sweep run showed that WBNS (default noise_lvl=2, resolution=10) and CLAHE clip_limit < 0.03 erase dim deep cells. 17 keeps WBNS on but softens it; 18/19 disable WBNS and compensate elsewhere.",
+      "name": "17_wbns_gentle",
+      "overrides": {
+        "background_subtraction": { "noise_lvl": 1, "resolution_xy": 6, "resolution_xz": 6 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "_comment": "Best deep-cell recipe from sweep round 1: no WBNS (which was eating the dim signal) + the only CLAHE clip_limit that preserved them (0.030).",
+      "name": "18_no_wbns_clahe030",
+      "overrides": {
+        "background_subtraction": { "enabled": false },
+        "clahe": { "clip_limit": 0.030 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "_comment": "No WBNS + tighter percentile_norm — tests whether aggressive outlier clipping can replace WBNS haze removal without losing deep cells.",
+      "name": "19_no_wbns_pct_tight",
+      "overrides": {
+        "background_subtraction": { "enabled": false },
+        "percentile_normalization": { "percentile_low": 5.0, "percentile_high": 99.95 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
     }
   ]
 }
