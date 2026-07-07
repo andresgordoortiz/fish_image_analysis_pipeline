@@ -185,6 +185,44 @@
         "deconvolution_3d": { "enabled": false },
         "deconvolution_xz": { "enabled": false }
       }
+    },
+
+    {
+      "_comment": "ROUND 2 — Deep-cell preservation, post-mortem on 17-19. WBNS per-view gate (resolution_xz=0 disables XZ only). The XZ WBNS call hardcodes noise_lvl=0 so it's even more aggressive than XY, and XZ is exactly where deep cells are dim and haze accumulates.",
+      "name": "20_wbns_xy_only",
+      "overrides": {
+        "background_subtraction": { "resolution_xz": 0 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "_comment": "Reverse of 20 — keep XZ WBNS, disable XY. Confirms whether XZ really is the deep-cell killer (if 20 keeps cells but 21 doesn't, hypothesis confirmed).",
+      "name": "21_wbns_xz_only",
+      "overrides": {
+        "background_subtraction": { "resolution_xy": 0 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "_comment": "No WBNS + CLAHE 0.030 + CLAHE's own p_low raised to 15.0 (vs default 0.5). Lets CLAHE itself clip the haze before equalization, so cloudiness drops without touching the percentile_normalization / WBNS knobs that have been eating deep cells.",
+      "name": "22_no_wbns_clahe030_p_low",
+      "overrides": {
+        "background_subtraction": { "enabled": false },
+        "clahe": { "clip_limit": 0.030, "p_low": 15.0 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "_comment": "Combines 17's gentle XY with 20's XZ-off. Most likely candidate recipe if 20 keeps deep cells.",
+      "name": "23_wbns_xy_only_gentle",
+      "overrides": {
+        "background_subtraction": { "noise_lvl": 1, "resolution_xy": 6, "resolution_xz": 0 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
     }
   ]
 }
