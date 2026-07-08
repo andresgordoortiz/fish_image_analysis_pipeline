@@ -880,17 +880,18 @@ def run_one_experiment_tp(
     # Cellpose label mask (cast to uint16 — the per-image nucleus count
     # is well below 65 535 in practice).
     #
-    # Implementation note: this MUST use `imagej=True` so the file is a
-    # real ImageJ-format hyperstack (Fiji/ImageJ read it as 2 channels
-    # with per-channel brightness/contrast; napari reads it as 2 channel
-    # layers). Without `imagej=True`, tifffile writes a flat multi-page
-    # TIFF that viewers interpret as a 2Z-page single-channel stack —
-    # exactly the failure mode that motivated this comment.
-    #
-    # The earlier 8-byte stub was caused by passing non-standard
-    # metadata keys (`channels`, `channel_0_name`, `channel_1_name`)
-    # that crashed tifffile's IJMetadata serializer. Pass ONLY the
-    # `axes` key — that's all ImageJ needs to recognise the format.
+    # Write strategy: try `imagej=True` first (best Fiji/ImageJ
+    # experience — proper per-channel brightness/contrast), and fall
+    # back to a plain axes-tagged write if tifffile's IJMetadata
+    # serializer chokes. Older tifffile releases (and some newer ones
+    # on certain array shapes) silently leave an 8-byte header-only
+    # stub on disk when this happens — that's the empty-hyperstack
+    # failure mode the user hit. We detect the stub via a post-write
+    # size check, delete it, and retry in the next mode. The plain
+    # fallback is robust across tifffile versions and is read correctly
+    # by napari (which honours the axes tag in the ImageDescription).
+    # Fiji/ImageJ will see a 2*Z-page stack and the user can configure
+    # the channel axis via Image > Hyperstacks > Stacks to Hyperstack.
     hyper_name = f"{base_name}_{scaling_pct}_hyperstack.tif"
     try:
         if processed.ndim == 2:
@@ -903,23 +904,58 @@ def run_one_experiment_tp(
         if hyper_stack.size == 0:
             raise ValueError(f"empty stack (shape={hyper_stack.shape})")
         hyper_path = os.path.join(exp_dir, hyper_name)
-        tifffile.imwrite(
-            hyper_path,
-            hyper_stack,
-            imagej=True,
-            metadata={'axes': 'CZYX'},
-        )
-        # Belt-and-braces: if tifffile's IJMetadata write crashes
-        # silently (older versions did this on any non-standard key),
-        # the file ends up as a header-only ~8-byte stub. Detect that
-        # and raise so the catch below logs a clear warning instead of
-        # the user discovering an empty hyperstack in the publish dir.
-        size_bytes = os.path.getsize(hyper_path)
-        if size_bytes < 1024:
-            raise ValueError(
-                f"hyperstack is only {size_bytes} bytes after write "
-                f"(likely a header-only IJMetadata failure)"
-            )
+        # Wipe any leftover stub from a previous failed run so the size
+        # check below doesn't mis-fire on a stale file.
+        if os.path.exists(hyper_path) and os.path.getsize(hyper_path) < 1024:
+            os.remove(hyper_path)
+
+        write_modes = [
+            # (imagej flag, human-readable name for logs)
+            (True,  "imagej+IJMetadata"),
+            (False, "plain-axes-tagged"),
+        ]
+        wrote_ok = False
+        for imagej_flag, mode_name in write_modes:
+            try:
+                tifffile.imwrite(
+                    hyper_path,
+                    hyper_stack,
+                    imagej=imagej_flag,
+                    metadata={'axes': 'CZYX'},
+                )
+                size_bytes = os.path.getsize(hyper_path)
+                if size_bytes < 1024:
+                    # tifffile returned "successfully" but left a stub —
+                    # clean it up and try the next mode.
+                    os.remove(hyper_path)
+                    raise ValueError(
+                        f"header-only stub ({size_bytes} B) after "
+                        f"mode={mode_name}"
+                    )
+                if mode_name != write_modes[0][1]:
+                    log(
+                        f"  [info] [{exp_name}] hyperstack written in "
+                        f"'{mode_name}' mode (Fiji/ImageJ may need the "
+                        f"channel axis configured manually); napari reads "
+                        f"both channels automatically."
+                    )
+                wrote_ok = True
+                break
+            except Exception as mode_err:
+                # Clean up any stub the failed write left behind.
+                if os.path.exists(hyper_path) and os.path.getsize(hyper_path) < 1024:
+                    os.remove(hyper_path)
+                is_last = mode_name == write_modes[-1][1]
+                if is_last:
+                    raise
+                log(
+                    f"  [warn] [{exp_name}] hyperstack write in "
+                    f"'{mode_name}' mode failed "
+                    f"({type(mode_err).__name__}: {mode_err}); "
+                    f"trying '{write_modes[1][1]}' next"
+                )
+        if not wrote_ok:
+            raise RuntimeError("all hyperstack write modes failed")
     except Exception as e:
         # Don't fail the whole experiment just because we couldn't pack
         # the mask — the two-channel view is a convenience, not a
