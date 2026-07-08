@@ -223,6 +223,39 @@
         "deconvolution_3d": { "enabled": false },
         "deconvolution_xz": { "enabled": false }
       }
+    },
+
+    {
+      "_comment": "ROUND 3 — 22 wins overall but loses/blurs the ROI at xy=(146-218, 481-642). Three culprits: gaussian smooth (smears fine structure), z_intensity_correction (amplifies noise in dim slices), clahe.p_low=15 (clips dim cells in low-intensity tiles).",
+      "name": "24_22_no_gauss",
+      "overrides": {
+        "background_subtraction": { "enabled": false },
+        "clahe": { "clip_limit": 0.030, "p_low": 15.0 },
+        "gaussian_smooth": { "enabled": false },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "_comment": "22 minus z_intensity_correction — tests whether per-slice Z rescaling is amplifying noise in the dim slice containing the ROI.",
+      "name": "25_22_no_z_corr",
+      "overrides": {
+        "background_subtraction": { "enabled": false },
+        "z_intensity_correction": { "enabled": false },
+        "clahe": { "clip_limit": 0.030, "p_low": 15.0 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
+    },
+    {
+      "_comment": "22 with clahe.p_low=5.0 (vs 15.0) — tests whether the aggressive 15% bottom-clip is erasing dim cells in the ROI's tile.",
+      "name": "26_22_p_low5",
+      "overrides": {
+        "background_subtraction": { "enabled": false },
+        "clahe": { "clip_limit": 0.030, "p_low": 5.0 },
+        "deconvolution_3d": { "enabled": false },
+        "deconvolution_xz": { "enabled": false }
+      }
     }
   ]
 }
