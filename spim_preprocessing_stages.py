@@ -40,6 +40,7 @@ from typing import Callable, Optional
 import numpy as np
 import tifffile
 from scipy import ndimage as ndi
+from skimage.measure import regionprops
 from skimage.transform import rescale
 
 # Shared helpers (pure functions, no side effects on import). These live in
@@ -598,6 +599,153 @@ def _nuclei_count(mask: np.ndarray) -> int:
     return int(mask.max())
 
 
+# ---------------------------------------------------------------------------
+# Real-nucleus filter — separates real nuclei (~10 µm in this dataset) from
+# CellposeSAM's over-segmentation (tiny artefacts) and under-segmentation
+# (merged blobs from light-sheet stripes). The filter is purely size-based
+# on the volume of each label, converted to an equivalent-sphere diameter
+# in micrometres using the stack's physical voxel size.
+# ---------------------------------------------------------------------------
+
+# Canonical nucleus diameter for this dataset. Used as the centre of the
+# acceptance band and drawn as a red dashed line in the volume histogram.
+NUCLEUS_DIAMETER_UM = 10.0
+
+# Acceptance band (µm). Nuclei with an estimated diameter outside this range
+# are counted as artefacts / blobs and excluded from `real_count`.
+# 5 µm catches sub-nuclear speckle; 15 µm catches small merged blobs.
+NUCLEUS_DIAMETER_BAND_UM = (5.0, 15.0)
+
+
+def _nuclei_stats(mask: np.ndarray, voxel_size_um: tuple) -> dict:
+    """Per-label statistics with a real-nucleus size filter.
+
+    For every distinct label in ``mask`` (excluding 0 = background), compute
+    its volume in voxels and convert to an equivalent-sphere diameter in
+    micrometres using ``voxel_size_um`` (vx, vy, vz). The real-nucleus
+    count is the number of labels whose estimated diameter falls within
+    ``NUCLEUS_DIAMETER_BAND_UM``.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Integer label image (0 = background, >0 = label id).
+    voxel_size_um : (vx, vy, vz)
+        Physical voxel size in micrometres (per axis). The volume of one
+        voxel is the product of the three.
+
+    Returns
+    -------
+    dict with keys:
+        total                    — int, mask.max() (Cellpose's raw count)
+        real_count               — int, labels passing the size filter
+        real_pct                 — float, real_count / total
+        median_real_diameter_um  — float, median of the filtered diameters
+        diameters_um             — list[float], every label's diameter
+                                   (used by _save_volume_histogram)
+        voxel_volume_um3         — float, physical volume of one voxel
+    """
+    voxel_vol_um3 = float(np.prod(voxel_size_um))
+    if mask.max() == 0:
+        return {
+            "total": 0,
+            "real_count": 0,
+            "real_pct": 0.0,
+            "median_real_diameter_um": 0.0,
+            "diameters_um": [],
+            "voxel_volume_um3": voxel_vol_um3,
+        }
+
+    props = regionprops(mask)
+    if not props:
+        return {
+            "total": int(mask.max()),
+            "real_count": 0,
+            "real_pct": 0.0,
+            "median_real_diameter_um": 0.0,
+            "diameters_um": [],
+            "voxel_volume_um3": voxel_vol_um3,
+        }
+
+    volumes_vox = np.array([p.area for p in props], dtype=np.int64)
+    volumes_um3 = volumes_vox * voxel_vol_um3
+    # Equivalent-sphere diameter for the label's volume.
+    diameters_um = 2.0 * np.cbrt(3.0 * volumes_um3 / (4.0 * np.pi))
+
+    lo, hi = NUCLEUS_DIAMETER_BAND_UM
+    real_mask = (diameters_um >= lo) & (diameters_um <= hi)
+    real_diameters = diameters_um[real_mask]
+
+    return {
+        "total": int(mask.max()),
+        "real_count": int(real_mask.sum()),
+        "real_pct": float(real_mask.sum()) / float(max(1, mask.max())),
+        "median_real_diameter_um": float(np.median(real_diameters)) if real_diameters.size else 0.0,
+        "diameters_um": diameters_um.tolist(),
+        "voxel_volume_um3": voxel_vol_um3,
+    }
+
+
+def _save_volume_histogram(
+    exp_dir: str,
+    exp_name: str,
+    base_name: str,
+    scaling_pct: int,
+    diameters_um,
+) -> None:
+    """Save a per-timepoint histogram of per-label diameters (µm).
+
+    X axis: estimated diameter (µm), binned at 0.5 µm between 0 and 30 µm.
+    Reference lines at the lower band edge, the canonical nucleus diameter,
+    and the upper band edge. The canonical line is dashed red; the band
+    edges are dotted black.
+
+    Failures to import matplotlib (e.g. a slimmed-down env) are logged and
+    swallowed — the rest of the experiment outputs are still complete.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log = print
+        log(
+            f"  [warn] [{exp_name}] matplotlib not available; "
+            f"skipping diameter histogram for {base_name}"
+        )
+        return
+
+    diameters_um = np.asarray(diameters_um, dtype=np.float64)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    if diameters_um.size:
+        ax.hist(
+            diameters_um,
+            bins=np.arange(0.0, 30.0, 0.5),
+            color="#1f77b4",
+            edgecolor="white",
+            linewidth=0.4,
+        )
+    lo, hi = NUCLEUS_DIAMETER_BAND_UM
+    ax.axvline(lo, color="black", linestyle=":", alpha=0.7,
+               label=f"band low = {lo:.0f} µm")
+    ax.axvline(NUCLEUS_DIAMETER_UM, color="red", linestyle="--", alpha=0.8,
+               label=f"canonical = {NUCLEUS_DIAMETER_UM:.0f} µm")
+    ax.axvline(hi, color="black", linestyle=":", alpha=0.7,
+               label=f"band high = {hi:.0f} µm")
+    ax.set_xlabel("Estimated diameter (µm)")
+    ax.set_ylabel("Count")
+    ax.set_title(f"{exp_name} / {base_name} — per-label diameter distribution\n"
+                 f"n={diameters_um.size} labels, "
+                 f"band=({lo:.0f}, {hi:.0f}) µm")
+    ax.legend(fontsize=9, loc="upper right")
+    out_path = os.path.join(
+        exp_dir, f"{exp_name}_{base_name}_{scaling_pct}_diameters.png"
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
 def _image_stats(image: np.ndarray) -> dict:
     """Quick intensity summary."""
     if image.dtype != np.float32 and image.dtype != np.float64:
@@ -782,6 +930,14 @@ def run_one_experiment_tp(
             f"falling back to separate channels"
         )
     nuclei = _nuclei_count(mask)
+    nuc_stats = _nuclei_stats(mask, voxel_size)
+    _save_volume_histogram(
+        exp_dir=exp_dir,
+        exp_name=exp_name,
+        base_name=base_name,
+        scaling_pct=scaling_pct,
+        diameters_um=nuc_stats["diameters_um"],
+    )
     stats = _image_stats(processed)
 
     meta = {
@@ -795,6 +951,15 @@ def run_one_experiment_tp(
         "stage_notes": ctx.get("stage_notes", {}),
         "intensity_stats": stats,
         "nuclei_count": nuclei,
+        "nuclei_stats": {
+            "total": nuc_stats["total"],
+            "real_count": nuc_stats["real_count"],
+            "real_pct": nuc_stats["real_pct"],
+            "median_real_diameter_um": nuc_stats["median_real_diameter_um"],
+            "voxel_volume_um3": nuc_stats["voxel_volume_um3"],
+            "diameter_band_um": list(NUCLEUS_DIAMETER_BAND_UM),
+            "canonical_diameter_um": NUCLEUS_DIAMETER_UM,
+        },
     }
     with open(os.path.join(exp_dir, f"{exp_name}_{base_name}_{scaling_pct}_metadata.json"), "w") as f:
         json.dump(meta, f, indent=2, default=str)
@@ -842,14 +1007,24 @@ def aggregate_simulation_metadata(
 
     summary_rows = []
     for exp_name, rows in per_exp.items():
+        # Some older metadata.json files pre-date the nuclei_stats field —
+        # treat them as zeros rather than KeyError-ing the whole sweep.
+        real_counts = [r.get("nuclei_stats", {}).get("real_count", 0) for r in rows]
+        real_pcts = [r.get("nuclei_stats", {}).get("real_pct", 0.0) for r in rows]
+        med_diams = [r.get("nuclei_stats", {}).get("median_real_diameter_um", 0.0) for r in rows]
+        nuclei_counts = [r["nuclei_count"] for r in rows]
         summary_rows.append({
             "experiment": exp_name,
             "n_tps": len(rows),
             "runtime_s_mean": float(np.mean([r["runtime_s"] for r in rows])),
             "mean_intensity": float(np.mean([r["intensity_stats"]["mean"] for r in rows])),
             "p99_intensity": float(np.mean([r["intensity_stats"]["p99"] for r in rows])),
-            "nuclei_count_mean": float(np.mean([r["nuclei_count"] for r in rows])),
-            "nuclei_count_std": float(np.std([r["nuclei_count"] for r in rows])) if len(rows) > 1 else 0.0,
+            "nuclei_total_mean": float(np.mean(nuclei_counts)),
+            "nuclei_total_std": float(np.std(nuclei_counts)) if len(rows) > 1 else 0.0,
+            "real_nuclei_mean": float(np.mean(real_counts)),
+            "real_nuclei_std": float(np.std(real_counts)) if len(rows) > 1 else 0.0,
+            "real_nuclei_pct_mean": float(np.mean(real_pcts)),
+            "median_diam_um_mean": float(np.mean(med_diams)),
         })
 
     summary_csv = os.path.join(output_dir, "summary.csv")
@@ -862,25 +1037,35 @@ def aggregate_simulation_metadata(
             for row in summary_rows:
                 f.write(",".join(str(row[k]) for k in keys) + "\n")
 
-        median_nuclei = float(np.median([r["nuclei_count_mean"] for r in summary_rows]))
+        median_real = float(np.median([r["real_nuclei_mean"] for r in summary_rows]))
         with open(summary_md, "w") as f:
             f.write("# Simulation summary\n\n")
             f.write(f"Inputs: {inputs_count} timepoint(s)\n\n")
             f.write(
-                f"{'experiment':<24} {'runtime_s':>10} {'mean_int':>10} "
-                f"{'p99':>8} {'nuclei_mean':>14} {'nuclei_std':>12}\n"
+                f"'real_nuclei' = labels with estimated diameter in "
+                f"{NUCLEUS_DIAMETER_BAND_UM[0]:.0f}-"
+                f"{NUCLEUS_DIAMETER_BAND_UM[1]:.0f} µm "
+                f"(canonical = {NUCLEUS_DIAMETER_UM:.0f} µm). "
+                f"'nuclei_total' is the raw CellposeSAM count (no filter).\n\n"
             )
-            f.write("-" * 90 + "\n")
+            f.write(
+                f"{'experiment':<24} {'runtime_s':>10} {'mean_int':>10} "
+                f"{'p99':>8} {'nuc_total':>10} {'real_nuc':>10} "
+                f"{'real_pct':>10} {'med_diam':>10}\n"
+            )
+            f.write("-" * 102 + "\n")
             for row in summary_rows:
-                rel = row["nuclei_count_mean"] - median_nuclei
+                rel = row["real_nuclei_mean"] - median_real
                 arrow = "↑" if rel > 0 else ("↓" if rel < 0 else "·")
                 f.write(
                     f"{row['experiment']:<24} "
                     f"{row['runtime_s_mean']:>10.1f} "
                     f"{row['mean_intensity']:>10.1f} "
                     f"{row['p99_intensity']:>8.1f} "
-                    f"{row['nuclei_count_mean']:>12.1f} {arrow}  "
-                    f"{row['nuclei_count_std']:>12.1f}\n"
+                    f"{row['nuclei_total_mean']:>10.1f} "
+                    f"{row['real_nuclei_mean']:>10.1f} {arrow} "
+                    f"{row['real_nuclei_pct_mean']*100:>9.1f}% "
+                    f"{row['median_diam_um_mean']:>10.2f}\n"
                 )
 
         log(f"\n[Aggregation] Done. Summary written to:\n  {summary_csv}\n  {summary_md}")
