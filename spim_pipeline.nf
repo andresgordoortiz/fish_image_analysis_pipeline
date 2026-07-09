@@ -3177,6 +3177,28 @@ workflow {
         if (!input_dir.exists()) {
             error "config.input.directory not found: ${config.input?.directory}"
         }
+
+        // Mirror the main pipeline's file-vs-directory detection (see the
+        // top of this file, lines around `_raw_input_dir` / `_raw_input_file`).
+        // A single hyperstack .czi / .tif has no `t*_Channel *.tif` ordering
+        // because it hasn't been split yet — feeding that path straight into
+        // the per-timepoint glob below would silently produce zero matches
+        // and the simulation would fail with an empty input set. So when the
+        // path is a file, run SPLIT_INPUT_FILE first to materialise the
+        // per-timepoint TIFFs the rest of the simulation expects.
+        def sim_input_file = null
+        if (!input_dir.isDirectory()) {
+            def fname = input_dir.getName().toLowerCase()
+            if (!(fname.endsWith('.czi') || fname.endsWith('.tif') || fname.endsWith('.tiff'))) {
+                error "config.input.directory points at a file but it is not .czi/.tif/.tiff: ${config.input?.directory}"
+            }
+            log.info "Simulation: input.directory is a single file — splitting via SPLIT_INPUT_FILE first"
+            sim_input_file = file(input_dir.toString())
+            // We re-use the parent directory as the working "input dir" so
+            // the rest of the simulation block can stay path-agnostic.
+            input_dir = file(input_dir.parent.toString())
+        }
+
         // Match the same glob pattern the main pipeline uses: t*_Channel *.tif
         // (or t*_Channel <N>.tif when channel is explicit).
         def glob_pattern = config.channel > 0
@@ -3184,19 +3206,43 @@ workflow {
             : "t*_Channel *.tif"
         def matcher = FileSystems.getDefault().getPathMatcher("glob:${glob_pattern}")
         def all_tp_tuples = []
-        // input_dir IS already a java.nio.Path (Nextflow's file() returns Path).
-        // NOTE: must wrap with Nextflow's file() helper (not raw p.toFile())
-        // before this ever reaches a process `path` input — Nextflow accepts
-        // its own Path type (or String/java.nio.Path via file()) but rejects
-        // plain java.io.File values with "Not a valid path value type".
-        Files.list(input_dir).each { p ->
-            if (matcher.matches(p.getFileName())) {
-                def m = (p.getFileName().toString() =~ /(?i)t(\d+)/)
-                def tp = m.find() ? m.group(1).toInteger() : 0
-                all_tp_tuples << [tp, file(p.toString())]
+        if (sim_input_file != null) {
+            // Split the hyperstack into per-timepoint TIFFs, then read those
+            // back from the work dir using the same t(\d+) regex the main
+            // pipeline uses (see lines around 3415 for the identical
+            // pattern). Following the same idiom: sort the channel into a
+            // list, then materialise with `.toList()` so we can iterate
+            // locally and append to `all_tp_tuples`.
+            SPLIT_INPUT_FILE(
+                Channel.fromPath(sim_input_file.toString(), checkIfExists: true),
+                config.channel
+            )
+            def split_tp_tuples = SPLIT_INPUT_FILE.out.timepoints
+                .flatten()
+                .map { f ->
+                    def m = (f.getName() =~ /(?i)t(\d+)/)
+                    def tp = m.find() ? m.group(1).toInteger() : 0
+                    tuple(tp, file(f.toString()))
+                }
+                .toSortedList { a, b -> a[0] <=> b[0] }
+                .flatMap { it }
+                .toList()
+            all_tp_tuples = split_tp_tuples
+        } else {
+            // input_dir IS already a java.nio.Path (Nextflow's file() returns Path).
+            // NOTE: must wrap with Nextflow's file() helper (not raw p.toFile())
+            // before this ever reaches a process `path` input — Nextflow accepts
+            // its own Path type (or String/java.nio.Path via file()) but rejects
+            // plain java.io.File values with "Not a valid path value type".
+            Files.list(input_dir).each { p ->
+                if (matcher.matches(p.getFileName())) {
+                    def m = (p.getFileName().toString() =~ /(?i)t(\d+)/)
+                    def tp = m.find() ? m.group(1).toInteger() : 0
+                    all_tp_tuples << [tp, file(p.toString())]
+                }
             }
+            all_tp_tuples = all_tp_tuples.sort { it[0] }
         }
-        all_tp_tuples = all_tp_tuples.sort { it[0] }
         if (all_tp_tuples.isEmpty()) {
             error "no per-timepoint TIFFs found in ${config.input?.directory} (pattern: ${glob_pattern})"
         }

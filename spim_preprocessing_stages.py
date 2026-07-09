@@ -1182,23 +1182,68 @@ def run_simulation(sweep_path: str, log: Callable[[str], None] = print) -> dict:
     # single source of truth for inputs.
     if not inputs:
         input_dir = (base_config.get("input") or {}).get("directory")
-        if input_dir and os.path.isdir(input_dir):
-            import glob as _glob
-            # Match the same glob pattern as the Nextflow workflow.
-            channel = (base_config.get("input") or {}).get("channel", 0)
-            glob_pat = f"t*_Channel {channel}.tif" if channel else "t*_Channel *.tif"
-            timepoints_filter = (base_config.get("input") or {}).get("timepoints")
-            for f in sorted(_glob.glob(os.path.join(input_dir, glob_pat))):
-                m = re.match(r"(?i)t(\d+)", os.path.basename(f))
-                if not m:
-                    continue
-                tp = int(m.group(1))
-                if timepoints_filter and not any(
-                    _matches_timepoint_filter(tp, f, sel) for sel in timepoints_filter
-                ):
-                    continue
-                inputs.append(f)
-            log(f"[Simulation] Discovered {len(inputs)} input(s) from config.input.directory")
+        if input_dir:
+            if os.path.isdir(input_dir):
+                import glob as _glob
+                # Match the same glob pattern as the Nextflow workflow.
+                channel = (base_config.get("input") or {}).get("channel", 0)
+                glob_pat = f"t*_Channel {channel}.tif" if channel else "t*_Channel *.tif"
+                timepoints_filter = (base_config.get("input") or {}).get("timepoints")
+                for f in sorted(_glob.glob(os.path.join(input_dir, glob_pat))):
+                    m = re.match(r"(?i)t(\d+)", os.path.basename(f))
+                    if not m:
+                        continue
+                    tp = int(m.group(1))
+                    if timepoints_filter and not any(
+                        _matches_timepoint_filter(tp, f, sel) for sel in timepoints_filter
+                    ):
+                        continue
+                    inputs.append(f)
+                log(f"[Simulation] Discovered {len(inputs)} input(s) from config.input.directory")
+            elif os.path.isfile(input_dir):
+                # Single-file input (hyperstack TIFF or single-timepoint TIFF).
+                # The main Nextflow pipeline splits hyperstacks via
+                # SPLIT_INPUT_FILE, but the local-CLI simulation treats the
+                # file as a single 3D stack — that's the contract
+                # _load_image() relies on. The timepoint-ordering requirement
+                # only applies to directory-of-per-timepoint-TIFFs inputs;
+                # a single file has no ordering to enforce, so we accept it
+                # unconditionally (the optional timepoints filter still
+                # applies if the user provided one).
+                ext = os.path.splitext(input_dir)[1].lower()
+                if ext not in (".tif", ".tiff"):
+                    raise ValueError(
+                        f"Unsupported single-file input for simulation: {input_dir} "
+                        f"(extension {ext!r}). Use .tif/.tiff."
+                    )
+                timepoints_filter = (base_config.get("input") or {}).get("timepoints")
+                # No tp can be parsed from a hyperstack filename, so any
+                # timepoints filter that targets a numeric index cannot
+                # match — only stem / full-filename entries could. Apply
+                # the same helper used for the directory path so behaviour
+                # is consistent.
+                if timepoints_filter:
+                    m = re.match(r"(?i)t(\d+)", os.path.basename(input_dir))
+                    tp = int(m.group(1)) if m else 0
+                    if not any(
+                        _matches_timepoint_filter(tp, input_dir, sel)
+                        for sel in timepoints_filter
+                    ):
+                        log(
+                            f"[Simulation] Single-file input {input_dir} does not "
+                            f"match config.input.timepoints ({timepoints_filter}); skipping"
+                        )
+                    else:
+                        inputs.append(input_dir)
+                        log(f"[Simulation] Using single-file input from config.input.directory: {input_dir}")
+                else:
+                    inputs.append(input_dir)
+                    log(f"[Simulation] Using single-file input from config.input.directory: {input_dir}")
+            else:
+                log(
+                    f"[Simulation] config.input.directory={input_dir!r} is neither "
+                    f"a directory nor a readable file; no inputs discovered"
+                )
     output_dir = sweep["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
 
