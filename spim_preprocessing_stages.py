@@ -880,18 +880,33 @@ def run_one_experiment_tp(
     # Cellpose label mask (cast to uint16 — the per-image nucleus count
     # is well below 65 535 in practice).
     #
-    # Write strategy: try `imagej=True` first (best Fiji/ImageJ
-    # experience — proper per-channel brightness/contrast), and fall
-    # back to a plain axes-tagged write if tifffile's IJMetadata
-    # serializer chokes. Older tifffile releases (and some newer ones
-    # on certain array shapes) silently leave an 8-byte header-only
-    # stub on disk when this happens — that's the empty-hyperstack
-    # failure mode the user hit. We detect the stub via a post-write
-    # size check, delete it, and retry in the next mode. The plain
-    # fallback is robust across tifffile versions and is read correctly
-    # by napari (which honours the axes tag in the ImageDescription).
-    # Fiji/ImageJ will see a 2*Z-page stack and the user can configure
-    # the channel axis via Image > Hyperstacks > Stacks to Hyperstack.
+    # Coordinate system: the pipeline runs ``isotropic_reslice`` BEFORE
+    # Cellpose, so the returned mask is already aligned to the
+    # preprocessed volume's coordinate system. The two arrays stack
+    # cleanly along the channel axis (axis 0).
+    #
+    # Write strategy: three-tier fallback chain. We try each in turn
+    # and fall back on either an exception from ``tifffile.imwrite`` or
+    # an 8-byte header-only stub left on disk (older tifffile releases
+    # have known bugs in the IJMetadata serializer that produce this
+    # symptom). Between attempts we clean up any partial file so the
+    # publish dir never keeps an 8-byte debris file.
+    #
+    #   1. ``imagej=True``           — best Fiji/ImageJ experience
+    #                                  (proper IJMetadata, per-channel
+    #                                  brightness/contrast). Brittle.
+    #   2. ``ome=True`` (OME-TIFF)   — standard format, read as a true
+    #                                  multi-channel hyperstack by both
+    #                                  napari AND Fiji/ImageJ (via the
+    #                                  Bio-Formats plugin). Universal.
+    #   3. plain axes-tagged         — multi-page TIFF with axes tag in
+    #                                  the ImageDescription. napari
+    #                                  reads both channels
+    #                                  automatically; Fiji sees a 2·Z
+    #                                  page flat stack and the user
+    #                                  must configure the channel axis
+    #                                  manually (Image > Hyperstacks >
+    #                                  Stacks to Hyperstack).
     hyper_name = f"{base_name}_{scaling_pct}_hyperstack.tif"
     try:
         if processed.ndim == 2:
@@ -900,6 +915,9 @@ def run_one_experiment_tp(
         else:
             proc_3d = processed.astype(np.uint16)
             msk_3d  = mask.astype(np.uint16) if mask.max() < 65535 else mask
+        # Both arrays are in the same physical space (the pipeline runs
+        # isotropic_reslice before Cellpose, so the mask is already
+        # aligned to the preprocessed volume's coordinate system).
         hyper_stack = np.stack([proc_3d, msk_3d], axis=0)          # (2, Z, Y, X)
         if hyper_stack.size == 0:
             raise ValueError(f"empty stack (shape={hyper_stack.shape})")
@@ -909,20 +927,42 @@ def run_one_experiment_tp(
         if os.path.exists(hyper_path) and os.path.getsize(hyper_path) < 1024:
             os.remove(hyper_path)
 
+        # Three-tier fallback chain. Each entry is (mode_name, axis_order,
+        # array_to_write, extra_imwrite_kwargs). axis_order is the axes
+        # tag tifffile should emit so the file is read as a real
+        # multi-channel hyperstack by both napari and Fiji/ImageJ.
         write_modes = [
-            # (imagej flag, human-readable name for logs)
-            (True,  "imagej+IJMetadata"),
-            (False, "plain-axes-tagged"),
+            # 1) Best Fiji/ImageJ experience: proper IJMetadata block,
+            #    per-channel brightness/contrast. Brittle on some
+            #    tifffile versions (the 8-byte stub bug).
+            ("imagej+IJMetadata",  "CZYX",  hyper_stack,
+             {"imagej": True,  "metadata": {"axes": "CZYX"}}),
+            # 2) OME-TIFF: standard format, read as a true multi-channel
+            #    hyperstack by napari AND Fiji/ImageJ (via Bio-Formats).
+            #    Shape must be 5D (TCZYX) so add a singleton T axis.
+            #    We deliberately do NOT include PhysicalSize* metadata
+            #    here — different tifffile versions are picky about the
+            #    unit string ("µm" vs "micron" vs UTF-8) and a rejected
+            #    unit aborts the whole write. Isotropy is already
+            #    guaranteed by the pipeline (isotropic_reslice runs
+            #    before Cellpose), so the OME file just needs to declare
+            #    the channel axis correctly. The user can set voxel
+            #    size manually in napari/Fiji if they need it.
+            ("OME-TIFF",          "TCZYX", hyper_stack[None],
+             {"ome": True, "metadata": {"axes": "TCZYX"}}),
+            # 3) Plain multi-page TIFF with the axes tag in
+            #    ImageDescription. napari reads both channels
+            #    automatically; Fiji sees a 2·Z-page flat stack and the
+            #    user must configure the channel axis manually (Image >
+            #    Hyperstacks > Stacks to Hyperstack).
+            ("plain-axes-tagged", "CZYX",  hyper_stack,
+             {"imagej": False, "metadata": {"axes": "CZYX"}}),
         ]
         wrote_ok = False
-        for imagej_flag, mode_name in write_modes:
+        used_mode = None
+        for mode_name, _axes, data_to_write, imw_kwargs in write_modes:
             try:
-                tifffile.imwrite(
-                    hyper_path,
-                    hyper_stack,
-                    imagej=imagej_flag,
-                    metadata={'axes': 'CZYX'},
-                )
+                tifffile.imwrite(hyper_path, data_to_write, **imw_kwargs)
                 size_bytes = os.path.getsize(hyper_path)
                 if size_bytes < 1024:
                     # tifffile returned "successfully" but left a stub —
@@ -932,28 +972,26 @@ def run_one_experiment_tp(
                         f"header-only stub ({size_bytes} B) after "
                         f"mode={mode_name}"
                     )
-                if mode_name != write_modes[0][1]:
-                    log(
-                        f"  [info] [{exp_name}] hyperstack written in "
-                        f"'{mode_name}' mode (Fiji/ImageJ may need the "
-                        f"channel axis configured manually); napari reads "
-                        f"both channels automatically."
-                    )
+                used_mode = mode_name
                 wrote_ok = True
                 break
             except Exception as mode_err:
                 # Clean up any stub the failed write left behind.
                 if os.path.exists(hyper_path) and os.path.getsize(hyper_path) < 1024:
                     os.remove(hyper_path)
-                is_last = mode_name == write_modes[-1][1]
-                if is_last:
-                    raise
                 log(
                     f"  [warn] [{exp_name}] hyperstack write in "
                     f"'{mode_name}' mode failed "
-                    f"({type(mode_err).__name__}: {mode_err}); "
-                    f"trying '{write_modes[1][1]}' next"
+                    f"({type(mode_err).__name__}: {mode_err})"
                 )
+        if used_mode is not None and used_mode != write_modes[0][0]:
+            # First mode failed and we fell back — log which mode
+            # actually succeeded so the user knows what viewer
+            # behaviour to expect.
+            log(
+                f"  [info] [{exp_name}] hyperstack written in "
+                f"'{used_mode}' mode."
+            )
         if not wrote_ok:
             raise RuntimeError("all hyperstack write modes failed")
     except Exception as e:
