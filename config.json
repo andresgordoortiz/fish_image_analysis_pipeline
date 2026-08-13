@@ -49,6 +49,12 @@
     "z_um": 2.0
   },
 
+  "downscaling": {
+    "_comment": "Optional pre-pipeline XY downscaling. Applied BEFORE segmentation regardless of whether preprocessing runs. 1.0 = no downscale. <1.0 trades resolution for speed/RAM.",
+    "enabled": true,
+    "factor": 0.33
+  },
+
   "preprocessing": {
     "_comment": "Shading + Z-intensity correction + deblurring. Produces an isotropic, intensity-normalised stack ready for segmentation.",
     "enabled": true,
@@ -78,12 +84,11 @@
 
     "_comment_psf": "Point spread function .tif used by Richardson-Lucy. Only used when method = 'deconvolution'.",
     "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
-    "_comment_image_scaling": "Downscale input by this factor before deconvolution. 1.0 = no downscale. 0.33 trades resolution for speed/RAM.",
-    "image_scaling": 0.33,
     "save_intermediates": true,
     "deconvolution": {
-      "niter": 3,
-      "niterz": 3,
+      "_comment": "Tuned to sweep experiment 23_wbns_xy_only_gentle on 2026-07-09. niter=0 skips XY Richardson-Lucy; niterz=0 skips XZ Richardson-Lucy. The pipeline guards both with `if niter > 0` / `if niterz > 0`, so 0 is the canonical 'disabled' value here.",
+      "niter": 0,
+      "niterz": 0,
       "padding": 64
     },
 
@@ -95,17 +100,17 @@
       "percentile_high": 99.9
     },
     "background_subtraction": {
-      "_comment": "Rolling-ball background subtraction after deconvolution.",
-      "resolution_px0": 10,
-      "resolution_pz0": 10,
-      "noise_lvl": 2
+      "_comment": "WBNS (wavelet-based background subtraction) on XY then on transposed XZ. Same algorithm and parameters as the debug branch's stage_wbns. Tuned to sweep experiment 23_wbns_xy_only_gentle on 2026-07-09: gentle XY subtraction (resolution_px0=6, noise_lvl=1) with XZ subtraction disabled (resolution_pz0=0).",
+      "resolution_px0": 6,
+      "resolution_pz0": 0,
+      "noise_lvl": 1
     },
     "postprocessing": {
-      "_comment": "Final Gaussian smoothing on the preprocessed volume.",
+      "_comment": "Final Gaussian smoothing sigma. NOTE: spim_pipeline.py reads --sigma (default 1.0) and ignores this key, so to actually use 1.2 to match debug, pass --sigma 1.2 on the CLI.",
       "sigma": 1.2
     },
     "correction_flags": {
-      "_comment": "Force-disable individual correction steps (debugging only).",
+      "_comment": "Force-disable individual correction steps (debugging only). All false = all corrections enabled (matches debug branch's default).",
       "no_clahe": false,
       "no_z_correction": false,
       "no_shading": false
@@ -120,9 +125,10 @@
 
   "segmentation": {
     "_comment": "3D Cellpose segmentation. Runs on a GPU node. Set enabled=false to skip.",
-    "enabled": false,
+    "enabled": true,
     "_comment_model": "Path to a Cellpose model folder or a built-in name ('cyto3', 'nuclei', ...).",
     "model": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Thomas/cellpose/models/cpsam_Gui_tracking_20250801",
+    "_comment_diameter": "Single source of truth for the expected nucleus diameter (px). BOTH the main segmentation and the per-stage simulation read this value (spim_pipeline.nf line ~257 falls back to it).",
     "diameter": 30,
     "flow_threshold": 0.8,
     "cellprob_threshold": 0.0,
@@ -147,7 +153,7 @@
 
   "tracking": {
     "_comment": "Cell tracking with ultrack. Set enabled=true to run the full chain (prep -> segment -> link -> solve -> export). Needs segmentation enabled too.",
-    "enabled": false,
+    "enabled": true,
     "prep": {
       "_comment": "Foreground / contour extraction parameters used before linking.",
       "fg_sigma": 5.0,

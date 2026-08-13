@@ -170,6 +170,27 @@ def skip_preprocessing = (config.preprocessing?.enabled == false) || (config.pre
 def preprocessed_dir = config.preprocessing?.preprocessed_dir ?: null
 def downscale_labels = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
 
+// Downscaling toggle — independent of preprocessing.enabled. When enabled
+// and preprocessing is skipped, runs DOWNSCALE_XY (XY-only cubic rescale,
+// optionally plus isotropic Z reslice in the same pass).
+def downscaling_enabled = config.downscaling?.enabled == true
+def downscaling_factor = config.downscaling?.factor != null ? (config.downscaling.factor as Double) : 1.0d
+if (downscaling_enabled && config.downscaling?.factor == null) {
+    log.error "downscaling.enabled=true requires downscaling.factor"
+    exit 1
+}
+if (downscaling_factor <= 0.0d || downscaling_factor > 1.0d) {
+    log.error "downscaling.factor must be greater than 0 and at most 1.0, got: ${downscaling_factor}"
+    exit 1
+}
+def effective_scaling = downscaling_enabled ? downscaling_factor : 1.0d
+def run_standalone_downscaling = skip_preprocessing && effective_scaling < 1.0d
+
+// Adapter map so the existing --image_scaling CLI plumbing keeps working
+// inside PREPROCESS_DECONVOLVE / PREPROCESS_SELFNET after the rename of
+// preprocessing.image_scaling -> downscaling.factor.
+def preprocess_config = (config.preprocessing ?: [:]) + [image_scaling: effective_scaling] // NOSONAR
+
 // Preprocessing method: 'deconvolution' (GPU Richardson-Lucy, default) or
 // 'selfnet' (Self-Net deep-learning deblurring / isotropic reconstruction).
 def preprocess_method = (config.preprocessing?.method ?: 'deconvolution').toString().toLowerCase()
@@ -326,7 +347,8 @@ if (downscale_labels < 0.1 || downscale_labels > 1.0) {
 def voxel_info = config.voxel_size.auto_detect ? "Auto-detect" : "Manual: ${config.voxel_size.x_um} x ${config.voxel_size.y_um} x ${config.voxel_size.z_um} µm"
 def roi_info = config.roi_cropping.enabled ? "Enabled" : "Disabled"
 def merge_info = skip_merge ? "SKIPPED" : "Enabled"
-def downscale_info = downscale_labels < 1.0 ? "${downscale_labels} (Fiji nearest-neighbor)" : "Disabled"
+def xy_downscale_info = downscaling_enabled ? "Enabled (factor=${effective_scaling})" : "Disabled"
+def label_downscale_info = downscale_labels < 1.0 ? "${downscale_labels} (Fiji nearest-neighbor)" : "Disabled"
 def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stitch_threshold != null ? "2D+Stitch(${config.segmentation.stitch_threshold})" : "2D")
 def tracking_info = skip_tracking ? "SKIPPED" : "Enabled (ultrack)"
 def debug_info = run_debug_preprocessing ? "ENABLED (nuclei tracking per stage)" : "Disabled"
@@ -342,7 +364,8 @@ Channel      : ${params.channel}
 ROI Cropping : ${roi_info}
 Voxel Size   : ${voxel_info}
 Merge        : ${merge_info}
-Downscale    : ${downscale_info}
+XY downscale : ${xy_downscale_info}
+Label downscale : ${label_downscale_info}
 Seg mode     : ${seg_mode_info}
 Preprocess   : ${preproc_info}
 Tracking     : ${tracking_info}
@@ -1095,6 +1118,120 @@ tifffile.imwrite(
         'TimePoint': ${timepoint},
         'WasROICropped': metadata.get('was_roi_cropped', False),
         'IsotropicResliced': True,
+    },
+)
+print(f"Wrote {out_name}")
+PYTHON_EOF
+    """
+}
+
+// ============================================================================
+// PROCESS: XY Downscaling (standalone; runs when preprocessing.enabled=false
+// but downscaling.enabled=true). Mirrors RESLICE_ISOTROPIC structurally.
+// Optionally performs isotropic Z resampling in the same pass.
+// ============================================================================
+
+process DOWNSCALE_XY {
+    tag "t${String.format('%04d', timepoint)}"
+
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    publishDir "${params.output_dir}/00c_downscaled",
+        mode: 'copy',
+        pattern: "t*_dscale_Channel*.tif"
+    publishDir "${params.output_dir}/logs/xy_downscaling",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    tuple val(timepoint), path(image_file)
+    path metadata_json
+    val scale_factor
+    val reslice_isotropic
+
+    output:
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_dscale_Channel*.tif"), emit: downscaled
+    path "t${String.format('%04d', timepoint)}_downscale_xy.log", emit: log
+
+    script:
+    def t_formatted = String.format('%04d', timepoint)
+    def filename = image_file.name
+    def scale_factor_py = (scale_factor as Double).toString()
+    def reslice_py = reslice_isotropic ? 'True' : 'False'
+    """
+    #!/bin/bash
+    set -euo pipefail
+    exec > >(tee t${t_formatted}_downscale_xy.log) 2>&1
+
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    python3 << 'PYTHON_EOF'
+import json
+import re as _re
+import numpy as np
+import tifffile
+from skimage.transform import rescale
+
+with open('${metadata_json}', 'r') as f:
+    metadata = json.load(f)
+
+xy_pixel_in = float(metadata['x_resolution_um'])
+z_pixel_in  = float(metadata['imagej']['spacing']) if 'imagej' in metadata else 1.0
+scale = float(${scale_factor_py})
+do_iso = (${reslice_py} == 'True')
+
+if not (0.0 < scale <= 1.0):
+    raise SystemExit(f"scale_factor must satisfy 0 < scale <= 1, got {scale}")
+
+img = tifffile.imread('${filename}')
+if img.ndim != 3:
+    raise SystemExit(f"Expected 3D ZYX input, got shape {img.shape}")
+print(f"Input  shape: {img.shape}, dtype: {img.dtype}, scale={scale}")
+
+# XY downscale using the same cubic anti-aliased algorithm the per-timepoint
+# preprocessing scripts use (spim_pipeline_fixed.py / spim_selfnet_preprocess.py).
+out = rescale(img, (1.0, scale, scale), order=3,
+              preserve_range=True, anti_aliasing=True)
+x_res = xy_pixel_in / scale
+y_res = float(metadata['y_resolution_um']) / scale
+print(f"After XY rescale: {out.shape}  X/Y pixel size -> {x_res:.4f} x {y_res:.4f} µm")
+
+# Optional isotropic Z reslice in the same task, matching RESLICE_ISOTROPIC.
+if do_iso:
+    zoom_z = z_pixel_in / x_res
+    if abs(zoom_z - 1.0) < 1e-3:
+        print("Z already isotropic, skipping.")
+    else:
+        from scipy.ndimage import zoom as ndi_zoom
+        new_z = int(round(out.shape[0] * zoom_z))
+        print(f"Isotropic Z reslice: {out.shape[0]} -> {new_z} (zoom_z={zoom_z:.4f})")
+        out = ndi_zoom(out, (zoom_z, 1.0, 1.0), order=1, prefilter=False)
+
+if out.dtype != np.uint16:
+    out = np.clip(out.astype(np.int32), 0, 65535).astype(np.uint16)
+
+m = _re.search(r'_Channel\\s*(\\d+)', '${filename}')
+channel = m.group(1) if m else '1'
+out_name = f"t${t_formatted}_dscale_Channel {channel}.tif"
+
+tifffile.imwrite(
+    out_name,
+    out,
+    imagej=True,
+    resolution=(1.0/x_res, 1.0/y_res),
+    metadata={
+        'spacing': z_pixel_in if not do_iso else x_res,
+        'unit': 'um',
+        'axes': 'ZYX',
+        'TimePoint': ${timepoint},
+        'WasROICropped': metadata.get('was_roi_cropped', False),
+        'XYDownscaled': True,
+        'ScalingFactor': scale,
+        'IsotropicResliced': bool(do_iso),
     },
 )
 print(f"Wrote {out_name}")
@@ -3090,16 +3227,29 @@ workflow {
             segmentation_input = Channel
                 .fromList(preproc_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) })
                 .ifEmpty { error "No preprocessed files with recognizable timepoint numbers found in: ${preprocessed_dir}" }
-        } else {
-            // No preprocessed_dir — use raw input images directly
-            if (isotropic_reslice) {
-                log.info "Preprocessing SKIPPED — applying lightweight isotropic Z reslicing only (preprocessing.isotropic_reslice=true)"
-                RESLICE_ISOTROPIC(processing_input, shared_metadata)
-                segmentation_input = RESLICE_ISOTROPIC.out.resliced
-            } else {
-                log.info "Preprocessing SKIPPED — using raw input images for segmentation (no isotropic reslicing)"
-                segmentation_input = processing_input
+
+            // Apply standalone downscaling on top of user-supplied preprocessed
+            // files when downscaling is enabled. Z reslice is skipped here to
+            // preserve whatever Z geometry the external files already carry.
+            if (run_standalone_downscaling) {
+                log.info "Applying DOWNSCALE_XY (factor=${effective_scaling}) on user-supplied preprocessed files; Z reslice skipped"
+                DOWNSCALE_XY(segmentation_input, shared_metadata, effective_scaling, false)
+                segmentation_input = DOWNSCALE_XY.out.downscaled
             }
+        } else if (run_standalone_downscaling) {
+            log.info "Preprocessing SKIPPED — applying standalone XY downscaling before segmentation: factor=${effective_scaling}"
+            if (isotropic_reslice) {
+                log.info "  (also isotropic Z reslice, in the same DOWNSCALE_XY task)"
+            }
+            DOWNSCALE_XY(processing_input, shared_metadata, effective_scaling, isotropic_reslice)
+            segmentation_input = DOWNSCALE_XY.out.downscaled
+        } else if (isotropic_reslice) {
+            log.info "Preprocessing SKIPPED — applying lightweight isotropic Z reslicing only (preprocessing.isotropic_reslice=true)"
+            RESLICE_ISOTROPIC(processing_input, shared_metadata)
+            segmentation_input = RESLICE_ISOTROPIC.out.resliced
+        } else {
+            log.info "Preprocessing SKIPPED — using raw input images for segmentation (no isotropic reslicing)"
+            segmentation_input = processing_input
         }
 
     } else {
@@ -3120,7 +3270,7 @@ workflow {
                 selfnet_script_ch.collect(),
                 shared_lib_ch.collect(),
                 wbns_lib_ch.collect(),
-                config.preprocessing
+                preprocess_config
             )
 
             preprocessed_processed = PREPROCESS_SELFNET.out.processed
@@ -3134,7 +3284,7 @@ workflow {
                 processing_input,
                 shared_metadata,
                 preproc_script_ch.collect(),
-                config.preprocessing
+                preprocess_config
             )
 
             preprocessed_processed = PREPROCESS_DECONVOLVE.out.processed
@@ -3191,8 +3341,9 @@ workflow {
 
     // 3. Segment each timepoint with Cellpose
     if (!skip_segmentation) {
-        // When preprocessing is skipped, no XY scaling was applied — use 1.0
-        def effective_scaling = skip_preprocessing ? 1.0 : config.preprocessing.image_scaling
+        // effective_scaling comes from the top-level downscaling.{enabled,factor}
+        // block (defined near skip_preprocessing). It is reused by CELLPOSE_SEGMENT
+        // below to write correct voxel sizes into the segmentation mask metadata.
 
         CELLPOSE_SEGMENT(
             segmentation_input,
@@ -3383,7 +3534,8 @@ workflow.onComplete {
     def merge_status = (config.output?.skip_merge ?: false) ? "SKIPPED" : "ENABLED"
     def seg_status = (config.segmentation?.enabled == false) ? "SKIPPED" : "ENABLED"
     def ds_factor = config.segmentation?.downscale_labels != null ? config.segmentation.downscale_labels : 1.0
-    def downscale_status = ds_factor < 1.0 ? "ENABLED (${ds_factor})" : "DISABLED"
+    def label_downscale_status = ds_factor < 1.0 ? "ENABLED (${ds_factor})" : "DISABLED"
+    def xy_downscale_status = downscaling_enabled ? "ENABLED (factor=${effective_scaling})" : "DISABLED"
 
     def benchmark_status = (config.benchmark?.enabled ?: false) ? "ENABLED" : "DISABLED"
     def tracking_status = (config.tracking?.enabled ?: false) ? "ENABLED (ultrack)" : "DISABLED"
@@ -3393,21 +3545,23 @@ workflow.onComplete {
     ============================================================================
     Pipeline completed!
     ============================================================================
-    Status       : ${workflow.success ? 'SUCCESS ✓' : 'FAILED ✗'}
-    Duration     : ${workflow.duration}
-    Channel      : ${params.channel}
-    ROI cropping : ${roi_status}
-    Segmentation : ${seg_status}
-    Voxel mode   : ${voxel_mode}
-    Merge        : ${merge_status}
-    Downscale    : ${downscale_status}
-    Tracking     : ${tracking_status}
-    Benchmark    : ${benchmark_status}
-    Debug preproc: ${debug_status}
-    Output dir   : ${params.output_dir}
+    Status          : ${workflow.success ? 'SUCCESS ✓' : 'FAILED ✗'}
+    Duration        : ${workflow.duration}
+    Channel         : ${params.channel}
+    ROI cropping    : ${roi_status}
+    Segmentation    : ${seg_status}
+    Voxel mode      : ${voxel_mode}
+    Merge           : ${merge_status}
+    XY downscale    : ${xy_downscale_status}
+    Label downscale : ${label_downscale_status}
+    Tracking        : ${tracking_status}
+    Benchmark       : ${benchmark_status}
+    Debug preproc   : ${debug_status}
+    Output dir      : ${params.output_dir}
 
     Results:
       ${config.roi_cropping?.enabled ? "- Cropped images     : ${params.output_dir}/00_cropped/" : ""}
+      ${run_standalone_downscaling ? "- Downscaled input   : ${params.output_dir}/00c_downscaled/" : ""}
       - Preprocessed images : ${params.output_dir}/01_preprocessed/
       - Segmented masks     : ${params.output_dir}/02_segmented/
       ${ds_factor < 1.0 ? "- Downscaled labels  : ${params.output_dir}/02_segmented_downscaled/" : ""}
