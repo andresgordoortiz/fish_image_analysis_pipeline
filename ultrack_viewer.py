@@ -177,6 +177,174 @@ def load_spots(path: str | Path) -> pd.DataFrame:
     return df
 
 
+def assign_tracks_to_spots(
+    spots: pd.DataFrame,
+    tracks_csv: str | Path,
+    spatial_tol: float | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Write ``TRACK_ID`` from a tracks CSV onto matching rows of ``spots``.
+
+    Designed for the common workflow where someone runs an external
+    filter / tracking step on a subset of nuclei (e.g. tracks.csv
+    contains only the surviving / curated tracks) and wants to overlay
+    those trajectories on the full set of detected nuclei.
+
+    Matching strategy, in order:
+      1. **Per-frame nucleus ID** — when the tracks CSV carries an ``id``
+         (ultrack) or ``ID`` (TrackMate) column, join on
+         ``(FRAME, id)`` exactly.  This is the cheapest and most robust
+         path because the nucleus IDs are stable per detection.
+      2. **Per-frame nearest neighbour** — when no shared per-frame id
+         exists, for every (frame, track_id) we look up the track's
+         mean (z, y, x) position and assign it to the closest spot
+         within the same frame, provided the distance is below
+         ``spatial_tol`` (in the same units as POSITION_*).  This lets
+         you pass a tracks CSV that does not preserve the original
+         nucleus id at all (e.g. a manual subset exported from R).
+
+    Spots without a match keep their existing ``TRACK_ID`` (NaN if
+    the spots dataframe did not have one).
+
+    Returns the new spots DataFrame plus a stats dict::
+
+        {
+            "n_spots": int,
+            "n_matched": int,    # rows whose TRACK_ID was newly set
+            "n_tracks": int,     # unique tracks in the input CSV
+            "match_strategy": "id" | "nearest",
+            "unmatched_tracks": int,
+        }
+    """
+    spots = spots.copy()
+    if "TRACK_ID" not in spots.columns:
+        spots["TRACK_ID"] = np.nan
+
+    fmt = _detect_csv_format(tracks_csv)
+    if fmt == "ultrack":
+        tr = load_ultrack_csv(tracks_csv)
+    else:
+        tr = load_trackmate_csv(tracks_csv)
+
+    # TrackMate exports use 'ID', ultrack exports use 'id'
+    id_col_tracks = "id" if fmt == "ultrack" else "ID"
+    if id_col_tracks not in tr.columns:
+        id_col_tracks = None
+
+    # --- Strategy 1: per-frame ID join ------------------------------
+    if id_col_tracks is not None and "ID" in spots.columns:
+        # Normalise both sides to nullable Int64 for the merge key
+        tr = tr.copy()
+        tr[id_col_tracks] = pd.to_numeric(
+            tr[id_col_tracks], errors="coerce"
+        ).astype("Int64")
+        tr["FRAME"] = tr["FRAME"].astype("Int64")
+
+        sp = spots.copy()
+        # Preserve the spots-side ID column; we only use it for the join.
+        sp_id = pd.to_numeric(sp["ID"], errors="coerce").astype("Int64")
+
+        # pandas DataFrame merge with nullable ints tolerates NaN
+        left = sp.drop(columns=["TRACK_ID"]).assign(_ID=sp_id)
+        right = tr[["FRAME", id_col_tracks, "TRACK_ID"]].rename(
+            columns={id_col_tracks: "_ID"}
+        )
+        merged = left.merge(right, on=["FRAME", "_ID"], how="left")
+        merged["TRACK_ID"] = merged["TRACK_ID"].astype("float64")
+        merged = merged.drop(columns=["_ID"])
+
+        n_matched = int(merged["TRACK_ID"].notna().sum())
+        spots = merged
+
+        return spots, {
+            "n_spots": int(len(spots)),
+            "n_matched": n_matched,
+            "n_tracks": int(tr["TRACK_ID"].nunique()),
+            "match_strategy": "id",
+            "unmatched_tracks": 0,
+        }
+
+    # --- Strategy 2: per-frame nearest-neighbour on (z, y, x) -------
+    from scipy.spatial import cKDTree
+
+    # Default tolerance: 1/10th of the median nearest-neighbour distance
+    # in the spots dataframe; generous enough to absorb segmentation
+    # jitter without spuriously matching across cells.
+    if spatial_tol is None:
+        # Sample to keep the bootstrap fast on millions of spots
+        sample = spots[["POSITION_X", "POSITION_Y", "POSITION_Z"]].values
+        if len(sample) > 5000:
+            rng = np.random.default_rng(0)
+            sample = sample[rng.choice(len(sample), 5000, replace=False)]
+        tree0 = cKDTree(sample)
+        d, _ = tree0.query(sample, k=2)
+        nn = d[:, 1]  # distance to nearest other spot
+        spatial_tol = float(np.median(nn) * 1.5)
+    spatial_tol = max(float(spatial_tol), 1e-6)
+
+    # Build per-frame KD-Trees of the spots
+    frames = np.sort(spots["FRAME"].unique())
+    frame_to_tree: dict[int, tuple[cKDTree, np.ndarray]] = {}
+    for fr in frames:
+        m = spots["FRAME"].values == fr
+        if not m.any():
+            continue
+        coords = np.column_stack(
+            [
+                spots.loc[m, "POSITION_Z"].values,
+                spots.loc[m, "POSITION_Y"].values,
+                spots.loc[m, "POSITION_X"].values,
+            ]
+        )
+        frame_to_tree[int(fr)] = (cKDTree(coords), np.where(m)[0])
+
+    # Group tracks by frame, assign the nearest spot per track point
+    tr = tr.copy()
+    tr["FRAME"] = tr["FRAME"].astype(int)
+    n_matched_rows = 0
+    unmatched_tracks: set[int] = set(
+        int(t) for t in tr["TRACK_ID"].dropna().unique()
+    )
+
+    # We accept a (track_id, frame) pair only once: a single track
+    # can have many points in the same frame, so take the centroid of
+    # that frame's points and match that.
+    grouped = tr.dropna(subset=["TRACK_ID"]).groupby(["TRACK_ID", "FRAME"])
+    for (tid, fr), grp in grouped:
+        if fr not in frame_to_tree:
+            unmatched_tracks.discard(int(tid))
+            continue
+        tree, spot_idx = frame_to_tree[fr]
+        cx = float(grp["POSITION_Z"].mean())
+        cy = float(grp["POSITION_Y"].mean())
+        cx_w = float(grp["POSITION_X"].mean())
+        dist, j = tree.query([cx, cy, cx_w], k=1)
+        if dist <= spatial_tol:
+            i = int(spot_idx[j])
+            existing = spots.at[i, "TRACK_ID"]
+            try:
+                if pd.isna(existing):
+                    spots.at[i, "TRACK_ID"] = int(tid)
+                    n_matched_rows += 1
+                    unmatched_tracks.discard(int(tid))
+                else:
+                    # Already has a track id — leave it alone to avoid
+                    # clobbering an exact-match join from a previous
+                    # call to this helper.
+                    unmatched_tracks.discard(int(tid))
+            except Exception:
+                pass
+        # else: leave unmatched; will be reported at the end
+
+    return spots, {
+        "n_spots": int(len(spots)),
+        "n_matched": n_matched_rows,
+        "n_tracks": int(tr["TRACK_ID"].nunique()),
+        "match_strategy": "nearest",
+        "unmatched_tracks": len(unmatched_tracks),
+        "spatial_tol": float(spatial_tol),
+    }
+
+
 # ############################################################################
 #                         SPHERE FITTING (cap-aware)
 # ############################################################################
@@ -3988,6 +4156,23 @@ class EmbryoViewer:
             lo = np.array([0.5, 0.5, 0.5, 0.12])
             return np.where(flags[:, None], hi, lo)
 
+        # ── Tracked vs un-tracked nuclei ─────────────────────────────
+        # Tracked (TRACK_ID present) → bright; un-tracked → ghosted grey.
+        # Helps users see at a glance which cells the external filter
+        # kept vs which were left out of the tracks CSV.
+        if mode == "tracked":
+            if "TRACK_ID" in df.columns:
+                flags = df["TRACK_ID"].values[idx]
+                if flags.dtype.kind == "f":
+                    flags = ~np.isnan(flags)
+                else:
+                    flags = pd.notna(flags).values
+            else:
+                flags = np.zeros(len(idx), dtype=bool)
+            hi = np.array([0.20, 0.85, 1.00, 1.00])   # cyan
+            lo = np.array([0.55, 0.55, 0.55, 0.18])   # faded grey
+            return np.where(flags[:, None], hi, lo)
+
         # ── Diverging mode ──
         if mode == "radial_vel" and "RADIAL_VELOCITY_SMOOTH" in df.columns:
             v = df["RADIAL_VELOCITY_SMOOTH"].values[idx].copy()
@@ -4445,6 +4630,92 @@ class EmbryoViewer:
 
         QTimer.singleShot(250, _poll)
 
+    def _assign_tracks_from_ui(self):
+        """Open a file dialog, load a tracks CSV, and assign TRACK_ID onto
+        the currently-loaded spots dataframe.
+
+        Designed for the case where the user has spots from a full
+        segmentation but only a filtered / curated set of tracks from
+        an external tool.  Spots that match a track keep their TRACK_ID;
+        unmatched spots stay NaN and remain visible (rendered grey
+        under the 'Tracked vs Untracked' colour mode).
+        """
+        from qtpy.QtWidgets import QFileDialog
+        from qtpy.QtCore import QTimer
+
+        if self.spots is None:
+            self.viewer.status = "Load spots first!"
+            return
+
+        tracks_path, _ = QFileDialog.getOpenFileName(
+            self.viewer.window._qt_window,
+            "Select Tracks CSV to assign (filtered subset is fine)",
+            "",
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not tracks_path:
+            return
+
+        self.lbl_tracks_status.value = "\u23f3 Assigning tracks..."
+        self.viewer.status = "Assigning tracks in background thread..."
+
+        spots_snapshot = self.spots.copy()
+        self._pending_assign_df = None
+        self._pending_assign_stats = None
+        self._pending_assign_err = None
+
+        def _bg():
+            try:
+                df, stats = assign_tracks_to_spots(spots_snapshot, tracks_path)
+                self._pending_assign_df = df
+                self._pending_assign_stats = stats
+            except Exception as e:
+                self._pending_assign_err = str(e)
+
+        t = threading.Thread(target=_bg, daemon=True)
+        t.start()
+
+        def _poll():
+            if t.is_alive():
+                QTimer.singleShot(250, _poll)
+                return
+            if self._pending_assign_err:
+                self.lbl_tracks_status.value = (
+                    f"Assign failed: {self._pending_assign_err}"
+                )
+                self.viewer.status = (
+                    f"Assign failed: {self._pending_assign_err}"
+                )
+                return
+            self._finish_assign_tracks(
+                self._pending_assign_df, self._pending_assign_stats
+            )
+
+        QTimer.singleShot(250, _poll)
+
+    def _finish_assign_tracks(self, df, stats):
+        """Finalise track assignment on the main thread."""
+        self._finish_spots_load(df)
+        if stats is None:
+            return
+        n_tr = stats.get("n_tracks", 0)
+        n_match = stats.get("n_matched", 0)
+        n_total = stats.get("n_spots", len(df))
+        strategy = stats.get("match_strategy", "id")
+        if strategy == "id":
+            extra = ""
+        else:
+            extra = (
+                f", {stats.get('unmatched_tracks', 0)} tracks outside "
+                f"±{stats.get('spatial_tol', 0):.2f} units"
+            )
+        msg = (
+            f"Assigned {n_match:,}/{n_total:,} spots from {n_tr:,} tracks "
+            f"via {strategy} match{extra}"
+        )
+        self.lbl_tracks_status.value = msg
+        self.viewer.status = msg
+
     def _finish_spots_load(self, df):
         """Finalise spots load on the main thread."""
         self.spots = df
@@ -4540,6 +4811,11 @@ class EmbryoViewer:
             if self.tracks_raw is not None
             else "No tracks loaded"
         )
+
+        btn_assign_tracks = PushButton(
+            text="Assign Tracks to Spots… (filtered subset OK)"
+        )
+        btn_assign_tracks.changed.connect(self._assign_tracks_from_ui)
 
         btn_load_segments = PushButton(text="Load Segments (.zarr)")
         btn_load_segments.changed.connect(self._load_segments_from_ui)
@@ -4740,6 +5016,8 @@ class EmbryoViewer:
         btn_color_ingress.changed.connect(lambda: self._recolor("ingressing"))
         btn_color_roi = PushButton(text="Colour ROI")
         btn_color_roi.changed.connect(lambda: self._recolor("roi"))
+        btn_color_tracked = PushButton(text="Colour: Tracked vs Untracked")
+        btn_color_tracked.changed.connect(lambda: self._recolor("tracked"))
 
         # ── Export & Video ──
         btn_export = PushButton(text="Export Enriched CSV")
@@ -4767,6 +5045,7 @@ class EmbryoViewer:
                 self.lbl_spots_status,
                 btn_load_tracks,
                 self.lbl_tracks_status,
+                btn_assign_tracks,
                 btn_load_segments,
                 self.lbl_segments_status,
                 self.segments_visible_cb,
@@ -4833,6 +5112,7 @@ class EmbryoViewer:
                 btn_color_radvel,
                 btn_color_ingress,
                 btn_color_roi,
+                btn_color_tracked,
                 Label(value="── Export & Video ──"),
                 btn_export,
                 self.render_scale_slider,
@@ -6132,6 +6412,7 @@ class EmbryoViewer:
             "radial_vel": "RADIAL_VELOCITY_SMOOTH",
             "ingressing": "INGRESSING",
             "roi": "IN_ROI",
+            "tracked": "TRACK_ID",
         }
         if mode in needed and needed[mode] not in df.columns:
             self.viewer.status = (
@@ -7231,6 +7512,17 @@ def main():
         "--tracks", "-t", default=None, help="Path to tracks CSV (optional)"
     )
     parser.add_argument(
+        "--assign-tracks", "-T", default=None, dest="assign_tracks",
+        help="Path to a tracks CSV whose TRACK_ID values should be "
+             "written onto the matching rows of the spots CSV. Use this "
+             "when the tracks CSV contains only a filtered subset of "
+             "nuclei (e.g. curated / surviving tracks) and you still "
+             "want to see every detected nucleus in the viewer. "
+             "Matching is done on (FRAME, nucleus-id) when possible, "
+             "falling back to nearest-neighbour on (z, y, x) within "
+             "each frame otherwise."
+    )
+    parser.add_argument(
         "--segments", "-s", default=None,
         help="Path to segments.zarr (ultrack label volume, 4D)",
     )
@@ -7303,6 +7595,26 @@ def main():
         if args.max_spots and len(spots_df) > args.max_spots:
             print(f"  Subsampling to {args.max_spots:,} spots...")
             spots_df = spots_df.sample(args.max_spots, random_state=42)
+
+    if args.assign_tracks and spots_df is not None:
+        print(f"Assigning TRACK_ID from {args.assign_tracks} → spots ...")
+        try:
+            spots_df, stats = assign_tracks_to_spots(
+                spots_df, args.assign_tracks
+            )
+            print(
+                f"  matched {stats['n_matched']:,} spots via "
+                f"{stats['match_strategy']} strategy "
+                f"({stats['n_tracks']:,} tracks in input)"
+            )
+            if stats["match_strategy"] == "nearest":
+                print(
+                    f"  unmatched tracks: {stats['unmatched_tracks']:,} "
+                    f"(outside ±{stats.get('spatial_tol', 0):.2f} "
+                    f"position units)"
+                )
+        except Exception as e:
+            print(f"  WARN: failed to assign tracks: {e}")
 
     if args.tracks:
         print(f"Loading tracks from {args.tracks}...")
