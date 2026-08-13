@@ -945,6 +945,7 @@ class CrossSectionViewer:
             ComboBox,
             PushButton,
             CheckBox,
+            SpinBox,
         )
 
         self.parent = parent
@@ -1065,6 +1066,26 @@ class CrossSectionViewer:
         )
         self.track_width_slider.changed.connect(self._on_track_width_changed)
 
+        # ── Mirror main-viewer selection (random sample / click) ────
+        self.mirror_main_selection_cb = CheckBox(
+            value=True, text="Show only main-viewer selected tracks"
+        )
+        self.mirror_main_selection_cb.changed.connect(self._on_mirror_changed)
+        self.lbl_parent_selection = Label(value="Parent selection: none")
+
+        # ── Random subsample (no-repeat; shared with main viewer) ─────
+        self.random_sample_n = SpinBox(
+            value=50, min=1, max=10000, step=1, label="Random N"
+        )
+        self.btn_random_sample = PushButton(
+            text="🎲 Sample N random (no repeat)"
+        )
+        self.btn_random_sample.changed.connect(self._random_sample_tracks)
+        self.btn_random_sample_reset = PushButton(text="↻ Reset random pool")
+        self.btn_random_sample_reset.changed.connect(
+            self._reset_random_sample_pool
+        )
+
         self.point_size_slider = FloatSlider(
             value=3.0, min=1.0, max=20.0, step=0.5, label="Point size"
         )
@@ -1165,6 +1186,11 @@ class CrossSectionViewer:
                 self.show_tracks_check,
                 self.max_tracks_slider,
                 self.track_width_slider,
+                self.mirror_main_selection_cb,
+                self.lbl_parent_selection,
+                self.random_sample_n,
+                self.btn_random_sample,
+                self.btn_random_sample_reset,
                 Label(value="── Annotations ──"),
                 self.show_landmarks_check,
                 self.show_sphere_check,
@@ -1261,6 +1287,14 @@ class CrossSectionViewer:
         from qtpy.QtCore import QTimer
         QTimer.singleShot(0, self._rebuild)
 
+        # Register with the parent so this cross-section viewer is notified
+        # of selection changes (random sample / click / clear) and seeds
+        # its own state from the parent's current selection.
+        self._register_with_parent()
+        self._parent_selected_tids: set[int] = set()
+        self._parent_selection_active: bool = False
+        self._refresh_parent_selection_label()
+
     # ── Quick-jump helpers ───────────────────────────────────────────
 
     def _jump_to_center(self):
@@ -1342,6 +1376,78 @@ class CrossSectionViewer:
     def _on_track_width_changed(self):
         self._track_width = float(self.track_width_slider.value)
         self._schedule_rebuild()
+
+    def _on_mirror_changed(self, value: bool):
+        """User toggled 'Show only main-viewer selected tracks'."""
+        self._schedule_rebuild()
+
+    def _random_sample_tracks(self):
+        """Delegate random sampling to the parent so both windows share
+        the same 'already drawn' pool and selection set.
+        """
+        try:
+            self.parent._random_sample_tracks()
+        except Exception:
+            traceback.print_exc()
+            self.viewer.status = (
+                "Random sample failed — ensure tracks are loaded"
+            )
+            return
+        self._refresh_parent_selection_label()
+
+    def _reset_random_sample_pool(self):
+        """Reset the shared no-repeat pool via the parent."""
+        try:
+            self.parent._reset_random_sample_pool()
+        except Exception:
+            traceback.print_exc()
+            return
+        self._refresh_parent_selection_label()
+
+    def _refresh_parent_selection_label(self):
+        """Update the small label summarising the parent's selection."""
+        lbl = getattr(self, "lbl_parent_selection", None)
+        if lbl is None:
+            return
+        parent = self.parent
+        n_sel = len(getattr(parent, "_selected_track_ids", set()))
+        n_pool = len(getattr(parent, "_random_sampled_ids", set()))
+        if n_sel == 0:
+            lbl.value = "Parent selection: none"
+        else:
+            lbl.value = (
+                f"Parent selection: {n_sel} track(s)"
+                f" — {n_pool} ever sampled"
+            )
+
+    def on_parent_selection_changed(self):
+        """Mirror parent's selection state and rebuild slab tracks.
+
+        Called by ``EmbryoViewer`` whenever selection state changes
+        (manual click, random sample, clear).
+        """
+        parent = self.parent
+        active = bool(getattr(parent, "_selection_active", False))
+        sel_set = (
+            set(int(t) for t in parent._selected_track_ids)
+            if active
+            else set()
+        )
+        self._parent_selection_active = active and bool(sel_set)
+        self._parent_selected_tids = sel_set
+        self._refresh_parent_selection_label()
+        if getattr(self, "_show_tracks", True):
+            self._schedule_rebuild()
+
+    def _register_with_parent(self):
+        """Register with the parent for selection-change notifications."""
+        parent = self.parent
+        reg = getattr(parent, "_register_cross_section", None)
+        if reg is not None:
+            try:
+                reg(self)
+            except Exception:
+                pass
 
     def _set_color(self, mode: str):
         needed = {
@@ -1768,6 +1874,24 @@ class CrossSectionViewer:
         slab_tids = np.unique(slab_tids_arr)
         if len(slab_tids) == 0:
             return
+
+        # Restrict to tracks currently selected in the main viewer (random
+        # sample or click selection).  Without this filter the cross-
+        # section viewer would always show every track intersecting the
+        # slab — the very reason the user opened this viewer to see
+        # "just the selected tracks".
+        if (
+            getattr(self, "_mirror_main_selection_cb", None) is not None
+            and self._mirror_main_selection_cb.value
+            and self._parent_selection_active
+        ):
+            sel_set = self._parent_selected_tids
+            slab_tids = np.array(
+                [t for t in slab_tids.tolist() if t in sel_set],
+                dtype=slab_tids.dtype,
+            )
+            if slab_tids.size == 0:
+                return
 
         # Subsample if needed
         if len(slab_tids) > self._max_tracks:
@@ -2721,7 +2845,10 @@ class EmbryoViewer:
         self._selection_lut: np.ndarray | None = None  # label→uint8 LUT for selection
         self._selection_spots_overlay = None  # napari Points (selection overlay)
         self._selection_tracks_overlay = None  # napari Tracks (selection overlay)
-        self._track_id_index: dict | None = None
+        # Cross-section viewers that should be notified when the selection
+        # state (random sample, manual click, clear) changes.  Registered
+        # by ``CrossSectionViewer.__init__`` via ``_register_cross_section``.
+        self._cross_section_viewers: list["CrossSectionViewer"] = []
         # Random-subsample state (IDs already drawn, never resampled)
         self._random_sampled_ids: set[int] = set()
         # Metrics params (match gastrulation_dynamics_comparison.R)
@@ -4967,6 +5094,8 @@ class EmbryoViewer:
         self._update_selection_label()
         self._apply_selection_display()
         self.viewer.status = "Selection cleared — showing all nuclei"
+        for xs in self._cross_section_viewers:
+            xs.on_parent_selection_changed()
 
     def _reset_random_sample_pool(self):
         """Clear the 'already sampled' pool so IDs may be drawn again."""
@@ -4994,19 +5123,29 @@ class EmbryoViewer:
             self.viewer.status = (
                 "All tracks have been sampled — press 'Reset random pool' "
                 "to start over")
+            # Always notify cross-section viewers so they re-render their
+            # overlay once the pool is reset from the other window.
+            for xs in self._cross_section_viewers:
+                xs.on_parent_selection_changed()
             return
         n_draw = min(n_req, eligible.size)
         rng = np.random.default_rng()
         picked = rng.choice(eligible, size=n_draw, replace=False)
-        self._random_sampled_ids.update(int(t) for t in picked)
-        self._selected_track_ids.update(int(t) for t in picked)
-        self._selection_active = True
+        if picked.size:
+            self._random_sampled_ids.update(int(t) for t in picked)
+            self._selected_track_ids.update(int(t) for t in picked)
+            self._selection_active = True
+        # Update label + status BEFORE applying the display so the user
+        # sees the sampling message even if the rebuild raises.
         self._update_selection_label()
-        self._apply_selection_display()
         self.viewer.status = (
             f"Sampled {n_draw} random track(s) — "
             f"{len(self._selected_track_ids)} currently selected, "
             f"{eligible.size - n_draw} still in pool")
+        self._apply_selection_display()
+        # Mirror the new selection onto every open cross-section viewer.
+        for xs in self._cross_section_viewers:
+            xs.on_parent_selection_changed()
 
     def _update_selection_label(self):
         """Update the selection info label."""
@@ -5051,6 +5190,8 @@ class EmbryoViewer:
             f"Track {tid} {action} — "
             f"{len(self._selected_track_ids)} track(s) selected"
         )
+        for xs in self._cross_section_viewers:
+            xs.on_parent_selection_changed()
 
     def _apply_selection_display(self):
         """Rebuild all display layers to show only selected tracks (or all)."""
@@ -5403,6 +5544,20 @@ class EmbryoViewer:
         self._follow_selection = value
         if value and self._selection_active:
             self._center_on_selection()
+
+    def _register_cross_section(self, viewer: "CrossSectionViewer") -> None:
+        """Register a ``CrossSectionViewer`` to receive selection updates.
+
+        Called by ``CrossSectionViewer.__init__``.  Seeds the new viewer's
+        state immediately so its first rebuild is consistent with the
+        parent.
+        """
+        if viewer not in self._cross_section_viewers:
+            self._cross_section_viewers.append(viewer)
+        try:
+            viewer.on_parent_selection_changed()
+        except Exception:
+            pass
 
     # ── Selection metrics plot ───────────────────────────────────────
 
