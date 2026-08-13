@@ -3442,8 +3442,118 @@ class EmbryoViewer:
 
     # ── Raw image loading ─────────────────────────────────────────────
 
+    @staticmethod
+    def _collect_timepoint_files(folder: Path) -> list[Path]:
+        """Return a time-sorted list of per-timepoint files in ``folder``.
+
+        Accepts both ``.tif``/``.tiff`` files and per-timepoint zarr
+        directories (sub-folders that look like zarr arrays). Sorting
+        uses the trailing numeric component in the stem, so any of
+        ``tp_0.tif``, ``t0001.tif``, ``frame12.tif`` etc. are ordered
+        correctly. Numeric stems take precedence over pure-lexicographic
+        ordering.
+        """
+        import re
+
+        candidates: list[Path] = []
+        for child in folder.iterdir():
+            if child.is_file() and child.suffix.lower() in ('.tif', '.tiff'):
+                candidates.append(child)
+            elif child.is_dir() and child.name.endswith('.zarr'):
+                candidates.append(child)
+        if not candidates:
+            return []
+
+        num_re = re.compile(r'(\d+)(?!.*\d)')  # last integer in stem
+
+        def sort_key(p: Path):
+            m = num_re.search(p.stem)
+            if m is not None:
+                return (0, int(m.group(1)), p.name)
+            return (1, 0, p.name)
+
+        candidates.sort(key=sort_key)
+        return candidates
+
+    def _stack_timepoint_files(self, files: list[Path]) -> np.ndarray:
+        """Load a list of per-timepoint files and stack them on the time axis.
+
+        Each file is expected to be a 3D volume (Z, Y, X) — either a
+        TIFF page-stack (handled via ImageJ metadata when present) or a
+        zarr array. Returns a 4D numpy array (T, Z, Y, X).
+        """
+        import time as _time
+        import tifffile
+        import multiprocessing as mp
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _load_one(p: Path) -> np.ndarray:
+            if p.is_dir() and p.name.endswith('.zarr'):
+                import zarr
+                arr = zarr.open_array(str(p), mode="r")
+                return np.asarray(arr)
+            # TIFF
+            with tifffile.TiffFile(str(p)) as tf:
+                arr = tf.asarray()
+                ij = tf.imagej_metadata or {}
+            n_frames = int(ij.get('frames', 0) or 0)
+            n_slices = int(ij.get('slices', 0) or 0)
+            if arr.ndim == 3 and n_frames > 1 and n_slices > 1:
+                expected = n_frames * n_slices
+                if arr.shape[0] == expected:
+                    arr = arr.reshape(
+                        n_frames, n_slices, arr.shape[1], arr.shape[2]
+                    )
+                    arr = arr[0]  # each file = single timepoint, take Z
+            return arr
+
+        n_cores = mp.cpu_count() or 1
+        n_tp = len(files)
+        first_shape = None
+        first_dtype = None
+        print(f"  Loading {n_tp} timepoint files ({n_cores} threads) ...",
+              end=" ", flush=True)
+        t0 = _time.time()
+        frames: list[np.ndarray] = []
+        # Parallel I/O + decode (decompression is GIL-released in tifffile)
+        with ThreadPoolExecutor(max_workers=min(n_cores, n_tp)) as ex:
+            for i, arr in enumerate(ex.map(_load_one, files)):
+                # If a TIFF came back as a multi-timepoint stack, split it.
+                if arr.ndim == 4:
+                    frames.extend(arr)
+                else:
+                    frames.append(arr)
+                if first_shape is None:
+                    first_shape = arr.shape[-3:]
+                    first_dtype = arr.dtype
+                if i % max(1, n_tp // 10) == 0:
+                    print(f"{i + 1}...", end=" ", flush=True)
+        print(f"done ({_time.time() - t0:.0f}s)")
+
+        # Validate uniform shape/dtype across timepoints
+        for i, arr in enumerate(frames):
+            if arr.shape != first_shape:
+                raise ValueError(
+                    f"Timepoint {i} ({files[i].name}) has shape "
+                    f"{arr.shape}, expected {first_shape}"
+                )
+
+        data_np = np.stack(frames, axis=0).astype(first_dtype, copy=False)
+        print(f"  Stacked {data_np.shape[0]} tp × {first_shape} "
+              f"({data_np.nbytes / 1e9:.1f} GB, dtype={data_np.dtype})")
+        return data_np
+
     def _load_processed(self, path: str | Path) -> None:
-        """Load a processed image hyperstack (TIFF or zarr, 4D: T×Z×Y×X).
+        """Load a processed image (TIFF, zarr, or folder of timepoints).
+
+        Accepted inputs:
+          • A 4D TIFF hyperstack (T×Z×Y×X, with ImageJ metadata).
+          • A zarr array, zarr group with numeric subarrays, or a `.zarr`
+            directory.
+          • A directory containing one file/sub-zarr per timepoint
+            (e.g. ``tp_000.tif``, ``tp_001.tif``, ...). Files are
+            sorted by the trailing numeric component in the stem and
+            stacked along the time axis.
 
         Preloads into RAM and uses the same vispy direct-texture-swap
         approach as segments for instant smooth scrubbing.
@@ -3453,7 +3563,17 @@ class EmbryoViewer:
         path = Path(path).resolve()
         print(f"Loading processed image: {path}")
 
-        if path.suffix in ('.tif', '.tiff'):
+        # ── Folder of per-timepoint files (TIFF or zarr) ─────────────
+        if path.is_dir() and path.suffix != '.zarr':
+            tp_files = self._collect_timepoint_files(path)
+            if not tp_files:
+                raise ValueError(
+                    f"No timepoint files (.tif/.tiff or zarr sub-dirs) "
+                    f"found in {path}"
+                )
+            print(f"  Folder of timepoints: {len(tp_files)} files detected")
+            data_np = self._stack_timepoint_files(tp_files)
+        elif path.suffix in ('.tif', '.tiff'):
             import tifffile
             t0 = _time.time()
             # Read pages + ImageJ metadata. Hyperstacks written by
@@ -3512,7 +3632,8 @@ class EmbryoViewer:
         else:
             raise ValueError(
                 f"Unsupported processed format: {path.suffix}  "
-                "(expected .tif, .tiff, or .zarr)"
+                "(expected .tif, .tiff, .zarr, or a folder of "
+                "per-timepoint files)"
             )
 
         # Ensure 4D (T, Z, Y, X)
@@ -3591,14 +3712,26 @@ class EmbryoViewer:
               f"{total_gb:.1f} GB display (uint8)")
 
     def _load_processed_from_ui(self):
-        """Open file dialog to load a processed image hyperstack."""
+        """Open dialog to load a processed image (file, .zarr, or folder)."""
         from qtpy.QtWidgets import QFileDialog
+
+        # Give the user a single dialog with both "Open File" and
+        # "Open Folder" options. QFileDialog doesn't expose a built-in
+        # mode switch, so we ask: if they cancel file mode, fall back
+        # to directory mode.
         path, _ = QFileDialog.getOpenFileName(
-            None, "Open Processed Hyperstack",
+            None, "Open Processed Hyperstack (or Cancel and choose a folder)",
             "", "Image files (*.tif *.tiff *.zarr);;All (*)",
         )
         if not path:
-            return
+            folder = QFileDialog.getExistingDirectory(
+                None,
+                "Select folder of per-timepoint files "
+                "(TIFFs or per-timepoint .zarr sub-dirs)",
+            )
+            if not folder:
+                return
+            path = folder
         try:
             if self._processed_layer is not None:
                 try:
@@ -6982,8 +7115,12 @@ def main():
     )
     parser.add_argument(
         "--processed", "-p", default=None,
-        help="Path to processed image hyperstack (TIFF or zarr, 4D: T×Z×Y×X). "
-             "Displayed as a grayscale volume alongside segments and tracks.",
+        help="Path to processed image (TIFF or zarr, 4D: T×Z×Y×X), or a "
+             "folder containing one TIFF/zarr per timepoint (e.g. "
+             "tp_000.tif, tp_001.tif, ...). When a folder is given, files "
+             "are sorted by the trailing numeric component of the stem and "
+             "stacked along the time axis. Displayed as a grayscale volume "
+             "alongside segments and tracks.",
     )
     parser.add_argument(
         "--preload",
