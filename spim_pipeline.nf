@@ -2307,32 +2307,50 @@ PRESERVE_MASK_META
 }
 
 // ============================================================================
-// PROCESS: Merge All Timepoints into 4D Hyperstack
+// PROCESS: Merge All Timepoints into 4D Hyperstack(s)
+//
+// Single process that merges ALL data types in one task. Nextflow DSL2
+// forbids invoking the same process twice in the same workflow context, so
+// instead of having separate process calls for processed / segmented /
+// raw_iso, we collect all three file lists up front and merge them in a
+// single Python task. Each data type is optional — empty lists are skipped.
+//
+// Each output is emitted under its own channel name so the rest of the
+// workflow (tracking, viewer exports) can subscribe to the right one.
 // ============================================================================
 
-process MERGE_TO_HYPERSTACK {
-    tag "Merging ${data_type} -> 4D hyperstack"
+process MERGE_HYPERSTACKS {
+    tag "Merging hyperstacks"
 
     maxRetries 2
     errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
-    publishDir "${params.output_dir}/${
-        data_type == 'processed' ? '01_preprocessed' :
-        data_type == 'raw_iso'   ? '01b_raw_isotropic' :
-                                   '02_segmented'
-    }", mode: 'copy'
+    // Fan-out: publishDir runs once per emitted output path. Same as
+    // before; each (data_type, output) tuple routes to the right dir.
+    publishDir "${params.output_dir}/01_preprocessed",      mode: 'copy', pattern: "4D_hyperstack_processed*"
+    publishDir "${params.output_dir}/01b_raw_isotropic",    mode: 'copy', pattern: "4D_hyperstack_raw_iso*"
+    publishDir "${params.output_dir}/02_segmented",         mode: 'copy', pattern: "4D_hyperstack_segmented*"
 
     input:
-    tuple val(data_type), path(input_files)
     path metadata_json
     path merge_script
+    path processed_files
+    path segmented_files
+    path raw_iso_files
 
     output:
-    val data_type, emit: dtype
-    path "4D_hyperstack_${data_type}.tif", emit: hyperstack, optional: true
-    path "4D_hyperstack_${data_type}_metadata.json", emit: metadata
-    path "4D_hyperstack_${data_type}.h5", emit: h5, optional: true
-    path "4D_hyperstack_${data_type}.xml", emit: xml, optional: true
+    path "4D_hyperstack_processed.tif",     emit: processed_tif, optional: true
+    path "4D_hyperstack_processed_metadata.json", emit: processed_meta, optional: true
+    path "4D_hyperstack_processed.h5",      emit: processed_h5,  optional: true
+    path "4D_hyperstack_processed.xml",     emit: processed_xml, optional: true
+    path "4D_hyperstack_segmented.tif",     emit: segmented_tif, optional: true
+    path "4D_hyperstack_segmented_metadata.json", emit: segmented_meta, optional: true
+    path "4D_hyperstack_segmented.h5",      emit: segmented_h5,  optional: true
+    path "4D_hyperstack_segmented.xml",     emit: segmented_xml, optional: true
+    path "4D_hyperstack_raw_iso.tif",       emit: raw_iso_tif,   optional: true
+    path "4D_hyperstack_raw_iso_metadata.json", emit: raw_iso_meta, optional: true
+    path "4D_hyperstack_raw_iso.h5",        emit: raw_iso_h5,    optional: true
+    path "4D_hyperstack_raw_iso.xml",       emit: raw_iso_xml,   optional: true
 
     container params.container
 
@@ -2348,96 +2366,105 @@ process MERGE_TO_HYPERSTACK {
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
 
-    echo "=== MERGE_TO_HYPERSTACK (${data_type}) ==="
-    echo "Python version:"
+    echo "=== MERGE_HYPERSTACKS ==="
     python3 --version
     echo ""
 
-    # Verify merge script is present
     if [ ! -f "${merge_script_name}" ]; then
         echo "ERROR: Merge script not found: ${merge_script_name}"
-        echo "Contents of work directory:"
         ls -lh
         exit 1
     fi
 
-    echo "Merge script: ${merge_script_name}"
-    echo "Data type: ${data_type}"
-    echo ""
-
     # Ensure required packages
-    echo "Checking required packages..."
     python3 -c "import tifffile, numpy" 2>/dev/null || {
         echo "Installing required packages..."
         micromamba install -y -n microscopy_env tifffile numpy
     }
-    echo "✓ Required packages available"
-    echo ""
 
-    # Create temporary config file using Python to avoid escaping issues
-    echo "Creating temporary config file..."
-    python3 << 'PYTHON_CONFIG'
+    # Stage file lists into separate subdirs so the merge script can
+    # glob them in isolation (otherwise data_type='processed' would also
+    # pick up _raw_iso_ files because of the t*_processed.tif pattern).
+    # When the workflow passes a placeholder file (merge_hyperstack.py)
+    # because the source channel was empty, we skip staging entirely —
+    # the script then skips that data_type with "no staged files".
+    mkdir -p stage_processed stage_segmented stage_raw_iso
+    stage_n() {
+        local src="\$1"
+        local dst="\$2"
+        if [ -d "\$src" ]; then
+            # Count tif files (excluding any .py placeholder)
+            local n=\$(find "\$src" -maxdepth 1 -type f -name '*.tif' | wc -l | tr -d ' ')
+            if [ "\$n" -gt 0 ]; then
+                find "\$src" -maxdepth 1 -type f -name '*.tif' \
+                    -exec cp {} "\$dst/" \\;
+            fi
+        fi
+    }
+    stage_n processed_files stage_processed
+    stage_n segmented_files stage_segmented
+    stage_n raw_iso_files   stage_raw_iso
+
+    # Temp config
+    python3 - << 'PYTHON_CONFIG'
 import json
-
-# Parse the JSON string from Groovy
 config_str = '''${config_json_str}'''
 config_data = json.loads(config_str)
-
-# Write it properly to file
 with open('config_temp.json', 'w') as f:
     json.dump(config_data, f, indent=2)
-
 print("✓ Config file created")
 PYTHON_CONFIG
 
-    # Verify config file was created
-    if [ ! -f "config_temp.json" ]; then
-        echo "ERROR: Failed to create config_temp.json"
-        exit 1
-    fi
+    # Run the merge for each non-empty data_type, in order
+    n_proc=$(ls -1 stage_processed/*.tif 2>/dev/null | wc -l | tr -d ' ')
+    n_seg=$(ls -1 stage_segmented/*.tif 2>/dev/null | wc -l | tr -d ' ')
+    n_raw=$(ls -1 stage_raw_iso/*.tif 2>/dev/null | wc -l | tr -d ' ')
+    echo "Staged: processed=${n_proc}, segmented=${n_seg}, raw_iso=${n_raw}"
 
-    echo "Config file contents (first 10 lines):"
-    head -10 config_temp.json
-    echo ""
-
-    # Run merge script with data_type argument
-    echo "Running merge script for ${data_type} data..."
-    python3 "${merge_script_name}" "${metadata_json}" config_temp.json "${data_type}"
-
-    # Check exit status
-    if [ \$? -ne 0 ]; then
-        echo ""
-        echo "ERROR: Merge script failed for ${data_type}"
-        exit 1
-    fi
-
-    # Verify output files
-    echo ""
-    echo "Verifying output file(s)..."
-
-    if [ ! -f "4D_hyperstack_${data_type}_metadata.json" ]; then
-        echo "ERROR: Metadata file not created"
-        exit 1
-    fi
-    echo "✓ Metadata file created"
-
-    # Check for TIFF or HDF5 output
-    if [ -f "4D_hyperstack_${data_type}.tif" ]; then
-        FILE_SIZE=\$(du -h "4D_hyperstack_${data_type}.tif" | cut -f1)
-        echo "✓ TIFF hyperstack created (size: \$FILE_SIZE)"
-    elif [ -f "4D_hyperstack_${data_type}.h5" ]; then
-        FILE_SIZE=\$(du -h "4D_hyperstack_${data_type}.h5" | cut -f1)
-        echo "✓ HDF5 file created (size: \$FILE_SIZE)"
-        if [ -f "4D_hyperstack_${data_type}.xml" ]; then
-            echo "✓ BDV XML file created"
+    run_merge() {
+        local dt="\$1"
+        local subdir="\$2"
+        if [ "\$dt" = "processed" ]; then local dest="01_preprocessed"
+        elif [ "\$dt" = "raw_iso" ]; then local dest="01b_raw_isotropic"
+        else                              local dest="02_segmented"
         fi
-    else
-        echo "ERROR: No output file created (expected 4D_hyperstack_${data_type}.tif or .h5)"
-        exit 1
-    fi
+        local n
+        n=\$(ls -1 "\$subdir"/*.tif 2>/dev/null | wc -l | tr -d ' ')
+        if [ "\$n" -eq 0 ]; then
+            echo "⏭  Skipping \${dt} — no staged files"
+            return 0
+        fi
+        echo ""
+        echo "--- Merging \${dt} (\${n} files) ---"
+        pushd "\$subdir" > /dev/null
+        (
+            export NXF_TASK_CPUS=\${NXF_TASK_CPUS:-1}
+            python3 "\${OLDPWD}/${merge_script_name}" "\${OLDPWD}/${metadata_json}" "\${OLDPWD}/config_temp.json" "\$dt" \
+                || { echo "ERROR: merge failed for \${dt}"; popd >/dev/null; exit 1; }
+        )
+        popd > /dev/null
+        # Move artefacts into the working dir so the publishDir fan-out picks them up.
+        if [ -f "\$subdir/4D_hyperstack_\${dt}.tif" ]; then
+            cp "\$subdir/4D_hyperstack_\${dt}.tif" .
+        fi
+        if [ -f "\$subdir/4D_hyperstack_\${dt}_metadata.json" ]; then
+            cp "\$subdir/4D_hyperstack_\${dt}_metadata.json" .
+        fi
+        if [ -f "\$subdir/4D_hyperstack_\${dt}.h5" ]; then
+            cp "\$subdir/4D_hyperstack_\${dt}.h5" .
+        fi
+        if [ -f "\$subdir/4D_hyperstack_\${dt}.xml" ]; then
+            cp "\$subdir/4D_hyperstack_\${dt}.xml" .
+        fi
+        echo "✓ \${dt} merged"
+    }
+
+    run_merge processed  stage_processed
+    run_merge segmented  stage_segmented
+    run_merge raw_iso    stage_raw_iso
 
     echo ""
-    echo "✓ MERGE_TO_HYPERSTACK (${data_type}) completed successfully"
+    echo "=== MERGE_HYPERSTACKS completed ==="
     """
 }
 
@@ -3292,11 +3319,6 @@ workflow {
         }
     } // end else (no hyperstack input)
 
-    // Create channel for merge script (only needed if merge is enabled)
-    if (!skip_merge) {
-        merge_script_ch = Channel.fromPath(params.merge_script, checkIfExists: true)
-    }
-
     // OPTIONAL: ROI Cropping Step
     if (config.roi_cropping.enabled) {
         log.info "ROI cropping enabled - using ${config.roi_cropping.roi_path}"
@@ -3520,66 +3542,46 @@ workflow {
         }
 
         // 5. OPTIONAL: Merge timepoints into 4D hyperstacks
+        //
+        // Single MERGE_HYPERSTACKS task that handles all data types in
+        // parallel streams. Each input list is optional — empty lists
+        // are skipped inside the task. This avoids the DSL2
+        // "process already used" error that would occur if we called
+        // the old per-data-type MERGE_TO_HYPERSTACK multiple times.
         if (!skip_merge) {
-            if (skip_preprocessing && skip_tracking) {
-                // When preprocessing is skipped and no tracking, only merge segmented output
-                log.info "Hyperstack merging enabled (segmented only, preprocessing was skipped)"
+            // Build the processed file list (the chain's "processed" output).
+            // Process input is `path` which requires a non-empty value →
+            // wrap each empty channel with `ifEmpty` that stages a
+            // placeholder file the bash script detects and skips.
+            processed_ch = segmentation_input
+                .map { timepoint, f -> f }
+                .collect()
+                .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] }
 
-                segmented_merge_ch = CELLPOSE_SEGMENT.out.segmented
-                    .map { timepoint, segmented_file -> segmented_file }
-                    .collect()
-                    .map { files -> tuple('segmented', files) }
-
-                MERGE_TO_HYPERSTACK(
-                    segmented_merge_ch,
-                    shared_metadata,
-                    merge_script_ch.collect()
-                )
-            } else {
-                if (skip_preprocessing) {
-                    log.info "Hyperstack merging enabled (input as processed + segmented, for tracking)"
-                } else {
-                    log.info "Hyperstack merging enabled (processed + segmented)"
-                }
-
-                // Collect processed and segmented files into labeled merge jobs
-                processed_merge_ch = segmentation_input
+            // Build the segmented file list (only meaningful if segmentation ran)
+            segmented_ch = (skip_segmentation
+                ? Channel.value(file("${workflow.projectDir}/merge_hyperstack.py"))
+                : CELLPOSE_SEGMENT.out.segmented
                     .map { timepoint, f -> f }
                     .collect()
-                    .map { files -> tuple('processed', files) }
+                    .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] })
 
-                segmented_merge_ch = CELLPOSE_SEGMENT.out.segmented
-                    .map { timepoint, segmented_file -> segmented_file }
+            // Build the raw_iso file list (only meaningful if raw_export ran)
+            raw_iso_ch = (raw_export_enabled && raw_iso_input != null
+                ? raw_iso_input.map { timepoint, f -> f }
                     .collect()
-                    .map { files -> tuple('segmented', files) }
+                    .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] }
+                : Channel.value(file("${workflow.projectDir}/merge_hyperstack.py")))
 
-                // .collect() on each channel already waits for all items;
-                // .mix() just combines the two ready merge jobs
-                merge_jobs_ch = processed_merge_ch.mix(segmented_merge_ch)
+            log.info "Hyperstack merging enabled"
 
-                MERGE_TO_HYPERSTACK(
-                    merge_jobs_ch,
-                    shared_metadata,
-                    merge_script_ch.collect()
-                )
-            }
-
-            // 5b. OPTIONAL: Merge the raw isotropic export (if enabled) into a
-            //     single 4D TIFF that the viewer can open via --processed.
-            //     Independent of segmentation / tracking — runs whenever the
-            //     raw_export step was launched and merge is on.
-            if (raw_export_enabled && raw_iso_input != null) {
-                log.info "Merging raw isotropic export into 4D hyperstack"
-                raw_iso_merge_ch = raw_iso_input
-                    .map { timepoint, f -> f }
-                    .collect()
-                    .map { files -> tuple('raw_iso', files) }
-                MERGE_TO_HYPERSTACK(
-                    raw_iso_merge_ch,
-                    shared_metadata,
-                    merge_script_ch.collect()
-                )
-            }
+            MERGE_HYPERSTACKS(
+                shared_metadata,
+                Channel.fromPath(params.merge_script, checkIfExists: true).first(),
+                processed_ch,
+                segmented_ch,
+                raw_iso_ch
+            )
         } else {
             log.info "Hyperstack merging SKIPPED (skip_merge=true)"
         }
@@ -3588,14 +3590,11 @@ workflow {
         if (!skip_tracking) {
             log.info "Ultrack tracking enabled"
 
-            // Filter merge outputs: get processed hyperstack (raw) and segmented hyperstack (labels)
-            // The TIFF hyperstack is required for ultrack prep (uses tifffile)
-            // Filenames contain the data type: 4D_hyperstack_processed.tif, 4D_hyperstack_segmented.tif
-            processed_hs = MERGE_TO_HYPERSTACK.out.hyperstack
-                .filter { it.name.contains('processed') }
-
-            segmented_hs = MERGE_TO_HYPERSTACK.out.hyperstack
-                .filter { it.name.contains('segmented') }
+            // The TIFF hyperstack is required for ultrack prep (uses tifffile).
+            // Filenames contain the data type: 4D_hyperstack_processed.tif,
+            // 4D_hyperstack_segmented.tif.
+            processed_hs = MERGE_HYPERSTACKS.out.processed_tif
+            segmented_hs = MERGE_HYPERSTACKS.out.segmented_tif
 
             prep_ultrack_script_ch = Channel.fromPath(params.prep_ultrack_script, checkIfExists: true)
 
@@ -3685,15 +3684,22 @@ workflow {
         if (!skip_merge) {
             log.info "Hyperstack merging enabled (processed only, no segmentation)"
 
-            processed_merge_ch = segmentation_input
-                .map { timepoint, processed_file -> processed_file }
+            processed_ch = segmentation_input
+                .map { timepoint, f -> f }
                 .collect()
-                .map { files -> tuple('processed', files) }
+                .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] }
+            raw_iso_ch = (raw_export_enabled && raw_iso_input != null
+                ? raw_iso_input.map { timepoint, f -> f }
+                    .collect()
+                    .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] }
+                : Channel.value(file("${workflow.projectDir}/merge_hyperstack.py")))
 
-            MERGE_TO_HYPERSTACK(
-                processed_merge_ch,
+            MERGE_HYPERSTACKS(
                 shared_metadata,
-                merge_script_ch.collect()
+                Channel.fromPath(params.merge_script, checkIfExists: true).first(),
+                processed_ch,
+                Channel.value(file("${workflow.projectDir}/merge_hyperstack.py")),
+                raw_iso_ch
             )
         }
     }
