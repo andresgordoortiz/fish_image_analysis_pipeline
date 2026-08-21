@@ -1341,19 +1341,19 @@ if do_iso:
     if abs(zoom_z - 1.0) < 1e-3:
         print("Z already isotropic, skipping.")
     else:
-        from scipy.ndimage import zoom as ndi_zoom
-        # Pin the output shape explicitly via `output=` to guarantee the
-        # documented Z expansion. With just a float zoom factor and
-        # prefilter=False, scipy.ndimage.zoom occasionally rounds to the
-        # input size when the factor is close to (but not exactly)
-        # 1 + 1/N. Forcing the output shape removes that ambiguity.
+        # Use skimage.transform.resize (same as the preprocessed chain)
+        # so the Z expansion matches the preprocessed output exactly.
+        # Pin the output shape so the documented Z expansion is guaranteed
+        # regardless of any rounding ambiguity in the float zoom factor.
         expected_z = int(round(out.shape[0] * zoom_z))
-        out = ndi_zoom(
+        from skimage.transform import resize as sk_resize
+        out = sk_resize(
             out,
-            (zoom_z, 1.0, 1.0),
+            (expected_z, out.shape[1], out.shape[2]),
             order=1,
-            prefilter=False,
-            output=(expected_z, out.shape[1], out.shape[2]),
+            mode="constant",
+            anti_aliasing=False,
+            preserve_range=True,
         )
         print(f"Isotropic Z reslice: expected={expected_z} (zoom_z={zoom_z:.4f}, got shape={out.shape})")
         # Hard sanity check — fail loudly if the volume is wrong so
