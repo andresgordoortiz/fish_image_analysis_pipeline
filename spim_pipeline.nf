@@ -2416,10 +2416,10 @@ print("✓ Config file created")
 PYTHON_CONFIG
 
     # Run the merge for each non-empty data_type, in order
-    n_proc=$(ls -1 stage_processed/*.tif 2>/dev/null | wc -l | tr -d ' ')
-    n_seg=$(ls -1 stage_segmented/*.tif 2>/dev/null | wc -l | tr -d ' ')
-    n_raw=$(ls -1 stage_raw_iso/*.tif 2>/dev/null | wc -l | tr -d ' ')
-    echo "Staged: processed=${n_proc}, segmented=${n_seg}, raw_iso=${n_raw}"
+    n_proc=\$(ls -1 stage_processed/*.tif 2>/dev/null | wc -l | tr -d ' ')
+    n_seg=\$(ls -1 stage_segmented/*.tif 2>/dev/null | wc -l | tr -d ' ')
+    n_raw=\$(ls -1 stage_raw_iso/*.tif 2>/dev/null | wc -l | tr -d ' ')
+    echo "Staged: processed=\${n_proc}, segmented=\${n_seg}, raw_iso=\${n_raw}"
 
     run_merge() {
         local dt="\$1"
