@@ -19,6 +19,8 @@
 #   6. ROI rectangle selection (draw in 2D, selects through full 3D volume)
 #   7. Ingression analysis: radial velocity, ingression flagging & colouring
 #   8. Export enriched CSVs → feeds R analysis pipeline
+#   9. Track-quality filters: min track length + max instantaneous speed
+#      (selectors auto-adjust to the loaded dataset)
 #
 # USAGE:
 #   python embryo_viewer.py medaka_25082025_combined_spots.csv  \
@@ -1124,6 +1126,23 @@ class CrossSectionViewer:
         self._show_all = False
         self._track_width = 2.0
         self._show_tracks = True
+        # ── Track-quality filters (mirror of main viewer's filters) ──
+        # Independent state so the user can dial in stricter thresholds
+        # for the cross-section without affecting the main viewer.
+        # Seeded from the parent on init; auto-adjusted when the dataset
+        # stats are recomputed.
+        self._min_track_length: int = max(
+            3, getattr(parent, "_min_track_length", 3)
+        )
+        self._max_speed: float = getattr(
+            parent, "_max_speed", float("inf")
+        )
+        # Per-track summary (length, max speed) computed lazily from the
+        # full dataset — cached so we don't recompute on every slab
+        # rebuild.  Keyed by track_id (int) → dict with keys
+        # "length" (int) and "max_speed" (float).
+        self._per_track_stats: dict[int, dict] = {}
+        self._per_track_stats_key: tuple | None = None  # cache key (n_rows, max_tid)
         self._points_visible = True  # track user's nuclei visibility preference
         self._tracks_visible_state = True  # track user's tracks visibility
         # ── User-tweakable Tracks display props (persist across rebuilds) ──
@@ -1234,6 +1253,43 @@ class CrossSectionViewer:
         )
         self.track_width_slider.changed.connect(self._on_track_width_changed)
 
+        # ── Track-quality filters (auto-adjusted to dataset) ──
+        # Same selectors as the main viewer, but with INDEPENDENT state —
+        # lets the cross-section user tighten the thresholds without
+        # affecting the main viewer's tracks.
+        #
+        # Spinbox min is 1 (not 2) so the user can type any value
+        # without the widget snapping partial input.  See the matching
+        # comment in the main viewer's ``_build_widgets``.
+        self.min_track_length_spin = SpinBox(
+            value=self._min_track_length,
+            min=1,
+            max=9999,
+            step=1,
+            label="Min track length (frames)",
+        )
+        self.min_track_length_spin.changed.connect(
+            self._on_min_track_length_changed
+        )
+
+        self.max_speed_slider = FloatSlider(
+            value=100.0,
+            min=0.0,
+            max=100.0,
+            step=0.5,
+            label="Max speed µm/frame (≤ keeps)",
+        )
+        self.max_speed_slider.changed.connect(self._on_max_speed_changed)
+
+        self.lbl_track_filters = Label(
+            value="Track filters: (computing…)"
+        )
+
+        # Count label mirroring the main viewer's, but counting only
+        # the tracks visible in the CURRENT slab (not the entire
+        # dataset).  Refreshed on every slab rebuild.
+        self.lbl_track_filter_count = Label(value="Filtered: (computing…)")
+
         # ── Mirror main-viewer selection (random sample / click) ────
         self.mirror_main_selection_cb = CheckBox(
             value=True, text="Show only main-viewer selected tracks"
@@ -1332,6 +1388,19 @@ class CrossSectionViewer:
         btn_screenshot = PushButton(text="\U0001f4f7 Screenshot")
         btn_screenshot.changed.connect(self._save_screenshot)
 
+        # ── Filtered export ──
+        # Exports tracks/spots tagged with THIS viewer's filter state
+        # (which is independent of the main viewer's — the user may
+        # have tightened the cross-section filters to focus on tracks
+        # that intersect the current slab).  Mirrors the main viewer's
+        # "Export Filtered Tracks (flagged)" button but uses the
+        # cross-section's own min_track_length / max_speed.
+        btn_export_filtered = PushButton(
+            text="Export Filtered Tracks (flagged)"
+        )
+        btn_export_filtered.changed.connect(self._export_filtered)
+        self.lbl_export = Label(value="")
+
         self.lbl_info = Label(value="")
         self.lbl_annotations = Label(value="")
         self.lbl_record = Label(value="")
@@ -1354,6 +1423,11 @@ class CrossSectionViewer:
                 self.show_tracks_check,
                 self.max_tracks_slider,
                 self.track_width_slider,
+                Label(value="━━ TRACK FILTERS ━━"),
+                self.min_track_length_spin,
+                self.max_speed_slider,
+                self.lbl_track_filters,
+                self.lbl_track_filter_count,
                 self.mirror_main_selection_cb,
                 self.lbl_parent_selection,
                 self.random_sample_n,
@@ -1387,6 +1461,9 @@ class CrossSectionViewer:
                 btn_record,
                 btn_screenshot,
                 self.lbl_record,
+                Label(value="── Export ──"),
+                btn_export_filtered,
+                self.lbl_export,
                 Label(value="── Info ──"),
                 self.lbl_info,
                 self.lbl_annotations,
@@ -1462,6 +1539,15 @@ class CrossSectionViewer:
         self._parent_selected_tids: set[int] = set()
         self._parent_selection_active: bool = False
         self._refresh_parent_selection_label()
+
+        # Auto-adjust the min-length / max-speed selectors to the
+        # loaded dataset.  Without this, the selectors stay at their
+        # arbitrary defaults and the speed filter is a silent no-op.
+        try:
+            self._update_track_filter_widgets()
+            self._refresh_filter_count_label()
+        except Exception:
+            pass
 
     # ── Quick-jump helpers ───────────────────────────────────────────
 
@@ -1544,6 +1630,471 @@ class CrossSectionViewer:
     def _on_track_width_changed(self):
         self._track_width = float(self.track_width_slider.value)
         self._schedule_rebuild()
+
+    # ── Track-quality filters (min length + max speed) ──────────────
+
+    def _on_min_track_length_changed(self):
+        """Handle min-track-length spinbox change (debounced)."""
+        v = int(self.min_track_length_spin.value)
+        # Enforce ≥2 (a track needs at least 2 points to be a track).
+        self._min_track_length = max(2, v)
+        self._refresh_filter_count_label()
+        self._schedule_rebuild()
+
+    def _on_max_speed_changed(self):
+        """Handle max-speed slider change (debounced)."""
+        v = float(self.max_speed_slider.value)
+        # Treat the slider's own max as "off" — keeps a sensible upper
+        # bound instead of forcing inf through the rest of the code.
+        slider_max = float(self.max_speed_slider.max)
+        self._max_speed = v if v < slider_max - 1e-9 else float("inf")
+        self._refresh_filter_count_label()
+        self._schedule_rebuild()
+
+    @staticmethod
+    def _compute_track_speed_numpy(
+        track_ids: np.ndarray,
+        frames: np.ndarray,
+        x: np.ndarray,
+        y: np.ndarray,
+        z: np.ndarray,
+    ) -> np.ndarray:
+        """Per-point instantaneous speed (units/frame) from numpy arrays.
+
+        Inputs MUST be sorted by (track_id, frame).  Returns NaN at the
+        first frame of every track (no previous point to diff against).
+        Mirrors the parent viewer's ``_compute_track_speed`` so the two
+        windows compute identical per-spot speeds for the same data.
+        """
+        f = frames.astype(float)
+        dx = np.diff(x, prepend=np.nan)
+        dy = np.diff(y, prepend=np.nan)
+        dz = np.diff(z, prepend=np.nan)
+        df_v = np.diff(f, prepend=-9999)
+        same = np.diff(track_ids.astype(float), prepend=-9999) == 0
+        dist = np.sqrt(dx**2 + dy**2 + dz**2)
+        dt = np.maximum(df_v, 1.0)
+        return np.where(same & (df_v > 0), dist / dt, np.nan)
+
+    def _ensure_per_track_stats(self) -> None:
+        """Lazy-compute (and cache) per-track length + max speed.
+
+        Re-computes only when the dataset shape changes — i.e. the parent
+        reloaded data — by keying the cache on (n_rows, max_tid,
+        max_frame).  Cheap on small datasets (~50 ms for 2 M spots),
+        so we don't bother parallelising.
+        """
+        if self._track_ids is None:
+            return
+        # Compute cache key from the cached numpy arrays (fast)
+        cache_key = (
+            int(self._track_ids.shape[0]),
+            int(self._frames.shape[0]),
+            int(np.nanmax(self._track_ids)) if self._track_ids.size else 0,
+        )
+        if self._per_track_stats_key == cache_key and self._per_track_stats:
+            return
+
+        track_ids = self._track_ids
+        if track_ids.dtype.kind == 'f':
+            valid = ~np.isnan(track_ids)
+        else:
+            valid = np.ones(len(track_ids), dtype=bool)
+        if not valid.any():
+            self._per_track_stats = {}
+            self._per_track_stats_key = cache_key
+            return
+
+        # Sort by (track_id, frame) for the speed diff
+        order = np.lexsort(
+            (self._frames[valid].astype(np.int64),
+             track_ids[valid].astype(np.int64))
+        )
+        tid_sorted = track_ids[valid][order].astype(np.int64)
+        f_sorted = self._frames[valid][order]
+        x_sorted = self._pos_x[valid][order]
+        y_sorted = self._pos_y[valid][order]
+        z_sorted = self._pos_z[valid][order]
+
+        # Track lengths (single pass via np.unique)
+        unique_tids, counts = np.unique(tid_sorted, return_counts=True)
+        lengths = dict(zip(unique_tids.tolist(), counts.tolist()))
+
+        # Per-track max speed
+        speed = self._compute_track_speed_numpy(
+            tid_sorted, f_sorted, x_sorted, y_sorted, z_sorted
+        )
+        # Treat first-frame NaN as zero (no previous point)
+        speed = np.where(np.isnan(speed), 0.0, speed)
+        # pandas groupby is the fastest portable option here
+        per_track_max_speed = pd.Series(speed).groupby(
+            tid_sorted, sort=False
+        ).max()
+
+        self._per_track_stats = {
+            int(t): {
+                "length": int(lengths.get(t, 0)),
+                "max_speed": float(per_track_max_speed.get(t, 0.0)),
+            }
+            for t in unique_tids
+        }
+        self._per_track_stats_key = cache_key
+
+    def _update_track_filter_widgets(self) -> None:
+        """Adjust min-track-length / max-speed selectors to the dataset.
+
+        Mirrors ``EmbryoViewer._update_track_filter_widgets`` but using
+        the numpy-only per-track stats we computed in
+        ``_ensure_per_track_stats``.
+        """
+        self._ensure_per_track_stats()
+        if not self._per_track_stats:
+            self.lbl_track_filters.value = (
+                "Track filters: (no tracks loaded)"
+            )
+            return
+
+        # Aggregate stats from the dict
+        lengths = np.array([v["length"] for v in self._per_track_stats.values()])
+        max_speeds = np.array(
+            [v["max_speed"] for v in self._per_track_stats.values()]
+        )
+
+        if lengths.size == 0:
+            self.lbl_track_filters.value = (
+                "Track filters: (no tracks loaded)"
+            )
+            return
+
+        len_min = int(lengths.min())
+        len_p50 = int(np.percentile(lengths, 50))
+        len_p95 = int(np.percentile(lengths, 95))
+        len_max = int(lengths.max())
+        speed_max = float(max_speeds.max())
+
+        # ── Min-track-length SpinBox: bounds = [2, len_max] ──
+        self.min_track_length_spin.max = max(2, len_max)
+        cur = int(self.min_track_length_spin.value)
+        if cur < 2 or cur > len_max:
+            default_min = int(np.clip(len_p95, 2, len_max))
+            self.min_track_length_spin.value = default_min
+            self._min_track_length = default_min
+
+        # ── Max-speed FloatSlider: max = ceil(track-max × 1.1) ──
+        sm = max(speed_max, 1.0) * 1.1
+        if sm <= 5:
+            slider_max = float(np.ceil(sm * 10) / 10)
+            step = 0.1
+        elif sm <= 50:
+            slider_max = float(np.ceil(sm))
+            step = 0.5
+        else:
+            slider_max = float(np.ceil(sm / 10) * 10)
+            step = 1.0
+        self.max_speed_slider.max = slider_max
+        self.max_speed_slider.step = step
+        cur = float(self.max_speed_slider.value)
+        was_off = not np.isfinite(self._max_speed)
+        if cur > slider_max or (was_off and cur >= slider_max - 1e-9):
+            default_speed = float(
+                np.clip(np.percentile(max_speeds, 99), 0.0, slider_max)
+            )
+            self.max_speed_slider.value = default_speed
+            self._max_speed = default_speed
+
+        # ── Refresh stats label ──
+        speed_p50 = float(np.percentile(max_speeds, 50))
+        speed_p99 = float(np.percentile(max_speeds, 99))
+        self.lbl_track_filters.value = (
+            f"Dataset: {len(self._per_track_stats):,} tracks | "
+            f"len {len_min}\u2013{len_max} "
+            f"(p50 {len_p50}, p95 {len_p95}) | "
+            f"max-speed {speed_max:.2f} \u00b5m/fr "
+            f"(p50 {speed_p50:.2f}, p99 {speed_p99:.2f})"
+        )
+
+    def _refresh_filter_count_label(self) -> None:
+        """Update the cross-section count label.
+
+        Shows how many tracks the user's current thresholds DROP across
+        the WHOLE dataset (mirrors the main viewer's
+        ``_refresh_filter_count_label``).  In-slab visibility counts are
+        surfaced in the main info label via ``n_tracks_shown``.
+        """
+        lbl = getattr(self, "lbl_track_filter_count", None)
+        if lbl is None:
+            return
+        self._ensure_per_track_stats()
+        if not self._per_track_stats:
+            lbl.value = "Filtered: (no tracks)"
+            return
+        n_total = len(self._per_track_stats)
+        n_drop = 0
+        for s in self._per_track_stats.values():
+            if s["length"] < self._min_track_length:
+                n_drop += 1
+                continue
+            if np.isfinite(self._max_speed) and s["max_speed"] > self._max_speed:
+                n_drop += 1
+        n_keep = n_total - n_drop
+        if n_drop == 0:
+            lbl.value = f"Track filters: keeping all {n_total:,} tracks"
+        else:
+            pct = n_drop / n_total * 100 if n_total else 0.0
+            lbl.value = (
+                f"Track filters: keeping {n_keep:,} / {n_total:,} "
+                f"({n_drop:,} filtered out, {pct:.1f}%)"
+            )
+
+    def _export_filtered(self):
+        """Export a filtered CSV using THIS viewer's filter state.
+
+        Mirrors ``EmbryoViewer._export_filtered`` but reads the
+        cross-section's independent ``_min_track_length`` and
+        ``_max_speed`` so the user can export using thresholds they've
+        tightened specifically for the cross-section (the main viewer's
+        exports use its own thresholds).  Produces:
+
+          * ``cross_section_filtered_spots.csv``  — every spot with two
+            new columns: ``FILTERED_OUT`` (bool) and ``FILTER_REASON``.
+          * ``cross_section_filtered_tracks.csv`` — same shape, but only
+            the rows belonging to filtered-out tracks.
+          * ``cross_section_filtered_summary.csv`` — per-track summary
+            that always includes ``FILTERED_OUT`` + ``FILTER_REASON``
+            + per-track max-speed for auditing.
+          * ``cross_section_filter_metadata.json`` — filter thresholds,
+            kept/dropped counts, and CSV filenames.
+
+        Runs in a background thread so the GUI stays responsive.
+        """
+        from qtpy.QtCore import QTimer
+
+        # Snapshot data + filter state on the GUI thread
+        spots_df = self.parent.spots
+        if spots_df is None:
+            self.viewer.status = "Load spots first!"
+            return
+
+        out_dir = Path("analysis_output")
+        out_dir.mkdir(exist_ok=True)
+
+        self.lbl_export.value = "Exporting filtered CSV (please wait)..."
+        self.viewer.status = (
+            "Exporting cross-section filtered tracks in background..."
+        )
+
+        # Snapshot filter state.  Cross-section state is independent
+        # of the main viewer's, so we deliberately do NOT read
+        # self.parent._min_track_length.
+        min_length = int(self._min_track_length)
+        max_speed = float(self._max_speed)
+        axis = str(self._axis)
+        pos = float(self.pos_slider.value)
+        thickness = float(self._thickness)
+
+        # Snapshot per-track stats we already cached locally
+        per_track_stats = dict(self._per_track_stats)
+
+        self._pending_xs_filtered_err = None
+        self._pending_xs_filtered_files = None
+
+        def _bg():
+            try:
+                files_written = []
+                import json
+
+                if "TRACK_ID" not in spots_df.columns:
+                    raise ValueError(
+                        "No TRACK_ID column — cannot apply track filters."
+                    )
+
+                df = spots_df.dropna(subset=["TRACK_ID"]).copy()
+                if df.empty:
+                    raise ValueError("No tracked rows to filter.")
+
+                df_sorted = df.sort_values(
+                    ["TRACK_ID", "FRAME"]
+                ).reset_index(drop=True)
+
+                # Re-derive per-track max speed from the sorted df
+                # (so it lines up with the speed array indices).
+                sp = self._compute_track_speed_numpy(
+                    df_sorted["TRACK_ID"].values,
+                    df_sorted["FRAME"].values,
+                    df_sorted["POSITION_X"].values,
+                    df_sorted["POSITION_Y"].values,
+                    df_sorted["POSITION_Z"].values,
+                )
+                track_max_speed = (
+                    pd.Series(sp)
+                    .groupby(
+                        df_sorted["TRACK_ID"].values, sort=False
+                    )
+                    .max()
+                )
+                track_max_speed = track_max_speed.reindex(
+                    df_sorted["TRACK_ID"].unique()
+                )
+
+                # Per-track length
+                track_len = df_sorted.groupby("TRACK_ID")[
+                    "FRAME"
+                ].transform("count")
+
+                # Per-track filter verdict + reason
+                length_pass = track_len >= min_length
+                if np.isfinite(max_speed):
+                    speed_pass = (
+                        df_sorted["TRACK_ID"]
+                        .map(track_max_speed)
+                        .le(max_speed)
+                        .values
+                    )
+                else:
+                    speed_pass = np.ones(len(df_sorted), dtype=bool)
+
+                keep_mask = length_pass & speed_pass
+                reason = np.empty(len(df_sorted), dtype=object)
+                reason[:] = ""
+                fail_len = ~length_pass.values & ~speed_pass
+                fail_spd = length_pass.values & ~speed_pass
+                fail_both = ~length_pass.values & ~speed_pass
+                reason[fail_len] = "min_length"
+                reason[fail_spd] = "max_speed"
+                reason[fail_both] = "both"
+
+                df_sorted = df_sorted.copy()
+                df_sorted["FILTERED_OUT"] = ~keep_mask.values
+                df_sorted["FILTER_REASON"] = reason
+                front = [
+                    "FILTERED_OUT",
+                    "FILTER_REASON",
+                    "TRACK_ID",
+                    "FRAME",
+                ]
+                cols = front + [
+                    c for c in df_sorted.columns if c not in front
+                ]
+                df_sorted = df_sorted[cols]
+
+                # 1. Full annotated spots CSV
+                df_sorted.to_csv(
+                    out_dir / "cross_section_filtered_spots.csv",
+                    index=False,
+                )
+                files_written.append("cross_section_filtered_spots.csv")
+
+                # 2. Filtered-out-only tracks (verbatim, for audit)
+                df_sorted[df_sorted["FILTERED_OUT"]].to_csv(
+                    out_dir / "cross_section_filtered_tracks.csv",
+                    index=False,
+                )
+                files_written.append("cross_section_filtered_tracks.csv")
+
+                # 3. Per-track summary with verdict + reason
+                grp = df_sorted.groupby("TRACK_ID")
+                track_summary = grp.agg(
+                    n_spots=("FRAME", "count"),
+                    frame_start=("FRAME", "min"),
+                    frame_end=("FRAME", "max"),
+                    mean_x=("POSITION_X", "mean"),
+                    mean_y=("POSITION_Y", "mean"),
+                    mean_z=("POSITION_Z", "mean"),
+                    FILTERED_OUT=("FILTERED_OUT", "first"),
+                    FILTER_REASON=("FILTER_REASON", "first"),
+                )
+                track_summary["max_speed_um_per_frame"] = track_max_speed
+                track_summary.to_csv(
+                    out_dir / "cross_section_filtered_summary.csv"
+                )
+                files_written.append(
+                    "cross_section_filtered_summary.csv"
+                )
+
+                # 4. Brief JSON metadata
+                unique_tids = df_sorted["TRACK_ID"].unique()
+                n_drop = int((~keep_mask).sum())
+                n_kept = int(keep_mask.sum())
+                meta = {
+                    "filter": {
+                        "min_track_length": int(min_length),
+                        "max_speed_um_per_frame": (
+                            float(max_speed)
+                            if np.isfinite(max_speed)
+                            else None
+                        ),
+                    },
+                    "slab": {
+                        "axis": axis,
+                        "position": pos,
+                        "thickness": thickness,
+                    },
+                    "n_spots_total": int(len(df_sorted)),
+                    "n_spots_kept": n_kept,
+                    "n_spots_filtered": n_drop,
+                    "n_tracks_total": int(len(unique_tids)),
+                    "n_tracks_filtered": int(
+                        df_sorted.loc[
+                            df_sorted["FILTERED_OUT"], "TRACK_ID"
+                        ].nunique()
+                    ),
+                    "csv_files": files_written,
+                }
+                with open(
+                    out_dir / "cross_section_filter_metadata.json", "w"
+                ) as f:
+                    json.dump(meta, f, indent=2, default=str)
+                files_written.append(
+                    "cross_section_filter_metadata.json"
+                )
+
+                self._pending_xs_filtered_files = files_written
+            except Exception as e:
+                self._pending_xs_filtered_err = str(e)
+
+        t = threading.Thread(target=_bg, daemon=True)
+        t.start()
+
+        def _poll():
+            if t.is_alive():
+                QTimer.singleShot(500, _poll)
+                return
+            if self._pending_xs_filtered_err:
+                self.lbl_export.value = (
+                    f"Filtered export error: "
+                    f"{self._pending_xs_filtered_err}"
+                )
+                self.viewer.status = (
+                    f"Filtered export failed: "
+                    f"{self._pending_xs_filtered_err}"
+                )
+                return
+            files = self._pending_xs_filtered_files or []
+            n_drop = None
+            n_kept = None
+            try:
+                import json as _json
+                meta = _json.loads(
+                    (out_dir / "cross_section_filter_metadata.json").read_text()
+                )
+                n_drop = meta.get("n_spots_filtered")
+                n_kept = meta.get("n_spots_kept")
+            except Exception:
+                pass
+            if n_drop is not None and n_kept is not None:
+                self.lbl_export.value = (
+                    f"Exported {len(files)} filtered files "
+                    f"(kept {n_kept:,}, filtered {n_drop:,})"
+                )
+            else:
+                self.lbl_export.value = (
+                    f"Exported {len(files)} filtered files to {out_dir}/"
+                )
+            self.viewer.status = (
+                f"Cross-section filtered export: {', '.join(files)}"
+            )
+
+        QTimer.singleShot(500, _poll)
 
     def _on_mirror_changed(self, value: bool):
         """User toggled 'Show only main-viewer selected tracks'."""
@@ -2058,6 +2609,29 @@ class CrossSectionViewer:
                 [t for t in slab_tids.tolist() if t in sel_set],
                 dtype=slab_tids.dtype,
             )
+            if slab_tids.size == 0:
+                return
+
+        # ── Apply track-quality filters (min length + max speed) ──────
+        # These drop entire tracks whose full-dataset stats fail the
+        # user's thresholds — same semantics as the main viewer.  We use
+        # the cached per-track stats computed lazily in
+        # ``_ensure_per_track_stats``.
+        self._ensure_per_track_stats()
+        stats = self._per_track_stats
+        if stats:
+            kept = []
+            for t in slab_tids.tolist():
+                s = stats.get(int(t))
+                if s is None:
+                    kept.append(t)
+                    continue
+                if s["length"] < self._min_track_length:
+                    continue
+                if np.isfinite(self._max_speed) and s["max_speed"] > self._max_speed:
+                    continue
+                kept.append(t)
+            slab_tids = np.array(kept, dtype=slab_tids.dtype)
             if slab_tids.size == 0:
                 return
 
@@ -2994,6 +3568,10 @@ class EmbryoViewer:
         self._max_tracks: int = 500000
         self._track_frame_min: int | None = None
         self._track_frame_max: int | None = None
+        # Track-quality filters (auto-adjusted to the loaded dataset)
+        self._min_track_length: int = 3          # min frames per track
+        self._max_speed: float = float("inf")    # max instantaneous µm/frame
+        self._dataset_track_stats: dict | None = None  # for status label
         self._roi_bounds: dict | None = None  # {x_min, x_max, y_min, ...}
         self._roi_only: bool = False  # show only ROI spots
         self._roi_shapes_layer = None
@@ -3073,6 +3651,16 @@ class EmbryoViewer:
 
         # ── Build control widgets ──
         self._build_widgets()
+
+        # If data was passed to the constructor (CLI / programmatic load),
+        # the UI loading path that normally triggers
+        # _update_track_filter_widgets() never runs — so call it explicitly
+        # now that the widgets exist.  Without this, _max_speed stays at
+        # inf, the slider stays at its default 100 µm/frame, and the
+        # speed filter is a silent no-op.
+        if self.spots is not None:
+            self._update_track_filter_widgets()
+            self._refresh_filter_count_label()
 
         # Connect click handler for landmark selection
         self.viewer.mouse_drag_callbacks.append(self._on_click)
@@ -3357,18 +3945,11 @@ class EmbryoViewer:
                                 pass
 
                 # ── 1b. Swap raw vispy texture (instant) ──
-                processed_frames = self._processed_frames
-                if processed_frames is not None and 0 <= t < len(processed_frames):
-                    processed_vol = self._vispy_processed_volume
-                    if processed_vol is not None:
-                        processed_vol.set_data(processed_frames[t])
-                    # Sync raw layer._data reference (same as segments)
-                    processed_lyr = self._processed_layer
-                    if processed_lyr is not None:
-                        try:
-                            processed_lyr._data = processed_frames[t]
-                        except Exception:
-                            pass
+                # Delegated to _swap_processed_at_time so the dedicated
+                # processed callback installed in _load_processed shares
+                # the exact same swap logic (incl. dynamic vispy lookup
+                # + layer.data fallback).
+                self._swap_processed_at_time(t)
 
                 # ── 2. Update Tracks shader time (GPU uniform, ~0 ms) ──
                 # Tracks layers use a GPU shader uniform for time filtering
@@ -3947,23 +4528,171 @@ class EmbryoViewer:
         print(f"  Building {n_tp} display frames ...", end=" ", flush=True)
         t0 = _time.time()
 
-        # Percentile-based contrast (robust to hot pixels / outliers)
-        # Subsample for speed: take every 4th frame, every 2nd voxel
-        sample = data_np[::4, ::2, ::2, ::2].ravel()
-        p_low, p_high = np.percentile(sample[sample > 0], [0.5, 99.5]) \
-            if np.any(sample > 0) else (float(data_np.min()), float(data_np.max()))
-        p_low = float(p_low)
-        p_high = float(p_high)
+        # Percentile-based contrast (robust to hot pixels / outliers).
+        # On large volumes the sample array can be hundreds of MB, so
+        # compute per-frame 256-bin histograms in parallel and merge
+        # — O(N) memory + full core utilisation, vs. the serial
+        # np.percentile on a single huge array which serialises on
+        # one core and adds meaningful latency on 4D data.
+        #
+        # Imports + core count must come BEFORE any print that
+        # references them — Python treats the whole function body as
+        # a single scope, so referencing ``n_cores`` before its
+        # ``n_cores = ...`` line raises UnboundLocalError.
+        import multiprocessing as _mp
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+
+        n_cores = max(1, _mp.cpu_count() or 1)
+        # Worker cap: physical cores for CPU-bound numpy.  We allow up
+        # to 2× when there's plenty of work because HT/SMT threads do
+        # help on memory-bandwidth-bound code (np.clip reads every
+        # voxel), and on a 32-core box 16 workers left most cores
+        # idle.  2× is a safe upper bound — going higher than that
+        # starts to thrash the L2/L3 cache and net out negative.
+        n_workers = min(n_tp, max(1, n_cores * 2))
+        print(
+            f"  Estimating contrast ({n_workers} threads × "
+            f"{n_cores} cores) ...",
+            end=" ",
+            flush=True,
+        )
+
+        # ── Parallel histogram → percentile ─────────────────────────
+        # Subsample 1/8th of voxels (every 2nd frame × 2nd voxel) and
+        # build per-frame histograms, then merge.  The 1/256 → 1/8
+        # subsample means we use ~1% of voxels but get a stable
+        # percentile estimate (the 0.5 / 99.5 percentiles don't need
+        # to see every voxel).
+        sample_stride = 2  # every Nth frame + every Nth voxel
+        n_hist_bins = 256
+        # Pre-scan to find global min/max for histogram bounds — needed
+        # in one pass over the data anyway for the clip.  Do it via
+        # min/max per frame in parallel.
+        # First, gather mins/maxes via parallel reduction
+        def _minmax(i):
+            sl = data_np[i, ::sample_stride, ::sample_stride, ::sample_stride]
+            return float(sl.min()), float(sl.max())
+        with _TPE(max_workers=n_workers) as pool:
+            mm = list(pool.map(_minmax, range(n_tp)))
+        global_min = min(m for m, _ in mm)
+        global_max = max(M for _, M in mm)
+
+        if global_min == global_max:
+            # Degenerate (constant) image — just emit zeros
+            p_low, p_high = float(global_min), float(global_max)
+        else:
+            def _hist(i):
+                sl = data_np[i, ::sample_stride, ::sample_stride, ::sample_stride]
+                # Skip zeros for "background-subtracted" percentiles —
+                # matches the original serial code's behavior
+                nz = sl[sl > 0]
+                if nz.size == 0:
+                    return np.zeros(n_hist_bins, dtype=np.int64)
+                return np.histogram(
+                    nz,
+                    bins=n_hist_bins,
+                    range=(global_min, global_max),
+                )[0].astype(np.int64)
+            with _TPE(max_workers=n_workers) as pool:
+                hist_sum = sum(pool.map(_hist, range(n_tp)))
+
+            # Find 0.5 / 99.5 percentiles from the merged histogram
+            cumsum = np.cumsum(hist_sum)
+            total = cumsum[-1]
+            if total == 0:
+                p_low = float(global_min)
+                p_high = float(global_max)
+            else:
+                edges = np.linspace(global_min, global_max, n_hist_bins + 1)
+                lo_idx = int(np.searchsorted(cumsum, total * 0.005))
+                hi_idx = int(np.searchsorted(cumsum, total * 0.995))
+                p_low = float(edges[lo_idx])
+                p_high = float(edges[hi_idx])
+
         scale_factor = 255.0 / max(p_high - p_low, 1e-10)
-        print(f"contrast range [{p_low:.0f}, {p_high:.0f}] ", end="")
+        print(f"[{p_low:.0f}, {p_high:.0f}] ", end="", flush=True)
+        print(f"({n_workers} threads × {n_cores} cores) ...", end=" ", flush=True)
 
         self._processed_frames = []
-        for i in range(n_tp):
+
+        def _convert_frame(i: int) -> np.ndarray:
             frame = data_np[i]
-            # Convert to uint8 with percentile-based contrast
-            f8 = np.clip((frame.astype(np.float32) - p_low) * scale_factor,
-                         0, 255).astype(np.uint8)
-            self._processed_frames.append(np.ascontiguousarray(f8))
+            return np.ascontiguousarray(
+                np.clip(
+                    (frame.astype(np.float32) - p_low) * scale_factor,
+                    0,
+                    255,
+                ).astype(np.uint8)
+            )
+
+        if n_workers == 1:
+            # Tiny dataset (or single core) — skip pool overhead
+            for i in range(n_tp):
+                self._processed_frames.append(_convert_frame(i))
+        else:
+            # When n_tp ≪ n_cores × 4 we have so few frames that
+            # each worker would only get 1–2 frames — the pool's
+            # dispatch / pickup overhead dominates.  Chunk by Z slabs
+            # instead so each worker gets ~equal, substantial work
+            # regardless of how few frames the dataset has.
+            z = data_np.shape[1]
+            # Aim for roughly n_workers × 2 chunks; never below 1 slab
+            # per frame (chunking per-frame would defeat the purpose)
+            target_chunks = max(n_tp, n_workers * 2)
+            slabs_per_frame = max(1, target_chunks // n_tp)
+            slab_size = max(1, z // slabs_per_frame)
+
+            # Build (frame, z_lo, z_hi) work units
+            work = []
+            for i in range(n_tp):
+                for s in range(slabs_per_frame):
+                    lo = s * slab_size
+                    hi = z if s == slabs_per_frame - 1 else (s + 1) * slab_size
+                    work.append((i, lo, hi))
+
+            def _convert_slab(item):
+                i, lo, hi = item
+                slab = data_np[i, lo:hi]
+                return (
+                    i,
+                    lo,
+                    hi,
+                    np.ascontiguousarray(
+                        np.clip(
+                            (slab.astype(np.float32) - p_low) * scale_factor,
+                            0,
+                            255,
+                        ).astype(np.uint8)
+                    ),
+                )
+
+            if len(work) <= n_workers * 2:
+                # Too few chunks to justify the pool — fall back to
+                # serial frame-by-frame, which is fast enough at this
+                # scale and avoids the pool overhead.
+                for i in range(n_tp):
+                    self._processed_frames.append(_convert_frame(i))
+            else:
+                # Rebuild each frame contiguously from its slabs so
+                # the final layout stays (T, Z, Y, X) regardless of
+                # chunking.
+                frame_buffers: list[list[np.ndarray]] = [
+                    [] for _ in range(n_tp)
+                ]
+                with _TPE(max_workers=n_workers) as pool:
+                    for i, lo, hi, slab_u8 in pool.map(
+                        _convert_slab, work
+                    ):
+                        frame_buffers[i].append(slab_u8)
+                for bufs in frame_buffers:
+                    if len(bufs) == 1:
+                        self._processed_frames.append(bufs[0])
+                    else:
+                        self._processed_frames.append(
+                            np.ascontiguousarray(
+                                np.concatenate(bufs, axis=0)
+                            )
+                        )
 
         frame_mb = self._processed_frames[0].nbytes / 1e6
         total_gb = n_tp * frame_mb / 1e3
@@ -4001,6 +4730,30 @@ class EmbryoViewer:
                         print("  ✓ Processed vispy direct texture path active")
         except Exception as exc:
             print(f"  ⚠ Processed vispy path unavailable ({exc})")
+
+        # ── Independent time-slider callback ───────────────────────────
+        # The existing _on_segments_time callback only fires when segments
+        # are loaded with --preload.  This dedicated callback guarantees
+        # processed updates work no matter how segments were loaded (lazy
+        # vs preload, or not at all).  Idempotent: disconnects any prior
+        # callback before reconnecting, so reloading processed via the UI
+        # doesn't end up with two listeners firing.
+        prior_cb = getattr(self, "_processed_time_cb", None)
+        if prior_cb is not None:
+            try:
+                self.viewer.dims.events.current_step.disconnect(prior_cb)
+            except (ValueError, TypeError):
+                pass
+
+        def _on_processed_time(event=None):
+            try:
+                t = int(self.viewer.dims.current_step[0])
+                self._swap_processed_at_time(t)
+            except Exception:
+                pass
+
+        self._processed_time_cb = _on_processed_time
+        self.viewer.dims.events.current_step.connect(_on_processed_time)
 
         print(f"  Ready: {n_tp} tp  |  shape {data_np.shape[1:]}  |  "
               f"{data_np.nbytes / 1e9:.1f} GB processed → "
@@ -4294,11 +5047,41 @@ class EmbryoViewer:
         if df.empty:
             return None, None
 
-        # Min track length
+        # Sort by (TRACK_ID, FRAME) ONCE and reuse below.
+        # _compute_track_speed relies on this ordering (uses np.diff with
+        # a NaN sentinel at every track boundary); running it on an
+        # unsorted df makes per-track max speeds garbage and the filter
+        # ends up either dropping everything or keeping everything.
+        df = df.sort_values(["TRACK_ID", "FRAME"]).reset_index(drop=True)
+
+        # Min track length (configurable via self._min_track_length).
         track_len = df.groupby("TRACK_ID")["FRAME"].transform("count")
-        df = df[track_len >= 3]
+        df = df[track_len >= self._min_track_length]
         if df.empty:
             return None, None
+
+        # Max instantaneous speed (configurable via self._max_speed).
+        # Drops whole tracks whose max single-frame displacement
+        # exceeds the threshold — typically tracking artefacts /
+        # segmentation swaps.  Uses the same per-spot speed formula
+        # as the "Colour by Speed" mode for consistency.
+        if np.isfinite(self._max_speed):
+            sp = self._compute_track_speed(df)
+            # Re-derive per-track max on the SAME sorted df so the
+            # groupby keys line up with the speed array indices.
+            track_max_speed = (
+                pd.Series(sp)
+                .groupby(df["TRACK_ID"].values, sort=False)
+                .max()
+            )
+            # Compare each track's max to the threshold
+            keep_mask = track_max_speed.le(self._max_speed).values
+            keep_tids = track_max_speed.index[keep_mask]
+            if len(keep_tids) == 0:
+                return None, None
+            df = df[df["TRACK_ID"].isin(keep_tids)]
+            if df.empty:
+                return None, None
 
         # Subsample tracks
         tids = df["TRACK_ID"].unique()
@@ -4308,7 +5091,10 @@ class EmbryoViewer:
             tids = rng.choice(tids, max_t, replace=False)
             df = df[df["TRACK_ID"].isin(tids)]
 
-        df = df.sort_values(["TRACK_ID", "FRAME"])
+        # df is already sorted by (TRACK_ID, FRAME) from earlier — no
+        # need to re-sort, and re-sorting would invalidate the row order
+        # that downstream code (e.g. _compute_track_speed callers, the
+        # speed filter above) was relying on.
         tracks = np.column_stack(
             [
                 df["TRACK_ID"].values,
@@ -4534,6 +5320,217 @@ class EmbryoViewer:
                 pass
             setattr(self, attr_name, None)
 
+    def _compute_dataset_track_stats(self) -> dict | None:
+        """Compute track-length + per-track-max-speed summary for the loaded data.
+
+        Returns a dict with p50/p95/p99/max statistics, or None if the
+        current ``spots`` has no TRACK_ID column.  Used by
+        ``_update_track_filter_widgets`` to auto-set slider bounds so
+        the controls always span the full dataset range.
+        """
+        if self.spots is None or "TRACK_ID" not in self.spots.columns:
+            return None
+        df = self.spots.dropna(subset=["TRACK_ID"])
+        if df.empty:
+            return None
+
+        # Track lengths
+        lens = df.groupby("TRACK_ID")["FRAME"].count()
+        stats = {
+            "n_tracks": int(lens.shape[0]),
+            "len_min": int(lens.min()),
+            "len_p50": int(np.percentile(lens, 50)),
+            "len_p95": int(np.percentile(lens, 95)),
+            "len_max": int(lens.max()),
+        }
+
+        # Per-track max instantaneous speed (µm/frame)
+        sp = self._compute_track_speed(df.sort_values(["TRACK_ID", "FRAME"]))
+        # _compute_track_speed returns NaN at the first frame of each
+        # track — those are valid "no movement" values; replace with 0
+        # so they don't poison the per-track max.
+        sp = np.where(np.isnan(sp), 0.0, sp)
+        if len(sp):
+            per_track_max = (
+                pd.Series(sp)
+                .groupby(df.sort_values(["TRACK_ID", "FRAME"])["TRACK_ID"].values)
+                .max()
+            )
+            v = per_track_max.values
+            v = v[np.isfinite(v)]
+            if v.size:
+                stats.update(
+                    speed_p50=float(np.percentile(v, 50)),
+                    speed_p95=float(np.percentile(v, 95)),
+                    speed_p99=float(np.percentile(v, 99)),
+                    speed_max=float(v.max()),
+                )
+            else:
+                stats.update(speed_p50=0.0, speed_p95=0.0, speed_p99=0.0, speed_max=0.0)
+        return stats
+
+    def _update_track_filter_widgets(self):
+        """Adjust min-track-length / max-speed selectors to the current dataset.
+
+        Also refreshes the small ``lbl_track_filters`` status label so
+        users can read the dataset's distribution at a glance.  Safe to
+        call when no data is loaded (it just clears the label).
+        """
+        stats = self._compute_dataset_track_stats()
+        self._dataset_track_stats = stats
+
+        if stats is None:
+            self.lbl_track_filters.value = "Track filters: (no tracks loaded yet)"
+            return
+
+        # ── Min-track-length SpinBox: bounds = [2, len_max] ──
+        self.min_track_length_spin.max = max(2, int(stats["len_max"]))
+        # Keep the current user value if still valid, else snap to
+        # the dataset's p95 (sensible default for "long enough").
+        cur = int(self.min_track_length_spin.value)
+        if cur < 2 or cur > int(stats["len_max"]):
+            default_min = int(np.clip(stats["len_p95"], 2, stats["len_max"]))
+            self.min_track_length_spin.value = default_min
+            self._min_track_length = default_min
+
+        # ── Max-speed FloatSlider: max = ceil(track-max × 1.1) ──
+        # Step is dynamic so the slider stays usable across datasets
+        # ranging from sub-cellular (0.5 µm/fr) to very fast (50 µm/fr).
+        speed_max = max(stats["speed_max"], 1.0) * 1.1
+        # Round up to a tidy ceiling so the slider's "off" position
+        # sits clearly above the dataset's noise floor.
+        if speed_max <= 5:
+            slider_max = float(np.ceil(speed_max * 10) / 10)
+            step = 0.1
+        elif speed_max <= 50:
+            slider_max = float(np.ceil(speed_max))
+            step = 0.5
+        else:
+            slider_max = float(np.ceil(speed_max / 10) * 10)
+            step = 1.0
+        self.max_speed_slider.max = slider_max
+        self.max_speed_slider.step = step
+        # Keep the current user value if still in range, else snap to
+        # p99 (drops only the noisiest 1% of tracks).  When the
+        # existing state is "off" (inf) and the user is sitting at
+        # the slider's previous top, we also snap into range.
+        cur = float(self.max_speed_slider.value)
+        was_off = not np.isfinite(self._max_speed)
+        if cur > slider_max or (was_off and cur >= slider_max - 1e-9):
+            default_speed = float(np.clip(stats["speed_p99"], 0.0, slider_max))
+            self.max_speed_slider.value = default_speed
+            self._max_speed = default_speed
+
+        # ── Refresh stats label ──
+        self.lbl_track_filters.value = (
+            f"Dataset: {stats['n_tracks']:,} tracks | "
+            f"len {stats['len_min']}\u2013{stats['len_max']} "
+            f"(p50 {stats['len_p50']}, p95 {stats['len_p95']}) | "
+            f"max-speed {stats['speed_max']:.2f} \u00b5m/fr "
+            f"(p50 {stats['speed_p50']:.2f}, p99 {stats['speed_p99']:.2f})"
+        )
+
+    def _compute_filtered_track_ids(
+        self,
+        min_track_length: int | None = None,
+        max_speed: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return (kept_ids, dropped_ids) under the given thresholds.
+
+        Uses the dataset stats from ``_compute_dataset_track_stats`` so
+        the numbers stay consistent with the filter widgets.  Pass
+        explicit ``min_track_length`` / ``max_speed`` to test alternate
+        thresholds (the export uses this to snapshot the user's
+        current values without going through the GUI).
+
+        Returns
+        -------
+        kept_ids : int64 array of TRACK_IDs that pass the filters
+        dropped_ids : int64 array of TRACK_IDs that fail (any criterion)
+        """
+        stats = self._compute_dataset_track_stats()
+        if stats is None:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+        if min_track_length is None:
+            min_track_length = int(self._min_track_length)
+        if max_speed is None:
+            max_speed = float(self._max_speed)
+
+        # Re-derive per-track length + max speed from the cached stats.
+        # We need per-track length, which isn't in stats — compute it
+        # once, here, with a numpy pass.
+        if self.spots is None or "TRACK_ID" not in self.spots.columns:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+        df = self.spots.dropna(subset=["TRACK_ID"])
+        if df.empty:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+
+        # Per-track length
+        tids = df["TRACK_ID"].values
+        if tids.dtype.kind == 'f':
+            valid = ~np.isnan(tids)
+            tids = tids[valid].astype(np.int64)
+        else:
+            tids = tids.astype(np.int64)
+        unique_tids, counts = np.unique(tids, return_counts=True)
+        length_pass = counts >= int(min_track_length)
+
+        # Per-track max speed comes straight from stats (computed in
+        # _compute_dataset_track_stats, keyed on sorted (tid, frame)
+        # numpy array — re-use the same loop).
+        sp = self._compute_track_speed(
+            df.sort_values(["TRACK_ID", "FRAME"])
+        )
+        sp = np.where(np.isnan(sp), 0.0, sp)
+        per_track_max = (
+            pd.Series(sp)
+            .groupby(
+                df.sort_values(["TRACK_ID", "FRAME"])["TRACK_ID"].values,
+                sort=False,
+            )
+            .max()
+        )
+        per_track_max = per_track_max.reindex(unique_tids).fillna(0.0)
+        if np.isfinite(max_speed):
+            speed_pass = per_track_max.le(max_speed).values
+        else:
+            speed_pass = np.ones(len(unique_tids), dtype=bool)
+
+        keep_mask = length_pass & speed_pass
+        kept = unique_tids[keep_mask]
+        dropped = unique_tids[~keep_mask]
+        return (
+            np.asarray(kept, dtype=np.int64),
+            np.asarray(dropped, dtype=np.int64),
+        )
+
+    def _refresh_filter_count_label(self) -> None:
+        """Update the count of filtered tracks shown next to the widgets."""
+        lbl = getattr(self, "lbl_track_filter_count", None)
+        if lbl is None:
+            return
+        kept, dropped = self._compute_filtered_track_ids()
+        total = kept.size + dropped.size
+        if total == 0:
+            lbl.value = "Filtered: (no tracks)"
+            return
+        n_drop = int(dropped.size)
+        n_keep = int(kept.size)
+        pct = (n_drop / total * 100) if total else 0.0
+        # When nothing is filtered out, hide the count to keep the panel
+        # uncluttered — only show the number when the user is actually
+        # narrowing the dataset.
+        if n_drop == 0:
+            lbl.value = f"Track filters: keeping all {total:,} tracks"
+        else:
+            lbl.value = (
+                f"Track filters: keeping {n_keep:,} / {total:,} "
+                f"({n_drop:,} filtered out, {pct:.1f}%)"
+            )
+
     def _reset_downstream(self):
         """Clear orientation / sphere / ROI state after new data load."""
         self.animal_pole = None
@@ -4588,6 +5585,11 @@ class EmbryoViewer:
                 self.max_tracks_slider.max = n_tracks
                 self.max_tracks_slider.value = n_tracks
                 self._max_tracks = n_tracks
+
+            # Auto-adjust the new track-filter selectors to the dataset
+            # (track-length range + per-track max-speed range).
+            self._update_track_filter_widgets()
+            self._refresh_filter_count_label()
 
     def _load_spots_from_ui(self):
         """Open a file dialog to load a spots CSV (background thread)."""
@@ -4870,6 +5872,44 @@ class EmbryoViewer:
         )
         self.track_width_slider.changed.connect(self._on_track_width_changed)
 
+        # ── Track-quality filters (auto-adjusted to dataset) ──
+        # Min track length (frames). Default 3 matches the original
+        # hard-coded minimum; upper bound is set when data loads so the
+        # slider always spans the full range of the current dataset.
+        #
+        # IMPORTANT: the spinbox minimum is 1, NOT 2.  If it were 2 the
+        # widget would silently rewrite the user's in-progress input
+        # (e.g. typing "1" then "0" to enter 10 would snap the "1" to
+        # "2" the moment it's committed).  The ≥2 guard lives in the
+        # filter logic below instead, so the user can type any value
+        # without surprise reformatting.
+        self.min_track_length_spin = SpinBox(
+            value=3, min=1, max=9999, step=1, label="Min track length (frames)"
+        )
+        self.min_track_length_spin.changed.connect(self._on_min_track_length_changed)
+
+        # Max instantaneous speed (µm/frame).  Drops tracks whose
+        # maximum single-frame displacement exceeds the threshold —
+        # typically a robust way to remove tracking artefacts /
+        # segmentation swaps.  Upper bound and step are derived from
+        # the dataset's per-track p99 of max speed when data loads.
+        self.max_speed_slider = FloatSlider(
+            value=100.0,
+            min=0.0,
+            max=100.0,
+            step=0.5,
+            label="Max speed µm/frame (≤ keeps)",
+        )
+        self.max_speed_slider.changed.connect(self._on_max_speed_changed)
+
+        # Tiny stats line so the user can read what the data look like
+        # before deciding on thresholds.
+        self.lbl_track_filters = Label(value="Track filters: (no data loaded yet)")
+
+        # Dedicated count label — sits right under the stats label so
+        # the user always sees how many tracks are being filtered out.
+        self.lbl_track_filter_count = Label(value="Filtered: (computing…)")
+
         # ── Track time range ──
         self.track_frame_start = FloatSlider(
             value=fmin_data, min=fmin_data, max=fmax_data, step=1, label="Track start frame"
@@ -5022,6 +6062,12 @@ class EmbryoViewer:
         # ── Export & Video ──
         btn_export = PushButton(text="Export Enriched CSV")
         btn_export.changed.connect(self._export)
+        # Export tracks/spots tagged with the current min-length +
+        # max-speed filter state.  Dropped rows stay in the file but
+        # get a ``FILTERED_OUT`` flag + ``FILTER_REASON`` so downstream
+        # tools can audit the threshold choice.
+        btn_export_filtered = PushButton(text="Export Filtered Tracks (flagged)")
+        btn_export_filtered.changed.connect(self._export_filtered)
         self.lbl_export = Label(value="")
         self.render_scale_slider = FloatSlider(
             value=2.0, min=1.0, max=4.0, step=0.5,
@@ -5061,6 +6107,11 @@ class EmbryoViewer:
                 self.display_pct_slider,
                 self.max_tracks_slider,
                 self.track_width_slider,
+                Label(value="━━ TRACK FILTERS ━━"),
+                self.min_track_length_spin,
+                self.max_speed_slider,
+                self.lbl_track_filters,
+                self.lbl_track_filter_count,
                 Label(value="━━ TRACK SELECTION ━━"),
                 btn_select_track,
                 btn_clear_selection,
@@ -5115,6 +6166,7 @@ class EmbryoViewer:
                 btn_color_tracked,
                 Label(value="── Export & Video ──"),
                 btn_export,
+                btn_export_filtered,
                 self.render_scale_slider,
                 self.duration_slider,
                 btn_record_video,
@@ -5711,6 +6763,70 @@ class EmbryoViewer:
         if seg_lyr is not None:
             try:
                 seg_lyr._data = frame
+            except Exception:
+                pass
+
+    def _swap_processed_at_time(self, t: int) -> None:
+        """Push processed frame *t* to its vispy node + layer._data.
+
+        Idempotent and safe to call even if processed wasn't loaded.
+
+        Has a dynamic vispy-node fallback: the cached node reference
+        (``self._vispy_processed_volume``) can be ``None`` if the initial
+        lookup at load time ran before vispy finished wiring up the
+        layer's visual — in that case we look the node up live from
+        ``canvas.layer_to_visual`` so the swap still works.
+
+        Falls back to assigning ``layer.data = frame`` if neither path
+        yields a vispy node, so the layer still scrolls even without
+        the GPU-texture shortcut.
+        """
+        processed_frames = self._processed_frames
+        if processed_frames is None or not (0 <= t < len(processed_frames)):
+            return
+
+        frame = processed_frames[t]
+
+        # ── 1. Try the cached vispy node ─────────────────────────────
+        processed_vol = self._vispy_processed_volume
+        swapped = False
+        if processed_vol is not None and hasattr(processed_vol, "set_data"):
+            try:
+                processed_vol.set_data(frame)
+                swapped = True
+            except Exception:
+                processed_vol = None
+
+        # ── 2. Dynamic lookup if cached was missing or stale ─────────
+        if not swapped and self._processed_layer is not None:
+            try:
+                qt_viewer = self.viewer.window._qt_viewer
+                canvas = qt_viewer.canvas
+                vl = canvas.layer_to_visual.get(self._processed_layer)
+                if vl is not None and hasattr(vl, "node") \
+                        and hasattr(vl.node, "set_data"):
+                    vl.node.set_data(frame)
+                    # Cache it for next time
+                    self._vispy_processed_volume = vl.node
+                    swapped = True
+                    try:
+                        canvas.native.update()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # ── 3. Last-resort: assign through napari's data setter ──────
+        if not swapped and self._processed_layer is not None:
+            try:
+                self._processed_layer.data = frame
+            except Exception:
+                pass
+
+        # ── 4. Sync napari's internal _data reference ────────────────
+        if self._processed_layer is not None:
+            try:
+                self._processed_layer._data = frame
             except Exception:
                 pass
 
@@ -6624,6 +7740,24 @@ class EmbryoViewer:
         )
         self._schedule_track_rebuild()
 
+    def _on_min_track_length_changed(self):
+        """Handle min-track-length spinbox change (debounced)."""
+        v = int(self.min_track_length_spin.value)
+        # Enforce ≥2 (a track needs at least 2 points to be a track).
+        self._min_track_length = max(2, v)
+        self._refresh_filter_count_label()
+        self._schedule_track_rebuild()
+
+    def _on_max_speed_changed(self):
+        """Handle max-speed slider change (debounced)."""
+        v = float(self.max_speed_slider.value)
+        # Treat the slider's own max as "off" — keeps a sensible upper
+        # bound instead of forcing inf through the rest of the code.
+        slider_max = float(self.max_speed_slider.max)
+        self._max_speed = v if v < slider_max - 1e-9 else float("inf")
+        self._refresh_filter_count_label()
+        self._schedule_track_rebuild()
+
     def _schedule_track_rebuild(self):
         """Debounce track rebuilds — waits 200ms after last slider change."""
         from qtpy.QtCore import QTimer
@@ -7124,6 +8258,218 @@ class EmbryoViewer:
             files = self._pending_export_files or []
             self.lbl_export.value = f"Exported {len(files)} files to {out_dir}/"
             self.viewer.status = f"Exported: {', '.join(files)}"
+
+        QTimer.singleShot(500, _poll)
+
+    def _export_filtered(self):
+        """Export a filtered CSV that FLAGS dropped tracks instead of removing them.
+
+        Produces three CSVs (parallel to the regular export) under
+        ``analysis_output/``:
+
+          * ``oriented_filtered_spots.csv``  — every spot with two new
+            columns: ``FILTERED_OUT`` (bool) and ``FILTER_REASON``
+            ("" | "min_length" | "max_speed" | "both").
+          * ``oriented_filtered_tracks.csv`` — same shape, but only the
+            rows belonging to filtered-out tracks.  Dropped tracks are
+            included verbatim so downstream tooling can audit them.
+          * ``oriented_filtered_summary.csv`` — per-track summary that
+            always includes ``FILTERED_OUT`` + ``FILTER_REASON`` so
+            users can see at a glance how many tracks dropped on each
+            criterion.
+
+        Runs in a background thread so the GUI stays responsive.
+        """
+        from qtpy.QtCore import QTimer
+
+        if self.spots is None:
+            self.viewer.status = "Load spots first!"
+            return
+
+        # Snapshot filter state and data on the GUI thread so the
+        # background thread can run free.
+        out_dir = Path("analysis_output")
+        out_dir.mkdir(exist_ok=True)
+
+        self.lbl_export.value = "Exporting filtered CSV (please wait)..."
+        self.viewer.status = "Exporting filtered tracks in background..."
+
+        spots_df = self.spots.copy()
+        min_length = int(self._min_track_length)
+        max_speed = float(self._max_speed)
+        # Per-track stats already cached by the GUI — compute fresh in
+        # the worker thread to keep the snapshot small.  We deliberately
+        # do NOT capture self._per_track_stats here because the worker
+        # may run on a different pandas/sort version.
+
+        self._pending_filtered_err = None
+        self._pending_filtered_files = None
+
+        def _bg():
+            try:
+                files_written = []
+
+                # 1. Per-track length + per-track max speed
+                if "TRACK_ID" not in spots_df.columns:
+                    raise ValueError(
+                        "No TRACK_ID column — cannot apply track filters."
+                    )
+
+                df = spots_df.dropna(subset=["TRACK_ID"]).copy()
+                if df.empty:
+                    raise ValueError("No tracked rows to filter.")
+
+                df_sorted = df.sort_values(["TRACK_ID", "FRAME"]).reset_index(
+                    drop=True
+                )
+                track_len = (
+                    df_sorted.groupby("TRACK_ID")["FRAME"].transform("count")
+                )
+
+                sp = self._compute_track_speed(df_sorted)
+                track_max_speed = (
+                    pd.Series(sp)
+                    .groupby(df_sorted["TRACK_ID"].values, sort=False)
+                    .max()
+                )
+                track_max_speed = track_max_speed.reindex(
+                    df_sorted["TRACK_ID"].unique()
+                )
+
+                # 2. Per-track filter verdict + reason
+                unique_tids = df_sorted["TRACK_ID"].unique()
+                length_pass = track_len >= min_length
+                if np.isfinite(max_speed):
+                    speed_pass = (
+                        df_sorted["TRACK_ID"].map(track_max_speed)
+                        .le(max_speed)
+                        .values
+                    )
+                else:
+                    speed_pass = np.ones(len(df_sorted), dtype=bool)
+
+                keep_mask = length_pass & speed_pass
+                # Per-row reason (only for dropped rows; kept rows = "")
+                reason = np.empty(len(df_sorted), dtype=object)
+                reason[:] = ""
+                fail_len = ~length_pass.values & ~speed_pass
+                fail_spd = length_pass.values & ~speed_pass
+                fail_both = ~length_pass.values & ~speed_pass
+                reason[fail_len] = "min_length"
+                reason[fail_spd] = "max_speed"
+                reason[fail_both] = "both"
+
+                df_sorted = df_sorted.copy()
+                df_sorted["FILTERED_OUT"] = ~keep_mask.values
+                df_sorted["FILTER_REASON"] = reason
+                # Put the new flags at the front for easy grepping
+                front = ["FILTERED_OUT", "FILTER_REASON", "TRACK_ID", "FRAME"]
+                cols = front + [c for c in df_sorted.columns if c not in front]
+                df_sorted = df_sorted[cols]
+
+                # 3. Full annotated spots CSV (every spot, flagged)
+                df_sorted.to_csv(
+                    out_dir / "oriented_filtered_spots.csv", index=False
+                )
+                files_written.append("oriented_filtered_spots.csv")
+
+                # 4. Filtered-out-only tracks (kept verbatim for audit)
+                df_sorted[df_sorted["FILTERED_OUT"]].to_csv(
+                    out_dir / "oriented_filtered_tracks.csv", index=False
+                )
+                files_written.append("oriented_filtered_tracks.csv")
+
+                # 5. Per-track summary with verdict + reason
+                grp = df_sorted.groupby("TRACK_ID")
+                track_summary = grp.agg(
+                    n_spots=("FRAME", "count"),
+                    frame_start=("FRAME", "min"),
+                    frame_end=("FRAME", "max"),
+                    mean_x=("POSITION_X", "mean"),
+                    mean_y=("POSITION_Y", "mean"),
+                    mean_z=("POSITION_Z", "mean"),
+                    FILTERED_OUT=("FILTERED_OUT", "first"),
+                    FILTER_REASON=("FILTER_REASON", "first"),
+                )
+                # Add per-track max_speed from our pre-computed series
+                track_summary["max_speed_um_per_frame"] = track_max_speed
+                track_summary.to_csv(
+                    out_dir / "oriented_filtered_summary.csv"
+                )
+                files_written.append("oriented_filtered_summary.csv")
+
+                # 6. Brief JSON metadata so the R pipeline can audit
+                # the threshold choices without re-parsing CSVs.
+                n_drop = int((~keep_mask).sum())
+                n_kept = int(keep_mask.sum())
+                meta = {
+                    "filter": {
+                        "min_track_length": int(min_length),
+                        "max_speed_um_per_frame": (
+                            float(max_speed)
+                            if np.isfinite(max_speed)
+                            else None
+                        ),
+                    },
+                    "n_spots_total": int(len(df_sorted)),
+                    "n_spots_kept": n_kept,
+                    "n_spots_filtered": n_drop,
+                    "n_tracks_total": int(len(unique_tids)),
+                    "n_tracks_filtered": int(
+                        df_sorted.loc[
+                            df_sorted["FILTERED_OUT"], "TRACK_ID"
+                        ].nunique()
+                    ),
+                    "csv_files": files_written,
+                }
+                with open(
+                    out_dir / "filter_metadata.json", "w"
+                ) as f:
+                    json.dump(meta, f, indent=2, default=str)
+                files_written.append("filter_metadata.json")
+
+                self._pending_filtered_files = files_written
+            except Exception as e:
+                self._pending_filtered_err = str(e)
+
+        t = threading.Thread(target=_bg, daemon=True)
+        t.start()
+
+        def _poll():
+            if t.is_alive():
+                QTimer.singleShot(500, _poll)
+                return
+            if self._pending_filtered_err:
+                self.lbl_export.value = (
+                    f"Filtered export error: {self._pending_filtered_err}"
+                )
+                self.viewer.status = (
+                    f"Filtered export failed: {self._pending_filtered_err}"
+                )
+                return
+            files = self._pending_filtered_files or []
+            n_drop = None
+            try:
+                import json as _json
+                meta = _json.loads(
+                    (out_dir / "filter_metadata.json").read_text()
+                )
+                n_drop = meta.get("n_spots_filtered")
+                n_kept = meta.get("n_spots_kept")
+            except Exception:
+                pass
+            if n_drop is not None and n_kept is not None:
+                self.lbl_export.value = (
+                    f"Exported {len(files)} filtered files (kept "
+                    f"{n_kept:,}, filtered {n_drop:,})"
+                )
+            else:
+                self.lbl_export.value = (
+                    f"Exported {len(files)} filtered files to {out_dir}/"
+                )
+            self.viewer.status = (
+                f"Filtered export: {', '.join(files)}"
+            )
 
         QTimer.singleShot(500, _poll)
 
