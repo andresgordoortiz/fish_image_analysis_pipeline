@@ -69,6 +69,8 @@ Toggles to control what runs (set to `true` / `false`):
 | --- | --- |
 | `preprocessing.enabled` | Shading + Z correction + deconvolution (or Self-Net) |
 | `roi_cropping.enabled`  | Crop every timepoint to a Fiji `.roi` rectangle |
+| `downscaling.enabled`   | XY downscale applied BEFORE segmentation (uses `downscaling.factor`) |
+| `raw_export.enabled`    | Export the raw input sliced-isotropic + downscaled for `ultrack_viewer.py --processed` (independent of preprocessing) |
 | `segmentation.enabled`  | Cellpose 3D segmentation |
 | `tracking.enabled`      | ultrack cell tracking (needs segmentation on) |
 | `benchmark.enabled`     | Per-timepoint timing/memory report |
@@ -123,8 +125,11 @@ my_experiment/
 ├── 00_split_input/        # per-timepoint TIFFs (if you gave a hyperstack)
 ├── 00_cropped/            # only if roi_cropping.enabled
 ├── 00b_isotropic/         # only if preprocessing.isotropic_reslice and preprocessing off
+├── 00c_downscaled/        # only if downscaling.enabled and preprocessing off
 ├── 01_preprocessed/       # the isotropic, normalised volumes
 │   └── *_processed.tif
+├── 01b_raw_isotropic/     # only if raw_export.enabled — RAW signal, sliced isotropic + downscaled
+│   └── *_raw_iso_Channel*.tif        (use this with --processed in the viewer to overlay tracks on raw)
 ├── 02_segmented/          # Cellpose label volumes
 ├── 02_segmented_downscaled/   # only if segmentation.downscale_labels < 1
 ├── 03_tracking/           # only if tracking.enabled
@@ -149,6 +154,47 @@ rsync -avh --progress \
 ```
 
 `/groups/pinheiro/user/` is the main server; it is backed up and shared. **Don't run pipeline jobs from there** — that is what scratch is for. Only move finished results back.
+
+### 1.9 Overlay tracks on the **RAW** signal (`raw_export`)
+
+The preprocessed chain (`01_preprocessed/`) applies shading correction,
+Z intensity correction, deconvolution / Self-Net deblurring, etc.
+That's great for segmentation, but when you want to **interpret** a
+track — confirming whether a cell actually ingressed, judging whether a
+jump is a real movement or a segmentation artefact — you want to see
+the tracks on the **raw** signal, not on the processed one.
+
+`raw_export` writes a parallel, downscaled + isotropic copy of the
+raw input under `01b_raw_isotropic/`. It is fully independent of the
+preprocessing chain (no shading correction, no CLAHE, no
+deconvolution — just the same `XY cubic rescale + optional
+isotropic Z resample` used by `DOWNSCALE_XY`, applied to the RAW
+input).
+
+```json
+{
+  "raw_export": {
+    "enabled": true,
+    "factor": 0.33,
+    "isotropic_reslice": true
+  }
+}
+```
+
+| Field | What it does |
+| --- | --- |
+| `enabled`        | Turns the export on (`true`) / off (`false`). Off by default — you opt in. |
+| `factor`         | XY scale factor (<1.0 = downscale). Pick a value appropriate for napari display (typically `0.25`–`0.5` for a multi-GB acquisition). |
+| `isotropic_reslice` | Resample Z so the voxel size matches the downscaled XY pixel size. Required for correct registration with the tracks (tracks are emitted in isotropic coordinates). |
+
+Output goes to `01b_raw_isotropic/<name>_raw_iso_Channel*.tif`
+(per-timepoint ImageJ TIFFs matching the same voxel geometry as the
+preprocessed chain) plus the merged `4D_hyperstack_raw_iso.tif` when
+`output.skip_merge = false`.
+
+> The preprocessed chain is **not** affected — it still operates on
+> the original-resolution raw input. The raw export is a purely
+> additive overlay for visualisation.
 
 ---
 
@@ -194,9 +240,9 @@ The viewer accepts three layers that are all optional but work best together:
 | ------- | -------------- | ------------ |
 | Tracks  | `--tracks`     | `03_tracking/results/tracks.csv` |
 | Labels  | `--segments`   | `03_tracking/results/segments.zarr` |
-| Volume  | `--processed`  | `01_preprocessed/<name>_processed.tif` |
+| Volume  | `--processed`  | `01_preprocessed/<name>_processed.tif` (or `01b_raw_isotropic/4D_hyperstack_raw_iso.tif` if you enabled `raw_export`) |
 
-A typical launch:
+A typical launch on the preprocessed volume:
 
 ```powershell
 mamba activate ultrack-viewer
@@ -208,6 +254,23 @@ python ultrack_viewer.py `
     --preload `
     --load-downsample 2
 ```
+
+To overlay the tracks on the **raw** signal instead (so you can see
+the unprocessed intensity under the nuclei), swap the `--processed`
+path to the raw export:
+
+```powershell
+python ultrack_viewer.py `
+    --tracks    03_tracking\results\tracks.csv `
+    --segments  03_tracking\results\segments.zarr `
+    --processed 01b_raw_isotropic\4D_hyperstack_raw_iso.tif `
+    --preload `
+    --load-downsample 2
+```
+
+Both volumes share the same voxel geometry (isotropic + same
+downscaling), so the cross-section viewer and the sphere overlay
+work identically against either layer.
 
 Flag cheatsheet:
 

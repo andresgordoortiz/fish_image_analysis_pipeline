@@ -296,7 +296,7 @@ def main():
 
     # 1. Parse Inputs
     if len(sys.argv) < 3 or len(sys.argv) > 4:
-        sys.exit("Usage: merge.py <metadata.json> <config.json> [processed|segmented]")
+        sys.exit("Usage: merge.py <metadata.json> <config.json> [processed|segmented|raw_iso]")
 
     meta_path = sys.argv[1]
     config_path = sys.argv[2]
@@ -318,8 +318,17 @@ def main():
     elif data_type == "segmented":
         file_pattern = "t*_segmented.tif"
         label = "segmented"
+    elif data_type == "raw_iso":
+        # Raw, downscaled, isotropic input exported by EXPORT_RAW_ISOTROPIC.
+        # Same geometric ops as the preprocessed chain (so the voxel sizes
+        # are computed identically below) but on the UNCORRECTED signal.
+        file_pattern = "t*_raw_iso_Channel*.tif"
+        label = "raw_iso"
     else:
-        sys.exit(f"Unknown data_type '{data_type}'. Use 'processed' or 'segmented'.")
+        sys.exit(
+            f"Unknown data_type '{data_type}'. "
+            f"Use 'processed', 'segmented', or 'raw_iso'."
+        )
 
     seg_files = sorted(Path(".").glob(file_pattern))
     if not seg_files:
@@ -353,7 +362,12 @@ def main():
     # Calculate resolutions
     # When preprocessing is skipped, image_scaling was never applied — use 1.0
     skip_preproc = config.get("preprocessing", {}).get("skip_preprocessing", False)
-    scaling = 1.0 if skip_preproc else config.get("preprocessing", {}).get("image_scaling", 1.0)
+    if data_type == "raw_iso":
+        # Raw export uses its own XY scale factor (raw_export.factor) — NOT the
+        # preprocessing image_scaling. Falls back to downscaling.factor / 1.0.
+        scaling = config.get("raw_export", {}).get("factor", 1.0)
+    else:
+        scaling = 1.0 if skip_preproc else config.get("preprocessing", {}).get("image_scaling", 1.0)
 
     # Metadata stores the ORIGINAL (pre-processing) resolution in microns
     vox_x = meta.get("x_resolution_um", 1.0) / scaling

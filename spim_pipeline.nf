@@ -179,6 +179,18 @@ if (downscaling_enabled && config.downscaling?.factor == null) {
     log.error "downscaling.enabled=true requires downscaling.factor"
     exit 1
 }
+
+// Raw export — produce a downscaled + isotropic version of the RAW (unprocessed)
+// input for overlaying with tracks in ultrack_viewer.py. Runs INDEPENDENTLY of
+// preprocessing/segmentation/tracking; the preprocessed chain still operates on
+// the original-resolution raw input. Purely additive.
+def raw_export_enabled  = config.raw_export?.enabled == true
+def raw_export_factor   = config.raw_export?.factor != null ? (config.raw_export.factor as Double) : 0.33d
+def raw_export_iso      = config.raw_export?.isotropic_reslice != null ? (config.raw_export.isotropic_reslice as Boolean) : true
+if (raw_export_enabled && (raw_export_factor <= 0.0d || raw_export_factor > 1.0d)) {
+    log.error "raw_export.factor must be greater than 0 and at most 1.0, got: ${raw_export_factor}"
+    exit 1
+}
 if (downscaling_factor <= 0.0d || downscaling_factor > 1.0d) {
     log.error "downscaling.factor must be greater than 0 and at most 1.0, got: ${downscaling_factor}"
     exit 1
@@ -353,6 +365,7 @@ def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stit
 def tracking_info = skip_tracking ? "SKIPPED" : "Enabled (ultrack)"
 def debug_info = run_debug_preprocessing ? "ENABLED (nuclei tracking per stage)" : "Disabled"
 def preproc_info = skip_preprocessing ? (preprocessed_dir ? "SKIPPED (using ${preprocessed_dir})" : "SKIPPED (using raw input)") : "Enabled"
+def raw_export_info = raw_export_enabled ? "Enabled (factor=${raw_export_factor}, iso=${raw_export_iso})" : "Disabled"
 
 log.info """
 ================================================
@@ -370,6 +383,7 @@ Seg mode     : ${seg_mode_info}
 Preprocess   : ${preproc_info}
 Tracking     : ${tracking_info}
 Debug preproc: ${debug_info}
+Raw export   : ${raw_export_info}
 ================================================
 """.stripIndent()
 
@@ -1232,6 +1246,128 @@ tifffile.imwrite(
         'XYDownscaled': True,
         'ScalingFactor': scale,
         'IsotropicResliced': bool(do_iso),
+    },
+)
+print(f"Wrote {out_name}")
+PYTHON_EOF
+    """
+}
+
+// ============================================================================
+// PROCESS: Export the RAW (unprocessed) input, sliced isotropic and downscaled
+//
+// Independent of the preprocessing chain: takes the post-ROI-crop raw input,
+// applies the same XY cubic rescale + optional isotropic Z resample as
+// DOWNSCALE_XY, and writes a per-timepoint TIFF with ImageJ metadata that
+// matches what ultrack_viewer.py expects via its --processed flag.
+//
+// Use this when you want to overlay tracks on the ORIGINAL (raw) signal
+// rather than the preprocessed one. The preprocessed chain still runs as
+// usual — this step is purely additive.
+// ============================================================================
+
+process EXPORT_RAW_ISOTROPIC {
+    tag "t${String.format('%04d', timepoint)}"
+
+    maxRetries 2
+    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+
+    publishDir "${params.output_dir}/01b_raw_isotropic",
+        mode: 'copy',
+        pattern: "t*_raw_iso_Channel*.tif"
+    publishDir "${params.output_dir}/logs/raw_export",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    tuple val(timepoint), path(image_file)
+    path metadata_json
+    val scale_factor
+    val reslice_isotropic
+
+    output:
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_raw_iso_Channel*.tif"), emit: raw_iso
+    path "t${String.format('%04d', timepoint)}_raw_iso.log", emit: log
+
+    script:
+    def t_formatted = String.format('%04d', timepoint)
+    def filename = image_file.name
+    def scale_factor_py = (scale_factor as Double).toString()
+    def reslice_py = reslice_isotropic ? 'True' : 'False'
+    """
+    #!/bin/bash
+    set -euo pipefail
+    exec > >(tee t${t_formatted}_raw_iso.log) 2>&1
+
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    python3 << 'PYTHON_EOF'
+import json
+import re as _re
+import numpy as np
+import tifffile
+from skimage.transform import rescale
+
+with open('${metadata_json}', 'r') as f:
+    metadata = json.load(f)
+
+xy_pixel_in = float(metadata['x_resolution_um'])
+z_pixel_in  = float(metadata['imagej']['spacing']) if 'imagej' in metadata else 1.0
+scale = float(${scale_factor_py})
+do_iso = (${reslice_py} == 'True')
+
+if not (0.0 < scale <= 1.0):
+    raise SystemExit(f"scale_factor must satisfy 0 < scale <= 1, got {scale}")
+
+img = tifffile.imread('${filename}')
+if img.ndim != 3:
+    raise SystemExit(f"Expected 3D ZYX input, got shape {img.shape}")
+print(f"Input  shape: {img.shape}, dtype: {img.dtype}, scale={scale}")
+
+# IMPORTANT: do NOT apply CLAHE/normalisation here — this is RAW export.
+# Only the geometric ops (XY cubic rescale + isotropic Z resample) so the
+# viewer can register tracks against the original signal.
+out = rescale(img, (1.0, scale, scale), order=3,
+              preserve_range=True, anti_aliasing=True)
+x_res = xy_pixel_in / scale
+y_res = float(metadata['y_resolution_um']) / scale
+print(f"After XY rescale: {out.shape}  X/Y pixel size -> {x_res:.4f} x {y_res:.4f} µm")
+
+if do_iso:
+    zoom_z = z_pixel_in / x_res
+    if abs(zoom_z - 1.0) < 1e-3:
+        print("Z already isotropic, skipping.")
+    else:
+        from scipy.ndimage import zoom as ndi_zoom
+        new_z = int(round(out.shape[0] * zoom_z))
+        print(f"Isotropic Z reslice: {out.shape[0]} -> {new_z} (zoom_z={zoom_z:.4f})")
+        out = ndi_zoom(out, (zoom_z, 1.0, 1.0), order=1, prefilter=False)
+
+if out.dtype != np.uint16:
+    out = np.clip(out.astype(np.int32), 0, 65535).astype(np.uint16)
+
+m = _re.search(r'_Channel\\s*(\\d+)', '${filename}')
+channel = m.group(1) if m else '1'
+out_name = f"t${t_formatted}_raw_iso_Channel {channel}.tif"
+
+tifffile.imwrite(
+    out_name,
+    out,
+    imagej=True,
+    resolution=(1.0/x_res, 1.0/y_res),
+    metadata={
+        'spacing': z_pixel_in if not do_iso else x_res,
+        'unit': 'um',
+        'axes': 'ZYX',
+        'TimePoint': ${timepoint},
+        'WasROICropped': metadata.get('was_roi_cropped', False),
+        'RawExported': True,
+        'ScalingFactor': scale,
+        'IsotropicResliced': bool(do_iso),
+        'PipelineStage': 'raw_export',
     },
 )
 print(f"Wrote {out_name}")
@@ -2180,8 +2316,11 @@ process MERGE_TO_HYPERSTACK {
     maxRetries 2
     errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
-    publishDir "${params.output_dir}/${data_type == 'processed' ? '01_preprocessed' : '02_segmented'}",
-        mode: 'copy'
+    publishDir "${params.output_dir}/${
+        data_type == 'processed' ? '01_preprocessed' :
+        data_type == 'raw_iso'   ? '01b_raw_isotropic' :
+                                   '02_segmented'
+    }", mode: 'copy'
 
     input:
     tuple val(data_type), path(input_files)
@@ -3187,6 +3326,25 @@ workflow {
     // Share the same metadata with all timepoints
     shared_metadata = EXTRACT_METADATA.out.metadata
 
+    // 1b. OPTIONAL: Raw export — produce a downscaled + isotropic version of
+    //     the RAW (unprocessed) input for overlaying tracks in ultrack_viewer.
+    //     Runs on processing_input (post-ROI-crop) so it sees the same
+    //     bounding box as segmentation. INDEPENDENT of preprocessing,
+    //     segmentation and tracking — purely additive.
+    raw_iso_input = null
+    if (raw_export_enabled) {
+        log.info "Raw export ENABLED — producing downscaled+isotropic RAW volumes for track overlay (factor=${raw_export_factor}, iso=${raw_export_iso})"
+        EXPORT_RAW_ISOTROPIC(
+            processing_input,
+            shared_metadata,
+            raw_export_factor,
+            raw_export_iso
+        )
+        raw_iso_input = EXPORT_RAW_ISOTROPIC.out.raw_iso
+    } else {
+        log.info "Raw export disabled (set raw_export.enabled=true in config.json to enable)"
+    }
+
     if (skip_preprocessing) {
         // ---- Skip preprocessing ----
         if (preprocessed_dir) {
@@ -3405,6 +3563,23 @@ workflow {
                     merge_script_ch.collect()
                 )
             }
+
+            // 5b. OPTIONAL: Merge the raw isotropic export (if enabled) into a
+            //     single 4D TIFF that the viewer can open via --processed.
+            //     Independent of segmentation / tracking — runs whenever the
+            //     raw_export step was launched and merge is on.
+            if (raw_export_enabled && raw_iso_input != null) {
+                log.info "Merging raw isotropic export into 4D hyperstack"
+                raw_iso_merge_ch = raw_iso_input
+                    .map { timepoint, f -> f }
+                    .collect()
+                    .map { files -> tuple('raw_iso', files) }
+                MERGE_TO_HYPERSTACK(
+                    raw_iso_merge_ch,
+                    shared_metadata,
+                    merge_script_ch.collect()
+                )
+            }
         } else {
             log.info "Hyperstack merging SKIPPED (skip_merge=true)"
         }
@@ -3540,6 +3715,7 @@ workflow.onComplete {
     def benchmark_status = (config.benchmark?.enabled ?: false) ? "ENABLED" : "DISABLED"
     def tracking_status = (config.tracking?.enabled ?: false) ? "ENABLED (ultrack)" : "DISABLED"
     def debug_status = (config.preprocessing?.debug_preprocessing?.enabled ?: false) ? "ENABLED" : "DISABLED"
+    def raw_export_status = raw_export_enabled ? "ENABLED (factor=${raw_export_factor}, iso=${raw_export_iso})" : "DISABLED"
 
     log.info """
     ============================================================================
@@ -3557,15 +3733,17 @@ workflow.onComplete {
     Tracking        : ${tracking_status}
     Benchmark       : ${benchmark_status}
     Debug preproc   : ${debug_status}
+    Raw export      : ${raw_export_status}
     Output dir      : ${params.output_dir}
 
     Results:
       ${config.roi_cropping?.enabled ? "- Cropped images     : ${params.output_dir}/00_cropped/" : ""}
       ${run_standalone_downscaling ? "- Downscaled input   : ${params.output_dir}/00c_downscaled/" : ""}
       - Preprocessed images : ${params.output_dir}/01_preprocessed/
+      ${raw_export_enabled ? "- Raw isotropic (for --processed in viewer): ${params.output_dir}/01b_raw_isotropic/" : ""}
       - Segmented masks     : ${params.output_dir}/02_segmented/
       ${ds_factor < 1.0 ? "- Downscaled labels  : ${params.output_dir}/02_segmented_downscaled/" : ""}
-      ${!(config.output?.skip_merge ?: false) ? "- Hyperstacks        : in 01_preprocessed/ and 02_segmented/" : ""}
+      ${!(config.output?.skip_merge ?: false) ? "- Hyperstacks        : in 01_preprocessed/, ${raw_export_enabled ? '01b_raw_isotropic/, ' : ''}and 02_segmented/" : ""}
       ${(config.tracking?.enabled ?: false) ? "- Tracking results   : ${params.output_dir}/03_tracking/" : ""}
       ${(config.benchmark?.enabled ?: false) ? "- Benchmark          : ${params.output_dir}/benchmark/" : ""}
       ${(config.preprocessing?.debug_preprocessing?.enabled ?: false) ? "- Debug nuclei report: ${params.output_dir}/debug_preprocessing/" : ""}

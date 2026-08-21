@@ -55,6 +55,15 @@
     "factor": 0.33
   },
 
+  "raw_export": {
+    "_comment": "Optional export of the RAW (unprocessed) input, sliced to be isotropic and downscaled so it can be overlaid on the tracks in ultrack_viewer.py. Runs INDEPENDENTLY of preprocessing/segmentation/tracking — the preprocessed chain still operates on the original-resolution raw input and produces its own volume. The exported raw volume is meant for visualization only (overlay with --processed in the viewer).",
+    "enabled": false,
+    "_comment_factor": "XY scale factor (<1.0 = downscale). Independent of downscaling.factor — pick a value appropriate for napari display (typically 0.25–0.5 for a multi-GB acquisition). 1.0 = no downscale.",
+    "factor": 0.33,
+    "_comment_isotropic": "Resample Z so voxels match the downscaled XY pixel size. Required for correct registration with the tracks in the viewer (tracks are emitted in isotropic coordinates).",
+    "isotropic_reslice": true
+  },
+
   "preprocessing": {
     "_comment": "Shading + Z-intensity correction + deblurring. Produces an isotropic, intensity-normalised stack ready for segmentation.",
     "enabled": true,
