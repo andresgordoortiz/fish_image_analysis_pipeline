@@ -1319,6 +1319,11 @@ z_pixel_in  = float(metadata['imagej']['spacing']) if 'imagej' in metadata else 
 scale = float(${scale_factor_py})
 do_iso = (${reslice_py} == 'True')
 
+# ── Loud diagnostics so workflow-binding mismatches surface in the log ──
+print(f"[DIAG] raw_export scale={scale}  do_iso={do_iso}  (reslice_py='${reslice_py}')")
+print(f"[DIAG] metadata x_res={xy_pixel_in}  z_spacing={z_pixel_in}  "
+      f"isotropic→x_res={xy_pixel_in/scale:.4f}  zoom_z={z_pixel_in/(xy_pixel_in/scale):.4f}")
+
 if not (0.0 < scale <= 1.0):
     raise SystemExit(f"scale_factor must satisfy 0 < scale <= 1, got {scale}")
 
