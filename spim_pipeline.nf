@@ -1342,9 +1342,26 @@ if do_iso:
         print("Z already isotropic, skipping.")
     else:
         from scipy.ndimage import zoom as ndi_zoom
-        new_z = int(round(out.shape[0] * zoom_z))
-        print(f"Isotropic Z reslice: {out.shape[0]} -> {new_z} (zoom_z={zoom_z:.4f})")
-        out = ndi_zoom(out, (zoom_z, 1.0, 1.0), order=1, prefilter=False)
+        # Pin the output shape explicitly via `output=` to guarantee the
+        # documented Z expansion. With just a float zoom factor and
+        # prefilter=False, scipy.ndimage.zoom occasionally rounds to the
+        # input size when the factor is close to (but not exactly)
+        # 1 + 1/N. Forcing the output shape removes that ambiguity.
+        expected_z = int(round(out.shape[0] * zoom_z))
+        out = ndi_zoom(
+            out,
+            (zoom_z, 1.0, 1.0),
+            order=1,
+            prefilter=False,
+            output=(expected_z, out.shape[1], out.shape[2]),
+        )
+        print(f"Isotropic Z reslice: expected={expected_z} (zoom_z={zoom_z:.4f}, got shape={out.shape})")
+        # Hard sanity check — fail loudly if the volume is wrong so
+        # the bug surfaces in the log instead of silently producing a
+        # mis-aligned volume.
+        assert out.shape[0] == expected_z, (
+            f"Z resample failed: expected {expected_z} planes, got {out.shape[0]}"
+        )
 
 if out.dtype != np.uint16:
     out = np.clip(out.astype(np.int32), 0, 65535).astype(np.uint16)
