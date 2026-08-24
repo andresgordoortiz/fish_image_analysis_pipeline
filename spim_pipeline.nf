@@ -2247,8 +2247,18 @@ if not config.get('save_npy', True):
     cmd.append('--no_npy')
 
 # Add anisotropy if specified
+# (null = isotropic, which is what the preprocessed stack is AFTER the
+# spim_pipeline_fixed.py isotropic reslice AND after we now write proper
+# ImageJ voxel-size metadata into the TIFF. Passing --anisotropy 1.0
+# explicitly tells Cellpose "voxels are isotropic, do NOT resample Z",
+# which avoids a 3x Z upsample that previously OOMed the segmentation
+# task on real-world stacks.)
 if config.get('anisotropy') is not None:
     cmd.extend(['--anisotropy', str(config['anisotropy'])])
+elif config.get('do_3d', False):
+    # Preprocessed TIFFs are nominally isotropic; force Cellpose to
+    # honour that rather than guessing from shape ratio.
+    cmd.extend(['--anisotropy', '1.0'])
 
 # Add stitch_threshold for 2D+stitch mode (only when do_3d is False)
 if config.get('stitch_threshold') is not None and not config.get('do_3d', False):

@@ -710,9 +710,26 @@ def main():
     base_name = os.path.splitext(image_name)[0]
     image_out_name = f"{base_name}_{int(100 * args.image_scaling)}.tif"
     img_out_path = os.path.join(args.outdir, image_out_name)
-    tifffile.imwrite(img_out_path, img)
+    # Write with ImageJ metadata so downstream tools (Cellpose, napari,
+    # TrackMate) read correct voxel size. After isotropic reslicing,
+    # Z spacing equals XY spacing, so Cellpose sees a true isotropic
+    # stack and skips its internal anisotropy resampling (which would
+    # otherwise OOM by tripling the Z count on stacks like ours).
+    tifffile.imwrite(
+        img_out_path,
+        img,
+        imagej=True,
+        resolution=(1.0 / physical_pixel_sizeX, 1.0 / physical_pixel_sizeY),
+        metadata={
+            'spacing': physical_pixel_sizeZ,
+            'unit': 'um',
+            'axes': 'ZYX',
+            'IsotropicResliced': True,
+        },
+    )
     t1 = time.time()
     print(f"  Saved processed image to: {img_out_path}")
+    print(f"  Voxel size written: {physical_pixel_sizeX:.4f} x {physical_pixel_sizeY:.4f} x {physical_pixel_sizeZ:.4f} um")
     print(f"[Timer] Saving image took {t1 - t0:.2f} seconds")
 
     # Validate output
