@@ -2437,10 +2437,16 @@ with open('config_temp.json', 'w') as f:
 print("✓ Config file created")
 PYTHON_CONFIG
 
-    # Run the merge for each non-empty data_type, in order
-    n_proc=\$(ls -1 stage_processed/*.tif 2>/dev/null | wc -l | tr -d ' ')
-    n_seg=\$(ls -1 stage_segmented/*.tif 2>/dev/null | wc -l | tr -d ' ')
-    n_raw=\$(ls -1 stage_raw_iso/*.tif 2>/dev/null | wc -l | tr -d ' ')
+    # Run the merge for each non-empty data_type, in order.
+    # Use `find` (not `ls *.tif`) so empty stage dirs return 0 instead of
+    # exit code 2 — otherwise `set -euo pipefail` aborts the task before
+    # the per-data-type skip branches below get a chance to run.
+    count_tifs() {
+        find "\$1" -maxdepth 1 -type f -name '*.tif' 2>/dev/null | wc -l | tr -d ' '
+    }
+    n_proc=\$(count_tifs stage_processed)
+    n_seg=\$(count_tifs stage_segmented)
+    n_raw=\$(count_tifs stage_raw_iso)
     echo "Staged: processed=\${n_proc}, segmented=\${n_seg}, raw_iso=\${n_raw}"
 
     run_merge() {
@@ -2451,7 +2457,9 @@ PYTHON_CONFIG
         else                              local dest="02_segmented"
         fi
         local n
-        n=\$(ls -1 "\$subdir"/*.tif 2>/dev/null | wc -l | tr -d ' ')
+        # Use find (not `ls *.tif`) so empty dirs return 0 instead of exit 2
+        # — set -euo pipefail would otherwise abort before this skip branch.
+        n=\$(find "\$subdir" -maxdepth 1 -type f -name '*.tif' 2>/dev/null | wc -l | tr -d ' ')
         if [ "\$n" -eq 0 ]; then
             echo "⏭  Skipping \${dt} — no staged files"
             return 0
