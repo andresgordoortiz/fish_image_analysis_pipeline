@@ -1174,7 +1174,13 @@ process DOWNSCALE_XY {
     def t_formatted = String.format('%04d', timepoint)
     def filename = image_file.name
     def scale_factor_py = (scale_factor as Double).toString()
-    def reslice_py = reslice_isotropic ? 'True' : 'False'
+    // Wrap in single quotes so Nextflow's GString interpolation emits
+    // 'True' / 'False' (quoted) into the Python heredoc. Without the
+    // wrapping, ${reslice_py} renders as the bare token `True`, which
+    // makes `do_iso = (True == 'True')` always False in Python (different
+    // types). Symptom: isotropic reslice is silently skipped even when
+    // isotropic_reslice=true is set in config.
+    def reslice_py = reslice_isotropic ? "'True'" : "'False'"
     """
     #!/bin/bash
     set -euo pipefail
@@ -1295,7 +1301,13 @@ process EXPORT_RAW_ISOTROPIC {
     def t_formatted = String.format('%04d', timepoint)
     def filename = image_file.name
     def scale_factor_py = (scale_factor as Double).toString()
-    def reslice_py = reslice_isotropic ? 'True' : 'False'
+    // Wrap in single quotes so Nextflow's GString interpolation emits
+    // 'True' / 'False' (quoted) into the Python heredoc. Without the
+    // wrapping, ${reslice_py} renders as the bare token `True`, which
+    // makes `do_iso = (True == 'True')` always False in Python (different
+    // types). Symptom: the raw_iso export keeps the input Z dimension
+    // instead of reslicing to match the preprocessed chain's isotropic Z.
+    def reslice_py = reslice_isotropic ? "'True'" : "'False'"
     """
     #!/bin/bash
     set -euo pipefail
@@ -1320,7 +1332,9 @@ scale = float(${scale_factor_py})
 do_iso = (${reslice_py} == 'True')
 
 # ── Loud diagnostics so workflow-binding mismatches surface in the log ──
-print(f"[DIAG] raw_export scale={scale}  do_iso={do_iso}  (reslice_py='${reslice_py}')")
+# Note: reslice_py is the rendered Python literal ('True' or 'False'), so
+# we wrap it in repr() instead of single quotes for the diagnostic print.
+print(f"[DIAG] raw_export scale={scale}  do_iso={do_iso}  (reslice_py={${reslice_py}}!r)")
 print(f"[DIAG] metadata x_res={xy_pixel_in}  z_spacing={z_pixel_in}  "
       f"isotropic→x_res={xy_pixel_in/scale:.4f}  zoom_z={z_pixel_in/(xy_pixel_in/scale):.4f}")
 
