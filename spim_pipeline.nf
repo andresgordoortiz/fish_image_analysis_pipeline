@@ -1278,9 +1278,15 @@ process EXPORT_RAW_ISOTROPIC {
     maxRetries 2
     errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
+    // Per-timepoint raw_iso TIFs are intermediate products for the
+    // MERGE_HYPERSTACKS task. When merge is enabled, publish ONLY the
+    // merged 4D_hyperstack_raw_iso.tif (the MERGE task publishes it).
+    // When merge is skipped, fall back to publishing the per-timepoint
+    // TIFs so the user still gets the raw_iso output for the viewer.
     publishDir "${params.output_dir}/01b_raw_isotropic",
         mode: 'copy',
-        pattern: "t*_raw_iso_Channel*.tif"
+        pattern: "t*_raw_iso_Channel*.tif",
+        enabled: skip_merge
     publishDir "${params.output_dir}/logs/raw_export",
         mode: 'copy',
         pattern: "*.log"
