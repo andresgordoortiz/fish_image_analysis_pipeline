@@ -543,7 +543,11 @@ def main():
     physical_pixel_sizeX, physical_pixel_sizeY, physical_pixel_sizeZ = voxel_size
 
     if tempScale > 0:
+        # When the caller passes --xy_pixel explicitly, treat that as the
+        # authoritative XY resolution for both axes (some source TIFFs have
+        # broken or missing YResolution tags that yield nonsensical µm/px).
         physical_pixel_sizeX = args.xy_pixel
+        physical_pixel_sizeY = args.xy_pixel
         physical_pixel_sizeZ = args.z_pixel
 
     print(f"  - voxel sizes (um): {voxel_size}")
@@ -561,6 +565,7 @@ def main():
             anti_aliasing=True,
         )
         physical_pixel_sizeX /= args.image_scaling
+        physical_pixel_sizeY /= args.image_scaling
         print(f"  - image dimension from : {img_shape} to {img.shape}")
         t1 = time.time()
         print(f"[Timer] Image rescaling took {t1 - t0:.2f} seconds")
