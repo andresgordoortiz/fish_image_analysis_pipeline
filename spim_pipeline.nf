@@ -2410,6 +2410,12 @@ process MERGE_HYPERSTACKS {
     // Create properly escaped JSON string for Python heredoc
     def config_json_str = groovy.json.JsonOutput.toJson(config)
     def merge_script_name = merge_script.name
+    // MERGE_STAGE_LAYOUT=v2 : stage_n() now accepts loose files at the work-dir
+    // root (the layout produced when Nextflow stages a LIST of files into a
+    // `path` input). Older cached runs used only the named-subdir layout and
+    // silently produced empty merge outputs. Bumping this version in the
+    // script body invalidates the Nextflow cache so -resume re-runs merge.
+    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v2"
     """
     #!/usr/bin/env bash
     set -euo pipefail
@@ -2419,6 +2425,7 @@ process MERGE_HYPERSTACKS {
     micromamba activate microscopy_env
 
     echo "=== MERGE_HYPERSTACKS ==="
+    echo "${merge_stage_layout_version}"
     python3 --version
     echo ""
 
@@ -2440,22 +2447,41 @@ process MERGE_HYPERSTACKS {
     # When the workflow passes a placeholder file (merge_hyperstack.py)
     # because the source channel was empty, we skip staging entirely —
     # the script then skips that data_type with "no staged files".
+    #
+    # NOTE on resume / input staging layout:
+    # When a `path` input receives a LIST of files, Nextflow stages each
+    # file loose at the work-dir root (no `processed_files/` etc. subdir).
+    # When it receives a single directory, Nextflow stages it under a
+    # subdir named after the input qualifier. Both layouts are valid and
+    # can appear across cached vs fresh tasks, so stage_n() accepts either:
+    #   1. A named subdir like processed_files/ (legacy / single-dir path)
+    #   2. Loose files at the work-dir root matching the data-type suffix
+    #      (the common case after `collect()` of a list channel)
     mkdir -p stage_processed stage_segmented stage_raw_iso
     stage_n() {
-        local src="\$1"
-        local dst="\$2"
+        local src="\$1"           # named subdir (optional)
+        local dst="\$2"           # destination subdir
+        local pattern="\$3"       # loose-file glob for this data type
         if [ -d "\$src" ]; then
-            # Count tif files (excluding any .py placeholder)
             local n=\$(find "\$src" -maxdepth 1 -type f -name '*.tif' | wc -l | tr -d ' ')
             if [ "\$n" -gt 0 ]; then
                 find "\$src" -maxdepth 1 -type f -name '*.tif' \
                     -exec cp {} "\$dst/" \\;
             fi
         fi
+        # Also pick up loose files at the work-dir root that match the
+        # per-data-type suffix. Skip the .py placeholder (no .tif suffix).
+        # `find` returns 0 on no matches under set -euo pipefail-safe usage
+        # because we redirect errors and the loop body never throws.
+        local m=\$(find . -maxdepth 1 -type f -name "\$pattern" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "\$m" -gt 0 ]; then
+            find . -maxdepth 1 -type f -name "\$pattern" \
+                -exec cp {} "\$dst/" \\;
+        fi
     }
-    stage_n processed_files stage_processed
-    stage_n segmented_files stage_segmented
-    stage_n raw_iso_files   stage_raw_iso
+    stage_n processed_files stage_processed 't*_processed.tif'
+    stage_n segmented_files stage_segmented 't*_segmented.tif'
+    stage_n raw_iso_files   stage_raw_iso   't*_raw_iso_*.tif'
 
     # Temp config
     python3 - << 'PYTHON_CONFIG'
@@ -3818,6 +3844,40 @@ workflow.onComplete {
     Completed at: ${workflow.complete}
     ============================================================================
     """.stripIndent()
+
+    // Sanity check: if tracking was enabled but the merge step did NOT
+    // produce a hyperstack on disk, point the user at the cause and a fix.
+    // (Happened in 2026-08-25: MERGE_HYPERSTACKS saw empty inputs because
+    // the stage-n logic only looked for files inside named subdirs, while
+    // Nextflow actually stages list-of-file inputs loose in the work dir.)
+    if ((config.tracking?.enabled ?: false) && !(config.output?.skip_merge ?: false)) {
+        def proc_hs = file("${params.output_dir}/01_preprocessed/4D_hyperstack_processed.tif")
+        def seg_hs  = file("${params.output_dir}/02_segmented/4D_hyperstack_segmented.tif")
+        if (!proc_hs.exists() || !seg_hs.exists()) {
+            log.warn """
+================================================================================
+TRACKING WAS REQUESTED BUT NO HYPERSTACKS WERE PRODUCED.
+  - 01_preprocessed/4D_hyperstack_processed.tif exists? ${proc_hs.exists()}
+  - 02_segmented/4D_hyperstack_segmented.tif exists?   ${seg_hs.exists()}
+
+This is the symptom of MERGE_HYPERSTACKS running with empty inputs (the
+pre-fix stage_n() looked for files inside named subdirs that Nextflow does
+not create for list-of-file inputs). Tracking needs both hyperstacks on
+disk to proceed.
+
+The current fix invalidates the merge cache via a script-body version
+stamp, so a plain -resume should re-run merge with the corrected logic.
+If it does not, force-rebuild merge with:
+
+    rm -rf work/*/8d/218dc037a542d356a650a27af6de13   # the cached merge task
+    nextflow run spim_pipeline.nf --config_json config.json -resume
+
+(use the work-dir hash printed in the previous run log for the actual
+MERGE_HYPERSTACKS task; the placeholder above is the hash from 2026-08-25.)
+================================================================================
+""".stripIndent()
+        }
+    }
 }
 
 workflow.onError {
