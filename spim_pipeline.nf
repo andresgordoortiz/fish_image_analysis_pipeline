@@ -2415,7 +2415,7 @@ process MERGE_HYPERSTACKS {
     // `path` input). Older cached runs used only the named-subdir layout and
     // silently produced empty merge outputs. Bumping this version in the
     // script body invalidates the Nextflow cache so -resume re-runs merge.
-    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v2"
+    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v3-absolute-workdir"
     """
     #!/usr/bin/env bash
     set -euo pipefail
@@ -2457,26 +2457,41 @@ process MERGE_HYPERSTACKS {
     #   1. A named subdir like processed_files/ (legacy / single-dir path)
     #   2. Loose files at the work-dir root matching the data-type suffix
     #      (the common case after `collect()` of a list channel)
+    # Resolve the work-dir absolutely. Nextflow sets NXF_TASK_WORKDIR to the
+    # absolute path of the task's work directory, which is reliable even when
+    # the container's CWD (or `pwd`) differs from the work-dir (e.g. when the
+    # container's CWD is the login node's CWD, not the per-task work-dir).
+    # Using absolute paths makes the staging resilient to any CWD ambiguity.
+    WORKDIR="\${NXF_TASK_WORKDIR:-\$PWD}"
+    echo "Stage workdir: \$WORKDIR"
+
     mkdir -p stage_processed stage_segmented stage_raw_iso
     stage_n() {
-        local src="\$1"           # named subdir (optional)
-        local dst="\$2"           # destination subdir
+        local src="\$1"           # named subdir (optional, relative to WORKDIR)
+        local dst="\$2"           # destination subdir (relative to WORKDIR)
         local pattern="\$3"       # loose-file glob for this data type
-        if [ -d "\$src" ]; then
-            local n=\$(find "\$src" -maxdepth 1 -type f -name '*.tif' | wc -l | tr -d ' ')
+
+        # Resolve inputs to absolute paths so CWD inside the container does
+        # not matter.
+        local abs_src="\$WORKDIR/\$src"
+        local abs_dst="\$WORKDIR/\$dst"
+
+        # Branch 1: named subdir staging (legacy / single-dir layout)
+        if [ -d "\$abs_src" ]; then
+            local n=\$(find "\$abs_src" -maxdepth 1 -type f -name '*.tif' 2>/dev/null | wc -l | tr -d ' ')
             if [ "\$n" -gt 0 ]; then
-                find "\$src" -maxdepth 1 -type f -name '*.tif' \
-                    -exec cp {} "\$dst/" \\;
+                find "\$abs_src" -maxdepth 1 -type f -name '*.tif' \
+                    -exec cp {} "\$abs_dst/" \\;
             fi
         fi
-        # Also pick up loose files at the work-dir root that match the
-        # per-data-type suffix. Skip the .py placeholder (no .tif suffix).
-        # `find` returns 0 on no matches under set -euo pipefail-safe usage
-        # because we redirect errors and the loop body never throws.
-        local m=\$(find . -maxdepth 1 -type f -name "\$pattern" 2>/dev/null | wc -l | tr -d ' ')
+
+        # Branch 2: loose files at the work-dir root matching the data-type
+        # suffix (the common case after `collect()` of a list channel).
+        # Use absolute path so the find CWD does not depend on container PWD.
+        local m=\$(find "\$WORKDIR" -maxdepth 1 -type f -name "\$pattern" 2>/dev/null | wc -l | tr -d ' ')
         if [ "\$m" -gt 0 ]; then
-            find . -maxdepth 1 -type f -name "\$pattern" \
-                -exec cp {} "\$dst/" \\;
+            find "\$WORKDIR" -maxdepth 1 -type f -name "\$pattern" \
+                -exec cp {} "\$abs_dst/" \\;
         fi
     }
     stage_n processed_files stage_processed 't*_processed.tif'
