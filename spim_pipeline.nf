@@ -2415,7 +2415,7 @@ process MERGE_HYPERSTACKS {
     // `path` input). Older cached runs used only the named-subdir layout and
     // silently produced empty merge outputs. Bumping this version in the
     // script body invalidates the Nextflow cache so -resume re-runs merge.
-    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v3-absolute-workdir"
+    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v5-direct-merge"
     """
     #!/usr/bin/env bash
     set -euo pipefail
@@ -2441,64 +2441,33 @@ process MERGE_HYPERSTACKS {
         micromamba install -y -n microscopy_env tifffile numpy
     }
 
-    # Stage file lists into separate subdirs so the merge script can
-    # glob them in isolation (otherwise data_type='processed' would also
-    # pick up _raw_iso_ files because of the t*_processed.tif pattern).
-    # When the workflow passes a placeholder file (merge_hyperstack.py)
-    # because the source channel was empty, we skip staging entirely —
-    # the script then skips that data_type with "no staged files".
+    # ----------------------------------------------------------------------
+    # Input staging & merge strategy (v5: simplest possible — match the
+    # pre-Aug-18 design that worked reliably).
+    # ----------------------------------------------------------------------
+    # Nextflow stages every per-timepoint TIFF loose at the work-dir root.
+    # merge_hyperstack.py uses Path('.').glob() to find files of the
+    # current data type, so we just run it from the work-dir with the
+    # data type as an argument. The Python glob is per-data-type, so
+    # processed / segmented / raw_iso files coexist without conflict.
     #
-    # NOTE on resume / input staging layout:
-    # When a `path` input receives a LIST of files, Nextflow stages each
-    # file loose at the work-dir root (no `processed_files/` etc. subdir).
-    # When it receives a single directory, Nextflow stages it under a
-    # subdir named after the input qualifier. Both layouts are valid and
-    # can appear across cached vs fresh tasks, so stage_n() accepts either:
-    #   1. A named subdir like processed_files/ (legacy / single-dir path)
-    #   2. Loose files at the work-dir root matching the data-type suffix
-    #      (the common case after `collect()` of a list channel)
-    # Resolve the work-dir absolutely. Nextflow sets NXF_TASK_WORKDIR to the
-    # absolute path of the task's work directory, which is reliable even when
-    # the container's CWD (or `pwd`) differs from the work-dir (e.g. when the
-    # container's CWD is the login node's CWD, not the per-task work-dir).
-    # Using absolute paths makes the staging resilient to any CWD ambiguity.
+    # We deliberately do NOT copy or symlink files into a staging subdir:
+    # the older MERGE_TO_HYPERSTACK did exactly this and worked, so we
+    # restore that. The previous staging layer added unnecessary fragility.
+    # ----------------------------------------------------------------------
+
+    # Resolve the work-dir absolutely. Inside apptainer the CWD can differ
+    # from the per-task work-dir; using $NXF_TASK_WORKDIR keeps everything
+    # anchored to the real task directory.
     WORKDIR="\${NXF_TASK_WORKDIR:-\$PWD}"
-    echo "Stage workdir: \$WORKDIR"
+    cd "\$WORKDIR"
+    echo "Merge workdir: \$(pwd)"
+    echo "Files in workdir root:"
+    ls -1 *.tif 2>/dev/null | head -5 || echo "  (no .tif files)"
+    echo "  ... (total: \$(ls -1 *.tif 2>/dev/null | wc -l | tr -d ' ') .tif files)"
+    echo ""
 
-    mkdir -p stage_processed stage_segmented stage_raw_iso
-    stage_n() {
-        local src="\$1"           # named subdir (optional, relative to WORKDIR)
-        local dst="\$2"           # destination subdir (relative to WORKDIR)
-        local pattern="\$3"       # loose-file glob for this data type
-
-        # Resolve inputs to absolute paths so CWD inside the container does
-        # not matter.
-        local abs_src="\$WORKDIR/\$src"
-        local abs_dst="\$WORKDIR/\$dst"
-
-        # Branch 1: named subdir staging (legacy / single-dir layout)
-        if [ -d "\$abs_src" ]; then
-            local n=\$(find "\$abs_src" -maxdepth 1 -type f -name '*.tif' 2>/dev/null | wc -l | tr -d ' ')
-            if [ "\$n" -gt 0 ]; then
-                find "\$abs_src" -maxdepth 1 -type f -name '*.tif' \
-                    -exec cp {} "\$abs_dst/" \\;
-            fi
-        fi
-
-        # Branch 2: loose files at the work-dir root matching the data-type
-        # suffix (the common case after `collect()` of a list channel).
-        # Use absolute path so the find CWD does not depend on container PWD.
-        local m=\$(find "\$WORKDIR" -maxdepth 1 -type f -name "\$pattern" 2>/dev/null | wc -l | tr -d ' ')
-        if [ "\$m" -gt 0 ]; then
-            find "\$WORKDIR" -maxdepth 1 -type f -name "\$pattern" \
-                -exec cp {} "\$abs_dst/" \\;
-        fi
-    }
-    stage_n processed_files stage_processed 't*_processed.tif'
-    stage_n segmented_files stage_segmented 't*_segmented.tif'
-    stage_n raw_iso_files   stage_raw_iso   't*_raw_iso_*.tif'
-
-    # Temp config
+    # Temp config (merge_hyperstack.py reads it from CWD)
     python3 - << 'PYTHON_CONFIG'
 import json
 config_str = '''${config_json_str}'''
@@ -2508,61 +2477,35 @@ with open('config_temp.json', 'w') as f:
 print("✓ Config file created")
 PYTHON_CONFIG
 
-    # Run the merge for each non-empty data_type, in order.
-    # Use `find` (not `ls *.tif`) so empty stage dirs return 0 instead of
-    # exit code 2 — otherwise `set -euo pipefail` aborts the task before
-    # the per-data-type skip branches below get a chance to run.
-    count_tifs() {
-        find "\$1" -maxdepth 1 -type f -name '*.tif' 2>/dev/null | wc -l | tr -d ' '
-    }
-    n_proc=\$(count_tifs stage_processed)
-    n_seg=\$(count_tifs stage_segmented)
-    n_raw=\$(count_tifs stage_raw_iso)
-    echo "Staged: processed=\${n_proc}, segmented=\${n_seg}, raw_iso=\${n_raw}"
-
     run_merge() {
         local dt="\$1"
-        local subdir="\$2"
-        if [ "\$dt" = "processed" ]; then local dest="01_preprocessed"
-        elif [ "\$dt" = "raw_iso" ]; then local dest="01b_raw_isotropic"
-        else                              local dest="02_segmented"
-        fi
-        local n
-        # Use find (not `ls *.tif`) so empty dirs return 0 instead of exit 2
-        # — set -euo pipefail would otherwise abort before this skip branch.
-        n=\$(find "\$subdir" -maxdepth 1 -type f -name '*.tif' 2>/dev/null | wc -l | tr -d ' ')
+
+        # Skip if no files for this data type exist in the work-dir.
+        local pattern="t*_\${dt}.tif"
+        if [ "\$dt" = "raw_iso" ]; then pattern="t*_raw_iso_*.tif"; fi
+        # Use ls + grep to count matches; works the same way on every shell
+        # without needing find/glob coordination. Suppress errors via 2>/dev/null.
+        local n=\$(ls \$pattern 2>/dev/null | wc -l | tr -d ' ')
         if [ "\$n" -eq 0 ]; then
-            echo "⏭  Skipping \${dt} — no staged files"
+            echo "⏭  Skipping \${dt} — no files matching '\${pattern}' in work-dir"
             return 0
         fi
         echo ""
         echo "--- Merging \${dt} (\${n} files) ---"
-        pushd "\$subdir" > /dev/null
-        (
-            export NXF_TASK_CPUS=\${NXF_TASK_CPUS:-1}
-            python3 "\${OLDPWD}/${merge_script_name}" "\${OLDPWD}/${metadata_json}" "\${OLDPWD}/config_temp.json" "\$dt" \
-                || { echo "ERROR: merge failed for \${dt}"; popd >/dev/null; exit 1; }
-        )
-        popd > /dev/null
-        # Move artefacts into the working dir so the publishDir fan-out picks them up.
-        if [ -f "\$subdir/4D_hyperstack_\${dt}.tif" ]; then
-            cp "\$subdir/4D_hyperstack_\${dt}.tif" .
-        fi
-        if [ -f "\$subdir/4D_hyperstack_\${dt}_metadata.json" ]; then
-            cp "\$subdir/4D_hyperstack_\${dt}_metadata.json" .
-        fi
-        if [ -f "\$subdir/4D_hyperstack_\${dt}.h5" ]; then
-            cp "\$subdir/4D_hyperstack_\${dt}.h5" .
-        fi
-        if [ -f "\$subdir/4D_hyperstack_\${dt}.xml" ]; then
-            cp "\$subdir/4D_hyperstack_\${dt}.xml" .
-        fi
+
+        export NXF_TASK_CPUS=\${NXF_TASK_CPUS:-1}
+        python3 "\$WORKDIR/${merge_script_name}" "\$WORKDIR/${metadata_json}" "\$WORKDIR/config_temp.json" "\$dt" \
+            || { echo "ERROR: merge failed for \${dt}"; return 1; }
+
         echo "✓ \${dt} merged"
     }
 
-    run_merge processed  stage_processed
-    run_merge segmented  stage_segmented
-    run_merge raw_iso    stage_raw_iso
+    # Process each data type in turn. merge_hyperstack.py's per-data-type
+    # glob ensures it only picks up files of the requested type, so the
+    # three runs are independent.
+    run_merge processed
+    run_merge segmented
+    run_merge raw_iso
 
     echo ""
     echo "=== MERGE_HYPERSTACKS completed ==="
