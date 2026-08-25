@@ -2415,7 +2415,7 @@ process MERGE_HYPERSTACKS {
     // `path` input). Older cached runs used only the named-subdir layout and
     // silently produced empty merge outputs. Bumping this version in the
     // script body invalidates the Nextflow cache so -resume re-runs merge.
-    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v5-direct-merge"
+    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v6-direct-from-cwd"
     """
     #!/usr/bin/env bash
     set -euo pipefail
@@ -2442,25 +2442,20 @@ process MERGE_HYPERSTACKS {
     }
 
     # ----------------------------------------------------------------------
-    # Input staging & merge strategy (v5: simplest possible — match the
-    # pre-Aug-18 design that worked reliably).
+    # Input staging & merge strategy (v6: matches the pre-Aug-18 design that
+    # worked reliably).
     # ----------------------------------------------------------------------
     # Nextflow stages every per-timepoint TIFF loose at the work-dir root.
     # merge_hyperstack.py uses Path('.').glob() to find files of the
-    # current data type, so we just run it from the work-dir with the
-    # data type as an argument. The Python glob is per-data-type, so
-    # processed / segmented / raw_iso files coexist without conflict.
+    # current data type, so we just run it from CWD with the data type as
+    # an argument. The Python glob is per-data-type, so processed /
+    # segmented / raw_iso files coexist in the work-dir without conflict.
     #
     # We deliberately do NOT copy or symlink files into a staging subdir:
     # the older MERGE_TO_HYPERSTACK did exactly this and worked, so we
     # restore that. The previous staging layer added unnecessary fragility.
     # ----------------------------------------------------------------------
 
-    # Resolve the work-dir absolutely. Inside apptainer the CWD can differ
-    # from the per-task work-dir; using $NXF_TASK_WORKDIR keeps everything
-    # anchored to the real task directory.
-    WORKDIR="\${NXF_TASK_WORKDIR:-\$PWD}"
-    cd "\$WORKDIR"
     echo "Merge workdir: \$(pwd)"
     echo "Files in workdir root:"
     ls -1 *.tif 2>/dev/null | head -5 || echo "  (no .tif files)"
@@ -2494,7 +2489,7 @@ PYTHON_CONFIG
         echo "--- Merging \${dt} (\${n} files) ---"
 
         export NXF_TASK_CPUS=\${NXF_TASK_CPUS:-1}
-        python3 "\$WORKDIR/${merge_script_name}" "\$WORKDIR/${metadata_json}" "\$WORKDIR/config_temp.json" "\$dt" \
+        python3 "${merge_script_name}" "${metadata_json}" config_temp.json "\$dt" \
             || { echo "ERROR: merge failed for \${dt}"; return 1; }
 
         echo "✓ \${dt} merged"
