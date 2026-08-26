@@ -37,12 +37,12 @@ dependencies:
   - pandas>=2.0
 
   # ---- napari viewer + Qt backend --------------------------------------
-  # napari on conda-forge pulls in pyqt + qtpy; the script also imports
-  # qtpy directly (qtpy.QtWidgets / qtpy.QtCore). pyqt is pulled in
-  # transitively by napari — don't pin it here, the loose version
-  # constraint fails on Windows builds.
+  # The script imports qtpy directly (qtpy.QtWidgets / qtpy.QtCore).
+  # napari no longer pulls a Qt binding transitively on conda-forge, so
+  # we must declare one explicitly. PyQt5 is the most compatible choice.
   - napari>=0.5
   - qtpy>=2.4
+  - pyqt>=5.15
 
   # ---- Plotting ---------------------------------------------------------
   - matplotlib>=3.8
