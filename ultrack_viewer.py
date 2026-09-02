@@ -1187,12 +1187,17 @@ class CrossSectionViewer:
         self._landmarks_layer = None
         self._center_layer = None
         self._processed_image_layer = None
+        self._raw_image_layer = None
         self._seg_image_layer = None
         self._recording = False
         self._saved_view_state = None  # camera + layer settings snapshot
 
         # Check which image data is available from parent viewer
         self._has_processed = getattr(parent, '_processed_frames', None) is not None
+        self._has_raw = (
+            getattr(parent, '_image_layers', {}).get("raw", {}).get("frames")
+            is not None
+        )
         self._has_seg = getattr(parent, '_segment_frames', None) is not None
 
         r = self._ranges[self._axis]
@@ -1348,6 +1353,10 @@ class CrossSectionViewer:
             value=self._has_processed, text="Show processed image slice"
         )
         self.show_processed_check.changed.connect(self._schedule_rebuild)
+        self.show_raw_check = CheckBox(
+            value=self._has_raw, text="Show raw image slice"
+        )
+        self.show_raw_check.changed.connect(self._schedule_rebuild)
         self.show_seg_check = CheckBox(
             value=self._has_seg, text="Show segmentation slice"
         )
@@ -1360,6 +1369,10 @@ class CrossSectionViewer:
             value=60, min=0, max=100, step=5, label="Processed opacity %"
         )
         self.processed_opacity_slider.changed.connect(self._schedule_rebuild)
+        self.raw_opacity_slider = FloatSlider(
+            value=60, min=0, max=100, step=5, label="Raw opacity %"
+        )
+        self.raw_opacity_slider.changed.connect(self._schedule_rebuild)
         self.seg_opacity_slider = FloatSlider(
             value=40, min=0, max=100, step=5, label="Seg opacity %"
         )
@@ -1440,6 +1453,8 @@ class CrossSectionViewer:
                 Label(value="── Image Layers ──"),
                 self.show_processed_check,
                 self.processed_opacity_slider,
+                self.show_raw_check,
+                self.raw_opacity_slider,
                 self.show_seg_check,
                 self.seg_opacity_slider,
                 self.slice_mip_check,
@@ -2341,7 +2356,8 @@ class CrossSectionViewer:
 
     def _remove_image_layers(self):
         """Remove image layers (call when slab geometry changes)."""
-        for attr in ("_processed_image_layer", "_seg_image_layer"):
+        for attr in ("_processed_image_layer", "_raw_image_layer",
+                     "_seg_image_layer"):
             layer = getattr(self, attr, None)
             if layer is not None:
                 try:
@@ -3129,7 +3145,7 @@ class CrossSectionViewer:
         frame = int(self.frame_slider.value)
         ds = getattr(self.parent, '_display_ds', 1) or 1
 
-        # ── Raw image slice ──
+        # ── Processed image slice ──
         processed_frames = getattr(self.parent, '_processed_frames', None)
         if self.show_processed_check.value and processed_frames is not None:
             n_tp = len(processed_frames)
@@ -3153,9 +3169,40 @@ class CrossSectionViewer:
                         self._processed_contrast_limits = [c_lo, c_hi]
                         processed_cl = self._processed_contrast_limits
                     self._push_image("_processed_image_layer", img, scale, translate,
-                                     name="Raw slice", colormap="gray",
+                                     name="Processed slice", colormap="gray",
                                      contrast_limits=processed_cl,
                                      opacity=self.processed_opacity_slider.value / 100.0)
+
+        # ── Raw image slice (the resliced isotropic companion to processed) ──
+        raw_frames = (
+            getattr(self.parent, '_image_layers', {}).get("raw", {}).get("frames")
+        )
+        if self.show_raw_check.value and raw_frames is not None:
+            n_tp = len(raw_frames)
+            t = self._frame_to_volume_index(frame, n_tp)
+            if 0 <= t < n_tp:
+                img, scale, translate = self._extract_oriented_slab_slice(
+                    raw_frames[t], pos, half, ds=1.0,
+                    projection="mean",
+                )
+                if img is not None:
+                    # Independent contrast per layer (raw usually needs a
+                    # different stretch than deconvolved/Self-Net).
+                    raw_cl = getattr(self, '_raw_contrast_limits', None)
+                    if raw_cl is None:
+                        nz = img[img > 0]
+                        if len(nz) > 0:
+                            c_lo = int(np.percentile(nz, 1))
+                            c_hi = int(np.percentile(nz, 99.5))
+                        else:
+                            c_lo, c_hi = 0, 255
+                        c_hi = max(c_hi, c_lo + 1)
+                        self._raw_contrast_limits = [c_lo, c_hi]
+                        raw_cl = self._raw_contrast_limits
+                    self._push_image("_raw_image_layer", img, scale, translate,
+                                     name="Raw slice", colormap="gray",
+                                     contrast_limits=raw_cl,
+                                     opacity=self.raw_opacity_slider.value / 100.0)
 
         # ── Segmentation slice ──
         seg_frames = getattr(self.parent, '_segment_frames', None)
@@ -3542,6 +3589,8 @@ class EmbryoViewer:
         tracks_df: pd.DataFrame | None = None,
         segments_zarr_path: str | Path | None = None,
         processed_path: str | Path | None = None,
+        raw_path: str | Path | None = None,
+        image_load_downsample: int = 1,
         voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
         downsample: int = 1,
         load_downsample: int = 1,
@@ -3613,12 +3662,45 @@ class EmbryoViewer:
         self._load_downsample_factor = load_downsample
         self._preload = preload
 
-        # Raw image state
+        # Image-volume state — one slot per kind (processed / raw).  All
+        # downstream accessors (cross-section viewer, vispy texture
+        # swap, etc.) read through the per-kind slot dict so the same
+        # machinery drives both volumes without code duplication.
+        #
+        # ``_image_layers`` keys: "processed", "raw".
+        # Each entry is a dict with:
+        #   path              original input path (str|Path)
+        #   data              numpy (T, Z, Y, X) raw array (after load-ds)
+        #   frames            list[np.ndarray] of uint8 display frames
+        #   layer             napari Image layer (or None)
+        #   vispy_volume      vispy Volume node for direct GPU swap
+        #   time_cb           per-volume dims.current_step callback
+        #   is_displayed      True if napari currently shows it
+        self._image_layers: dict[str, dict] = {
+            k: {
+                "path": None,
+                "data": None,
+                "frames": None,
+                "layer": None,
+                "vispy_volume": None,
+                "time_cb": None,
+                "is_displayed": False,
+            }
+            for k in ("processed", "raw")
+        }
+        # Back-compat aliases used throughout the rest of the file.
+        # Code that needs the per-kind state should migrate to read
+        # through _image_layers["processed"] / _image_layers["raw"];
+        # these aliases keep the diff to the existing call sites minimal.
         self._processed_path = processed_path
         self._processed_data = None        # numpy array (T, Z, Y, X)
         self._processed_layer = None       # napari Image layer
         self._processed_frames = None      # list of 3D contiguous arrays
         self._vispy_processed_volume = None
+        self._processed_time_cb = None
+        self._processed_contrast_limits = None
+
+        self._image_load_downsample = max(1, int(image_load_downsample))
         self._segments_affine = np.eye(4)  # cumulative affine for segments/raw
 
         # Create viewer
@@ -3628,9 +3710,13 @@ class EmbryoViewer:
         if segments_zarr_path is not None:
             self._load_segments(segments_zarr_path)
 
-        # Load raw image if provided
+        # Load processed image if provided
         if processed_path is not None:
-            self._load_processed(processed_path)
+            self._load_image_volume(processed_path, kind="processed")
+        # Load raw image if provided (the resliced isotropic companion to
+        # --processed, useful for side-by-side / overlay comparison).
+        if raw_path is not None:
+            self._load_image_volume(raw_path, kind="raw")
 
         # Load data layers if provided
         if self.spots is not None:
@@ -3944,12 +4030,12 @@ class EmbryoViewer:
                             except Exception:
                                 pass
 
-                # ── 1b. Swap raw vispy texture (instant) ──
-                # Delegated to _swap_processed_at_time so the dedicated
-                # processed callback installed in _load_processed shares
-                # the exact same swap logic (incl. dynamic vispy lookup
-                # + layer.data fallback).
-                self._swap_processed_at_time(t)
+                # ── 1b. Swap image-volume vispy textures (instant) ──
+                # Drives BOTH processed and raw slots through the
+                # shared per-kind swap helper, which handles dynamic
+                # vispy-node lookup + layer.data fallback.
+                for kind in ("processed", "raw"):
+                    self._swap_image_at_time(t, kind)
 
                 # ── 2. Update Tracks shader time (GPU uniform, ~0 ms) ──
                 # Tracks layers use a GPU shader uniform for time filtering
@@ -4306,13 +4392,18 @@ class EmbryoViewer:
                 vol.set_data(frames[t])
                 if canv is not None:
                     canv.native.update()
-            # ── raw ──
-            processed_frames = self._processed_frames
-            processed_vol = self._vispy_processed_volume
-            if processed_frames is not None and processed_vol is not None and 0 <= t < len(processed_frames):
-                processed_vol.set_data(processed_frames[t])
-                if canv is not None:
-                    canv.native.update()
+            # ── processed / raw image volumes (both kinds) ──
+            for kind in ("processed", "raw"):
+                slot = self._image_layers[kind]
+                pf = slot["frames"]
+                pv = slot["vispy_volume"]
+                if pf is not None and pv is not None and 0 <= t < len(pf):
+                    try:
+                        pv.set_data(pf[t])
+                    except Exception:
+                        pass
+            if canv is not None:
+                canv.native.update()
 
         QTimer.singleShot(50, _push)
 
@@ -4351,23 +4442,34 @@ class EmbryoViewer:
         candidates.sort(key=sort_key)
         return candidates
 
-    def _stack_timepoint_files(self, files: list[Path]) -> np.ndarray:
+    def _stack_timepoint_files(
+        self, files: list[Path], load_downsample: int = 1,
+    ) -> np.ndarray:
         """Load a list of per-timepoint files and stack them on the time axis.
 
         Each file is expected to be a 3D volume (Z, Y, X) — either a
         TIFF page-stack (handled via ImageJ metadata when present) or a
         zarr array. Returns a 4D numpy array (T, Z, Y, X).
+
+        ``load_downsample`` > 1 downsamples each per-timepoint volume
+        spatially (every Nth voxel on Z, Y, X) BEFORE stacking so the
+        full-resolution array is never materialised in RAM.
         """
         import time as _time
         import tifffile
         import multiprocessing as mp
         from concurrent.futures import ThreadPoolExecutor
 
+        lds = max(1, int(load_downsample))
+
         def _load_one(p: Path) -> np.ndarray:
             if p.is_dir() and p.name.endswith('.zarr'):
                 import zarr
                 arr = zarr.open_array(str(p), mode="r")
-                return np.asarray(arr)
+                arr_np = np.asarray(arr)
+                if lds > 1:
+                    arr_np = arr_np[::lds, ::lds, ::lds]
+                return arr_np
             # TIFF
             with tifffile.TiffFile(str(p)) as tf:
                 arr = tf.asarray()
@@ -4381,6 +4483,8 @@ class EmbryoViewer:
                         n_frames, n_slices, arr.shape[1], arr.shape[2]
                     )
                     arr = arr[0]  # each file = single timepoint, take Z
+            if lds > 1:
+                arr = arr[::lds, ::lds, ::lds]
             return arr
 
         n_cores = mp.cpu_count() or 1
@@ -4415,29 +4519,33 @@ class EmbryoViewer:
                 )
 
         data_np = np.stack(frames, axis=0).astype(first_dtype, copy=False)
+        lds_note = f" (load-ds {lds}×)" if lds > 1 else ""
         print(f"  Stacked {data_np.shape[0]} tp × {first_shape} "
-              f"({data_np.nbytes / 1e9:.1f} GB, dtype={data_np.dtype})")
+              f"({data_np.nbytes / 1e9:.1f} GB, dtype={data_np.dtype})"
+              f"{lds_note}")
         return data_np
 
-    def _load_processed(self, path: str | Path) -> None:
-        """Load a processed image (TIFF, zarr, or folder of timepoints).
+    def _load_image_volume(self, path: str | Path, kind: str = "processed") -> None:
+        """Load a microscopy image volume (TIFF, zarr, or folder of tps).
 
-        Accepted inputs:
-          • A 4D TIFF hyperstack (T×Z×Y×X, with ImageJ metadata).
-          • A zarr array, zarr group with numeric subarrays, or a `.zarr`
-            directory.
-          • A directory containing one file/sub-zarr per timepoint
-            (e.g. ``tp_000.tif``, ``tp_001.tif``, ...). Files are
-            sorted by the trailing numeric component in the stem and
-            stacked along the time axis.
+        A single helper that backs BOTH ``--processed`` and ``--raw`` so
+        the same machinery (zarr / TIFF / folder-of-TIFFs detection,
+        ImageJ-metadata reshape, load-downsample, percentile contrast,
+        per-volume vispy texture swap) drives both slots.
 
-        Preloads into RAM and uses the same vispy direct-texture-swap
-        approach as segments for instant smooth scrubbing.
+        Parameters
+        ----------
+        path : filesystem path (file or directory)
+        kind : "processed" or "raw" — selects which per-volume slot to
+            populate.  Both share the same image machinery; ``kind``
+            only affects the napari layer name and the status label.
         """
         import time as _time
 
         path = Path(path).resolve()
-        print(f"Loading processed image: {path}")
+        lds = self._image_load_downsample
+        kind_lbl = "processed" if kind == "processed" else "raw"
+        print(f"Loading {kind_lbl} image: {path}")
 
         # ── Folder of per-timepoint files (TIFF or zarr) ─────────────
         if path.is_dir() and path.suffix != '.zarr':
@@ -4448,7 +4556,7 @@ class EmbryoViewer:
                     f"found in {path}"
                 )
             print(f"  Folder of timepoints: {len(tp_files)} files detected")
-            data_np = self._stack_timepoint_files(tp_files)
+            data_np = self._stack_timepoint_files(tp_files, lds)
         elif path.suffix in ('.tif', '.tiff'):
             import tifffile
             t0 = _time.time()
@@ -4483,6 +4591,10 @@ class EmbryoViewer:
                 )
                 print(f"  Reshaped to 4D (T,Z,Y,X)={data_np.shape} "
                       f"using ImageJ metadata")
+            # Load-downsample (after reshape so axes stay 4D)
+            if lds > 1:
+                data_np = data_np[:, ::lds, ::lds, ::lds]
+                print(f"  Load-downsampled {lds}× → {data_np.shape}")
         elif path.is_dir() or path.suffix == '.zarr':
             import dask.array as da
             import zarr
@@ -4496,6 +4608,11 @@ class EmbryoViewer:
                 data = da.stack(lazy, axis=0)
             else:
                 raise ValueError(f"Unexpected zarr layout: {path}")
+            if lds > 1:
+                # Downsample spatially before pulling into RAM so the
+                # full-resolution array is never materialised.
+                data = data[:, ::lds, ::lds, ::lds]
+                data = data.rechunk({a: "auto" for a in (1, 2, 3)})
             n_cores = mp.cpu_count() or 1
             print(f"  Zarr shape={data.shape}, dtype={data.dtype}  "
                   f"({data.nbytes / 1e9:.1f} GB)")
@@ -4507,7 +4624,7 @@ class EmbryoViewer:
             del data
         else:
             raise ValueError(
-                f"Unsupported processed format: {path.suffix}  "
+                f"Unsupported {kind_lbl} format: {path.suffix}  "
                 "(expected .tif, .tiff, .zarr, or a folder of "
                 "per-timepoint files)"
             )
@@ -4517,10 +4634,13 @@ class EmbryoViewer:
             data_np = data_np[np.newaxis]  # single timepoint
         if data_np.ndim != 4:
             raise ValueError(
-                f"Processed image must be 4D (T,Z,Y,X), got {data_np.ndim}D"
+                f"{kind_lbl.capitalize()} image must be 4D "
+                f"(T,Z,Y,X), got {data_np.ndim}D"
             )
 
-        self._processed_data = data_np
+        slot = self._image_layers[kind]
+        slot["path"] = str(path)
+        slot["data"] = data_np
         n_tp = data_np.shape[0]
 
         # Build per-frame contiguous arrays for vispy texture swap.
@@ -4613,7 +4733,7 @@ class EmbryoViewer:
         print(f"[{p_low:.0f}, {p_high:.0f}] ", end="", flush=True)
         print(f"({n_workers} threads × {n_cores} cores) ...", end=" ", flush=True)
 
-        self._processed_frames = []
+        display_frames: list[np.ndarray] = []
 
         def _convert_frame(i: int) -> np.ndarray:
             frame = data_np[i]
@@ -4628,7 +4748,7 @@ class EmbryoViewer:
         if n_workers == 1:
             # Tiny dataset (or single core) — skip pool overhead
             for i in range(n_tp):
-                self._processed_frames.append(_convert_frame(i))
+                display_frames.append(_convert_frame(i))
         else:
             # When n_tp ≪ n_cores × 4 we have so few frames that
             # each worker would only get 1–2 frames — the pool's
@@ -4671,7 +4791,7 @@ class EmbryoViewer:
                 # serial frame-by-frame, which is fast enough at this
                 # scale and avoids the pool overhead.
                 for i in range(n_tp):
-                    self._processed_frames.append(_convert_frame(i))
+                    display_frames.append(_convert_frame(i))
             else:
                 # Rebuild each frame contiguously from its slabs so
                 # the final layout stays (T, Z, Y, X) regardless of
@@ -4686,119 +4806,198 @@ class EmbryoViewer:
                         frame_buffers[i].append(slab_u8)
                 for bufs in frame_buffers:
                     if len(bufs) == 1:
-                        self._processed_frames.append(bufs[0])
+                        display_frames.append(bufs[0])
                     else:
-                        self._processed_frames.append(
+                        display_frames.append(
                             np.ascontiguousarray(
                                 np.concatenate(bufs, axis=0)
                             )
                         )
 
-        frame_mb = self._processed_frames[0].nbytes / 1e6
+        slot["frames"] = display_frames
+        slot["contrast_limits"] = [0, 255]  # post-stretch, no auto-tune
+
+        frame_mb = display_frames[0].nbytes / 1e6
         total_gb = n_tp * frame_mb / 1e3
         print(f"{n_tp} × {frame_mb:.1f} MB = {total_gb:.1f} GB "
               f"({_time.time() - t0:.1f}s)")
 
-        # Processed image is loaded at full resolution → world scale (1,1,1).
+        # Image loaded at (possibly down-)sampled resolution → world scale
+        # is uniform across both image kinds, so they register voxel-to-voxel.
         scale_3d = (1, 1, 1)
+        layer_name = "Processed" if kind == "processed" else "Raw"
+        # Use lighter additive blending and gamma so that when both
+        # layers are visible side-by-side neither completely blows out
+        # the other.  Raw usually needs a touch more gamma than
+        # processed (which is already deconvolved/Self-Net bright).
+        opacity_default = 0.7 if kind == "processed" else 0.5
+        gamma_default = 0.7 if kind == "processed" else 0.85
 
         # Add as 3D Image layer (grayscale, additive for overlay with segments)
-        self._processed_layer = self.viewer.add_image(
-            self._processed_frames[0],
-            name="Processed",
+        layer = self.viewer.add_image(
+            display_frames[0],
+            name=layer_name,
             scale=scale_3d,
-            opacity=0.7,
+            opacity=opacity_default,
             rendering="mip",
             colormap="gray",
             contrast_limits=[0, 255],
             blending="additive",
-            gamma=0.7,
+            gamma=gamma_default,
         )
-        self._processed_layer._update_thumbnail = lambda: None
-        self._processed_layer._clear_extent = lambda: None
+        layer._update_thumbnail = lambda: None
+        layer._clear_extent = lambda: None
+        slot["layer"] = layer
+        slot["is_displayed"] = True
 
         # Find vispy Volume node for direct GPU texture swap
-        self._vispy_processed_volume = None
+        slot["vispy_volume"] = None
         try:
             qt_viewer = self.viewer.window._qt_viewer
             canvas = qt_viewer.canvas
             if hasattr(canvas, 'layer_to_visual'):
-                vl = canvas.layer_to_visual.get(self._processed_layer)
+                vl = canvas.layer_to_visual.get(layer)
                 if vl is not None and hasattr(vl, 'node'):
                     if hasattr(vl.node, 'set_data'):
-                        self._vispy_processed_volume = vl.node
-                        print("  ✓ Processed vispy direct texture path active")
+                        slot["vispy_volume"] = vl.node
+                        print(f"  ✓ {kind_lbl.capitalize()} "
+                              f"vispy direct texture path active")
         except Exception as exc:
-            print(f"  ⚠ Processed vispy path unavailable ({exc})")
+            print(f"  ⚠ {kind_lbl.capitalize()} vispy path "
+                  f"unavailable ({exc})")
 
         # ── Independent time-slider callback ───────────────────────────
         # The existing _on_segments_time callback only fires when segments
         # are loaded with --preload.  This dedicated callback guarantees
-        # processed updates work no matter how segments were loaded (lazy
+        # image updates work no matter how segments were loaded (lazy
         # vs preload, or not at all).  Idempotent: disconnects any prior
-        # callback before reconnecting, so reloading processed via the UI
-        # doesn't end up with two listeners firing.
-        prior_cb = getattr(self, "_processed_time_cb", None)
+        # callback before reconnecting, so reloading via the UI doesn't
+        # end up with two listeners firing.
+        prior_cb = slot.get("time_cb")
         if prior_cb is not None:
             try:
                 self.viewer.dims.events.current_step.disconnect(prior_cb)
             except (ValueError, TypeError):
                 pass
 
-        def _on_processed_time(event=None):
+        # Capture slot in closure so the callback always reads the
+        # current per-volume state, even if a UI reload replaces the
+        # slot's contents.
+        _slot = slot
+
+        def _on_image_time(event=None, _kind=kind, _slot=_slot):
             try:
                 t = int(self.viewer.dims.current_step[0])
-                self._swap_processed_at_time(t)
+                self._swap_image_at_time(t, _kind)
             except Exception:
                 pass
 
-        self._processed_time_cb = _on_processed_time
-        self.viewer.dims.events.current_step.connect(_on_processed_time)
+        slot["time_cb"] = _on_image_time
+        self.viewer.dims.events.current_step.connect(_on_image_time)
 
+        # Back-compat: keep the processed-only attributes in sync so
+        # existing call sites (cross-section viewer, _on_segments_time,
+        # _load_processed_from_ui, status label, ROI drawing) keep
+        # working without churn.  Raw-only accessors should read
+        # directly from ``self._image_layers["raw"]``.
+        if kind == "processed":
+            self._processed_data = data_np
+            self._processed_frames = display_frames
+            self._processed_layer = layer
+            self._vispy_processed_volume = slot["vispy_volume"]
+            self._processed_time_cb = _on_image_time
+
+        lds_note = f", load-ds {lds}×" if lds > 1 else ""
         print(f"  Ready: {n_tp} tp  |  shape {data_np.shape[1:]}  |  "
-              f"{data_np.nbytes / 1e9:.1f} GB processed → "
-              f"{total_gb:.1f} GB display (uint8)")
+              f"{data_np.nbytes / 1e9:.1f} GB {kind_lbl} → "
+              f"{total_gb:.1f} GB display (uint8){lds_note}")
 
-    def _load_processed_from_ui(self):
-        """Open dialog to load a processed image (file, .zarr, or folder)."""
+    def _load_image_from_ui(self, kind: str) -> None:
+        """Open dialog to load a microscopy image (file, .zarr, or folder).
+
+        Shared by ``_load_processed_from_ui`` and ``_load_raw_from_ui`` —
+        only the kind label and status widget differ.
+        """
         from qtpy.QtWidgets import QFileDialog
 
-        # Give the user a single dialog with both "Open File" and
-        # "Open Folder" options. QFileDialog doesn't expose a built-in
-        # mode switch, so we ask: if they cancel file mode, fall back
-        # to directory mode.
+        kind_lbl = "Processed" if kind == "processed" else "Raw"
         path, _ = QFileDialog.getOpenFileName(
-            None, "Open Processed Hyperstack (or Cancel and choose a folder)",
+            None, f"Open {kind_lbl} Hyperstack (or Cancel and choose a folder)",
             "", "Image files (*.tif *.tiff *.zarr);;All (*)",
         )
         if not path:
             folder = QFileDialog.getExistingDirectory(
                 None,
-                "Select folder of per-timepoint files "
+                f"Select folder of per-timepoint {kind_lbl} files "
                 "(TIFFs or per-timepoint .zarr sub-dirs)",
             )
             if not folder:
                 return
             path = folder
         try:
-            if self._processed_layer is not None:
+            existing_layer = self._image_layers[kind]["layer"]
+            if existing_layer is not None:
                 try:
-                    self.viewer.layers.remove(self._processed_layer)
+                    self.viewer.layers.remove(existing_layer)
                 except (ValueError, KeyError):
                     pass
-                self._processed_layer = None
-            self._load_processed(path)
-            self.lbl_processed_status.value = f"Loaded: {self._processed_data.shape}"
+                self._image_layers[kind]["layer"] = None
+            self._load_image_volume(path, kind=kind)
+            data = self._image_layers[kind]["data"]
+            status_label = (
+                self.lbl_processed_status if kind == "processed"
+                else self.lbl_raw_status
+            )
+            if status_label is not None:
+                status_label.value = f"Loaded: {data.shape}"
         except Exception as e:
-            self.lbl_processed_status.value = f"Error: {e}"
+            status_label = (
+                self.lbl_processed_status if kind == "processed"
+                else self.lbl_raw_status
+            )
+            if status_label is not None:
+                status_label.value = f"Error: {e}"
+
+    def _load_processed_from_ui(self) -> None:
+        """Back-compat shim — loads the processed image via the UI dialog."""
+        self._load_image_from_ui("processed")
+
+    def _load_raw_from_ui(self) -> None:
+        """Load the raw image (e.g. resliced isotropic) via the UI dialog."""
+        self._load_image_from_ui("raw")
+
+    def _load_processed(self, path: str | Path) -> None:
+        """Back-compat shim — loads the processed image programmatically.
+
+        External callers that used to do ``viewer._load_processed(path)``
+        now hit the unified per-kind loader.  New code should call
+        ``_load_image_volume(path, kind="processed")`` directly.
+        """
+        self._load_image_volume(path, kind="processed")
+
+    def _on_image_opacity_changed(self, value: float, kind: str) -> None:
+        layer = self._image_layers[kind]["layer"]
+        if layer is not None:
+            layer.opacity = value / 100.0
+
+    def _on_image_visible_changed(self, value: bool, kind: str) -> None:
+        layer = self._image_layers[kind]["layer"]
+        if layer is not None:
+            layer.visible = value
 
     def _on_processed_opacity_changed(self, value: float) -> None:
-        if self._processed_layer is not None:
-            self._processed_layer.opacity = value / 100.0
+        """Back-compat shim — forwards to the per-kind handler."""
+        self._on_image_opacity_changed(value, "processed")
 
     def _on_processed_visible_changed(self, value: bool) -> None:
-        if self._processed_layer is not None:
-            self._processed_layer.visible = value
+        """Back-compat shim — forwards to the per-kind handler."""
+        self._on_image_visible_changed(value, "processed")
+
+    def _on_raw_opacity_changed(self, value: float) -> None:
+        self._on_image_opacity_changed(value, "raw")
+
+    def _on_raw_visible_changed(self, value: bool) -> None:
+        self._on_image_visible_changed(value, "raw")
 
     def _add_spots_layer(self):
         """Add the main nuclei points layer."""
@@ -5848,6 +6047,33 @@ class EmbryoViewer:
         )
         self.processed_opacity_slider.changed.connect(self._on_processed_opacity_changed)
 
+        # ── Raw (e.g. resliced isotropic) image controls ────────────
+        # Independent of processed so the two volumes can be compared
+        # side-by-side at different opacities.  Sits right next to the
+        # processed controls so the user can flip both visibility/
+        # opacity together when they want to overlay them.
+        btn_load_raw = PushButton(text="Load Raw Image")
+        btn_load_raw.changed.connect(self._load_raw_from_ui)
+        raw_data_shape = (
+            self._image_layers.get("raw", {}).get("data")
+        )
+        raw_data_shape = raw_data_shape.shape if raw_data_shape is not None else None
+        self.lbl_raw_status = Label(
+            value=f"Loaded: {raw_data_shape}"
+            if raw_data_shape is not None
+            else "No raw image loaded"
+        )
+        self.raw_visible_cb = CheckBox(value=True, text="Show raw image")
+        self.raw_visible_cb.changed.connect(
+            lambda v: self._on_image_visible_changed(v, "raw")
+        )
+        self.raw_opacity_slider = FloatSlider(
+            value=30, min=0, max=100, step=5, label="Raw opacity %"
+        )
+        self.raw_opacity_slider.changed.connect(
+            lambda v: self._on_image_opacity_changed(v, "raw")
+        )
+
         # ── Display controls ──
         self.display_pct_slider = FloatSlider(
             value=100, min=1, max=100, step=1, label="Display %"
@@ -6100,6 +6326,10 @@ class EmbryoViewer:
                 self.lbl_processed_status,
                 self.processed_visible_cb,
                 self.processed_opacity_slider,
+                btn_load_raw,
+                self.lbl_raw_status,
+                self.raw_visible_cb,
+                self.raw_opacity_slider,
                 Label(value="━━ TRACK FRAME RANGE ━━"),
                 self.track_frame_start,
                 self.track_frame_end,
@@ -6767,47 +6997,56 @@ class EmbryoViewer:
                 pass
 
     def _swap_processed_at_time(self, t: int) -> None:
-        """Push processed frame *t* to its vispy node + layer._data.
+        """Back-compat — forwards to the per-kind swap."""
+        self._swap_image_at_time(t, "processed")
 
-        Idempotent and safe to call even if processed wasn't loaded.
+    def _swap_image_at_time(self, t: int, kind: str) -> None:
+        """Push image-kind frame *t* to its vispy node + layer._data.
+
+        The shared per-volume texture-swap helper.  Idempotent and safe
+        to call even if the slot is empty.
 
         Has a dynamic vispy-node fallback: the cached node reference
-        (``self._vispy_processed_volume``) can be ``None`` if the initial
-        lookup at load time ran before vispy finished wiring up the
-        layer's visual — in that case we look the node up live from
+        (``slot["vispy_volume"]``) can be ``None`` if the initial lookup
+        at load time ran before vispy finished wiring up the layer's
+        visual — in that case we look the node up live from
         ``canvas.layer_to_visual`` so the swap still works.
 
         Falls back to assigning ``layer.data = frame`` if neither path
         yields a vispy node, so the layer still scrolls even without
         the GPU-texture shortcut.
         """
-        processed_frames = self._processed_frames
-        if processed_frames is None or not (0 <= t < len(processed_frames)):
+        slot = self._image_layers.get(kind)
+        if slot is None:
+            return
+        frames = slot["frames"]
+        if frames is None or not (0 <= t < len(frames)):
             return
 
-        frame = processed_frames[t]
+        frame = frames[t]
+        layer = slot["layer"]
 
         # ── 1. Try the cached vispy node ─────────────────────────────
-        processed_vol = self._vispy_processed_volume
+        vol = slot["vispy_volume"]
         swapped = False
-        if processed_vol is not None and hasattr(processed_vol, "set_data"):
+        if vol is not None and hasattr(vol, "set_data"):
             try:
-                processed_vol.set_data(frame)
+                vol.set_data(frame)
                 swapped = True
             except Exception:
-                processed_vol = None
+                vol = None
 
         # ── 2. Dynamic lookup if cached was missing or stale ─────────
-        if not swapped and self._processed_layer is not None:
+        if not swapped and layer is not None:
             try:
                 qt_viewer = self.viewer.window._qt_viewer
                 canvas = qt_viewer.canvas
-                vl = canvas.layer_to_visual.get(self._processed_layer)
+                vl = canvas.layer_to_visual.get(layer)
                 if vl is not None and hasattr(vl, "node") \
                         and hasattr(vl.node, "set_data"):
                     vl.node.set_data(frame)
                     # Cache it for next time
-                    self._vispy_processed_volume = vl.node
+                    slot["vispy_volume"] = vl.node
                     swapped = True
                     try:
                         canvas.native.update()
@@ -6817,16 +7056,16 @@ class EmbryoViewer:
                 pass
 
         # ── 3. Last-resort: assign through napari's data setter ──────
-        if not swapped and self._processed_layer is not None:
+        if not swapped and layer is not None:
             try:
-                self._processed_layer.data = frame
+                layer.data = frame
             except Exception:
                 pass
 
         # ── 4. Sync napari's internal _data reference ────────────────
-        if self._processed_layer is not None:
+        if layer is not None:
             try:
-                self._processed_layer._data = frame
+                layer._data = frame
             except Exception:
                 pass
 
@@ -7805,6 +8044,13 @@ class EmbryoViewer:
         if self._processed_layer is not None:
             self._processed_was_visible = self._processed_layer.visible
             self._processed_layer.visible = False
+        # Hide raw image too (if loaded) so the 2D cross-section stays
+        # aligned with the world coordinate frame.
+        self._raw_was_visible = False
+        raw_layer = self._image_layers.get("raw", {}).get("layer")
+        if raw_layer is not None:
+            self._raw_was_visible = raw_layer.visible
+            raw_layer.visible = False
 
         if self._was_3d:
             self.viewer.dims.ndisplay = 2
@@ -7896,6 +8142,13 @@ class EmbryoViewer:
                 self, '_processed_was_visible', False
             ):
                 self._processed_layer.visible = True
+            # Restore raw layer visibility too if it was visible before
+            # the 2D ROI drawing pass.
+            raw_layer = self._image_layers.get("raw", {}).get("layer")
+            if raw_layer is not None and getattr(
+                self, '_raw_was_visible', False
+            ):
+                raw_layer.visible = True
             self._draw_roi_box()
 
             self.viewer.status = (
@@ -8913,7 +9166,30 @@ def main():
              "tp_000.tif, tp_001.tif, ...). When a folder is given, files "
              "are sorted by the trailing numeric component of the stem and "
              "stacked along the time axis. Displayed as a grayscale volume "
-             "alongside segments and tracks.",
+             "alongside segments and tracks."
+    )
+    parser.add_argument(
+        "--raw", "-r", default=None,
+        help="Path to a second image volume (e.g. the resliced isotropic "
+             "hyperstack from stage_raw_iso/). Same accepted formats as "
+             "--processed (TIFF hyperstack, .zarr, or folder of per-timepoint "
+             "files). When supplied alongside --processed, both volumes "
+             "are loaded and blended together for visual comparison. "
+             "Independent contrast per layer; shared voxel scale."
+    )
+    parser.add_argument(
+        "--image-load-downsample",
+        type=int,
+        default=1,
+        metavar="N",
+        dest="image_load_downsample",
+        help="Spatial downsample factor applied to BOTH --processed and "
+             "--raw when loading them into RAM (e.g. 2 = half-res -> 8x less "
+             "RAM, 4 = quarter-res -> 64x less RAM). Applies to all "
+             "supported image formats (zarr / TIFF hyperstack / folder of "
+             "per-timepoint TIFFs). Default: 1 (full resolution). "
+             "Recommended: 2 for a (460,1152,1152) volume to fit two "
+             "volumes into ~50-100 GB instead of ~400 GB."
     )
     parser.add_argument(
         "--preload",
@@ -8979,6 +9255,8 @@ def main():
         spots_df, tracks_df,
         segments_zarr_path=args.segments,
         processed_path=args.processed,
+        raw_path=args.raw,
+        image_load_downsample=args.image_load_downsample,
         voxel_size=tuple(args.voxel_size),
         downsample=args.downsample,
         load_downsample=args.load_downsample,
