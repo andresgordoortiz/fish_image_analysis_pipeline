@@ -1645,7 +1645,7 @@ process PLANAR_CORRECTION {
     input:
     tuple val(timepoint), path(image_file)
     path metadata_json
-    path planar_script
+    path bin_dir            // entire bin/ so _tiff_io.py is importable
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_planar.tif"), emit: corrected
@@ -1654,13 +1654,9 @@ process PLANAR_CORRECTION {
     script:
     def t_formatted = String.format('%04d', timepoint)
     def filename = image_file.name
-    def script_name = planar_script.name
     """
     #!/bin/bash
     set -euo pipefail
-
-    eval "\$(micromamba shell hook --shell bash)"
-    micromamba activate microscopy_env
 
     echo "============================================"
     echo "Planar (XY) shading correction — timepoint ${timepoint}"
@@ -1668,13 +1664,13 @@ process PLANAR_CORRECTION {
     echo "Sigma : ${planar_sigma_xy} px"
     echo "============================================"
 
-    python3 \${script_name} \\
-        --input  "${filename}" \\
-        --output "t${t_formatted}_planar.tif" \\
+    python3 bin/planar_intensity_correction.py \\
+        --input   "${filename}" \\
+        --output  "t${t_formatted}_planar.tif" \\
         --sigma_xy ${planar_sigma_xy} \\
         2>&1 | tee "t${t_formatted}_planar.log"
 
-    echo "✓ Planar correction complete: t${t_formatted}_planar.tif"
+    echo "Planar correction complete: t${t_formatted}_planar.tif"
     """
 }
 
@@ -1699,7 +1695,7 @@ process DEPTH_CORRECTION {
     input:
     tuple val(timepoint), path(image_file)
     path metadata_json
-    path depth_script
+    path bin_dir            // entire bin/ so _tiff_io.py is importable
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_depth.tif"), emit: corrected
@@ -1708,13 +1704,9 @@ process DEPTH_CORRECTION {
     script:
     def t_formatted = String.format('%04d', timepoint)
     def filename = image_file.name
-    def script_name = depth_script.name
     """
     #!/bin/bash
     set -euo pipefail
-
-    eval "\$(micromamba shell hook --shell bash)"
-    micromamba activate microscopy_env
 
     echo "============================================"
     echo "Depth (Z) intensity correction — timepoint ${timepoint}"
@@ -1724,7 +1716,7 @@ process DEPTH_CORRECTION {
     echo "Gain   : [${depth_gain_min}, ${depth_gain_max}]"
     echo "============================================"
 
-    python3 \${script_name} \\
+    python3 bin/depth_intensity_correction.py \\
         --input         "${filename}" \\
         --output        "t${t_formatted}_depth.tif" \\
         --mode          "${depth_mode}" \\
@@ -1733,7 +1725,7 @@ process DEPTH_CORRECTION {
         --gain_max      ${depth_gain_max} \\
         2>&1 | tee "t${t_formatted}_depth.log"
 
-    echo "✓ Depth correction complete: t${t_formatted}_depth.tif"
+    echo "Depth correction complete: t${t_formatted}_depth.tif"
     """
 }
 
@@ -1758,7 +1750,7 @@ process ISOTROPIC {
     input:
     tuple val(timepoint), path(image_file)
     path metadata_json
-    path iso_script
+    path bin_dir            // entire bin/ so _tiff_io.py is importable
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_processed.tif"), emit: processed
@@ -1767,13 +1759,9 @@ process ISOTROPIC {
     script:
     def t_formatted = String.format('%04d', timepoint)
     def filename = image_file.name
-    def script_name = iso_script.name
     """
     #!/bin/bash
     set -euo pipefail
-
-    eval "\$(micromamba shell hook --shell bash)"
-    micromamba activate microscopy_env
 
     echo "============================================"
     echo "Isotropic Z resampling — timepoint ${timepoint}"
@@ -1781,14 +1769,14 @@ process ISOTROPIC {
     echo "Target : ${iso_target_um} µm (order=${iso_order})"
     echo "============================================"
 
-    python3 \${script_name} \\
+    python3 bin/isotropic_resample.py \\
         --input     "${filename}" \\
         --output    "t${t_formatted}_processed.tif" \\
         --target_um ${iso_target_um} \\
         --order     ${iso_order} \\
         2>&1 | tee "t${t_formatted}_iso.log"
 
-    echo "✓ Isotropic resample complete: t${t_formatted}_processed.tif"
+    echo "Isotropic resample complete: t${t_formatted}_processed.tif"
     """
 }
 
@@ -2986,22 +2974,26 @@ workflow {
         //      parameter change
         //   3. intermediate TIFFs (planar / depth) are published and useful for QA
         log.info "Preprocessing chain: planar -> depth -> isotropic"
-        planar_script_ch = Channel.fromPath(params.planar_correction_script, checkIfExists: true)
-        depth_script_ch  = Channel.fromPath(params.depth_correction_script,  checkIfExists: true)
-        iso_script_ch    = Channel.fromPath(params.isotropic_resample_script, checkIfExists: true)
+        // Stage the entire bin/ directory as a single input so the per-step
+        // scripts (and their _tiff_io.py dependency) are all available in
+        // the task workdir when the script's first line is `from _tiff_io
+        // import ...`. Using path() (not file()) preserves the directory
+        // name 'bin/' which the script invocation ``python3 bin/<script>.py``
+        // relies on for the relative import.
+        bin_dir_ch = Channel.fromPath("${projectDir}/bin", type: 'dir', checkIfExists: true).collect()
 
         // Step 1: planar (XY) shading correction
         PLANAR_CORRECTION(
             processing_input,
             shared_metadata,
-            planar_script_ch.collect()
+            bin_dir_ch
         )
 
         // Step 2: depth (Z) intensity correction, consumes planar output
         DEPTH_CORRECTION(
             PLANAR_CORRECTION.out.corrected,
             shared_metadata,
-            depth_script_ch.collect()
+            bin_dir_ch
         )
 
         // Step 3: isotropic Z resampling, consumes depth output. The result is
@@ -3010,7 +3002,7 @@ workflow {
         ISOTROPIC(
             DEPTH_CORRECTION.out.corrected,
             shared_metadata,
-            iso_script_ch.collect()
+            bin_dir_ch
         )
 
         segmentation_input = ISOTROPIC.out.processed
