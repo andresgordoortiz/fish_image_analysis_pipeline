@@ -311,10 +311,19 @@ PLANAR_CORRECTION ──► DEPTH_CORRECTION ──► ISOTROPIC ──► Cellp
 | Isotropic resample | `bin/isotropic_resample.py` | Resamples Z so the voxel size matches the smallest XY pixel size. | `target_um = 0.374`, `order = 3` (cubic) |
 
 All three are pure NumPy + SciPy, run on CPU, and chain via Nextflow. The
-math is ported from the AIAF-32 modular scripts and adapted to read/write
-plain TIFFs with ImageJ metadata (voxel sizes round-trip through every
-step, so downstream Cellpose / ultrack / viewer see the corrected geometry
-automatically).
+math is ported **verbatim** from the AIAF-32 modular scripts and adapted
+to read/write plain TIFFs with ImageJ metadata (voxel sizes round-trip
+through every step, so downstream Cellpose / ultrack / viewer see the
+corrected geometry automatically).
+
+> **Bit-equivalence verified.** `tests/test_aiaf32_equivalence.py` runs
+> all three scripts on a synthetic stack and compares the output arrays
+> against the AIAF-32 reference math imported directly. They are
+> **bit-identical** (max abs diff = 0). Run it with:
+>
+> ```bash
+> /usr/local/bin/python3 tests/test_aiaf32_equivalence.py
+> ```
 
 To tune any step, edit its block in `config.json`:
 
@@ -328,6 +337,35 @@ To tune any step, edit its block in `config.json`:
   }
 }
 ```
+
+When **all** options are enabled, the full Nextflow chain is:
+
+```
+SPLIT_INPUT_FILE (optional, for hyperstack inputs)
+       │
+       ▼
+  CROP_WITH_ROI (optional)
+       │
+       ▼
+PLANAR_CORRECTION ──► DEPTH_CORRECTION ──► ISOTROPIC ──► DOWNSCALE_XY (optional)
+       │                                                       │
+       │                                                       ▼
+       │                                                  CELLPOSE_SEGMENT
+       │                                                       │
+       ▼                                                       ▼
+                                                       MERGE_HYPERSTACKS
+                                                              │
+                                                              ▼
+                                              PREP_ULTRACK → ULTRACK_SEGMENT
+                                                              │
+                                                              ▼
+                                              ULTRACK_LINK → ULTRACK_SOLVE
+                                                              │
+                                                              ▼
+                                                       ULTRACK_EXPORT
+```
+
+`EXPORT_RAW_ISOTROPIC` runs in parallel for the viewer overlay.
 
 To disable preprocessing entirely (e.g. you already have preprocessed
 TIFFs from another tool) set `preprocessing.enabled = false` and point

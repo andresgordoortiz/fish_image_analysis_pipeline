@@ -3017,6 +3017,25 @@ workflow {
 
     } // end skip_preprocessing else
 
+    // 2c. OPTIONAL: XY downscale on the preprocessed output, BEFORE segmentation.
+    //
+    // When all options are enabled (downscaling.enabled=true AND preprocessing
+    // enabled) the user expects the full chain to be:
+    //   PLANAR -> DEPTH -> ISOTROPIC -> DOWNSCALE_XY -> CELLPOSE -> ultrack
+    // This matches what DOWNSCALE_XY already does on the standalone-downscale
+    // path. Z stays isotropic (skipped here because ISOTROPIC already enforced
+    // it on the way in).
+    if (!skip_preprocessing && downscaling_enabled && effective_scaling < 1.0d) {
+        log.info "XY downscale ENABLED on preprocessed output — factor=${effective_scaling}"
+        DOWNSCALE_XY(
+            segmentation_input,
+            shared_metadata,
+            effective_scaling,
+            false  // Z already isotropic, no second reslice needed
+        )
+        segmentation_input = DOWNSCALE_XY.out.downscaled
+    }
+
     // 3. Segment each timepoint with Cellpose
     if (!skip_segmentation) {
         // effective_scaling comes from the top-level downscaling.{enabled,factor}
