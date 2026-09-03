@@ -1103,8 +1103,26 @@ class CrossSectionViewer:
 
     @property
     def df(self):
-        """Always read the parent's current spots DataFrame (never stale)."""
-        return self.parent.spots
+        """Always read the parent's current spots DataFrame (never stale).
+
+        Returns ``None`` when no spots have been loaded.  All callers that
+        need spots must check for ``None`` first — the cross-section
+        viewer is intentionally modular and works with any combination
+        of (raw, processed, segmented, tracks).
+        """
+        return getattr(self.parent, "spots", None)
+
+    @property
+    def _has_spots(self) -> bool:
+        df = self.df
+        return df is not None and len(df) > 0
+
+    @property
+    def _has_tracks(self) -> bool:
+        df = self.df
+        if df is None or "TRACK_ID" not in df.columns:
+            return False
+        return bool(df["TRACK_ID"].notna().any())
 
     def __init__(self, parent: "EmbryoViewer"):
         napari, _ = _import_napari()
@@ -1154,30 +1172,45 @@ class CrossSectionViewer:
         self._track_display_graph = True
         self._track_opacity = 1.0
 
-        # ── Pre-cache numpy arrays from DF (avoids repeated .values calls) ──
+        # ── Spots / tracks are OPTIONAL ──
+        # The cross-section viewer is modular: any combination of
+        # raw, processed, segmented and tracks can be loaded.  When
+        # spots are missing, axis ranges and frame bounds are derived
+        # from the first available image volume instead.
         df = self.df
-        self._pos_x = df["POSITION_X"].values
-        self._pos_y = df["POSITION_Y"].values
-        self._pos_z = df["POSITION_Z"].values
-        self._frames = df["FRAME"].values
-
-        # Set max tracks to actual track count (fast on numpy)
-        if "TRACK_ID" in df.columns:
-            self._track_ids = df["TRACK_ID"].values
-            n_total_tracks = len(np.unique(self._track_ids[~np.isnan(self._track_ids)])) if self._track_ids.dtype.kind == 'f' else len(np.unique(self._track_ids))
+        if df is not None and len(df) > 0:
+            self._pos_x = df["POSITION_X"].values
+            self._pos_y = df["POSITION_Y"].values
+            self._pos_z = df["POSITION_Z"].values
+            self._frames = df["FRAME"].values
+            if "TRACK_ID" in df.columns:
+                self._track_ids = df["TRACK_ID"].values
+                tids = self._track_ids
+                if tids.dtype.kind == 'f':
+                    tids = tids[~np.isnan(tids)]
+                n_total_tracks = len(np.unique(tids))
+            else:
+                self._track_ids = None
+                n_total_tracks = 500
         else:
+            self._pos_x = np.array([], dtype=float)
+            self._pos_y = np.array([], dtype=float)
+            self._pos_z = np.array([], dtype=float)
+            self._frames = np.array([], dtype=np.int64)
             self._track_ids = None
             n_total_tracks = 500
         self._max_tracks = n_total_tracks
 
-        # Compute axis ranges (single pass on cached arrays)
-        self._ranges = {
-            "X": (float(self._pos_x.min()), float(self._pos_x.max())),
-            "Y": (float(self._pos_y.min()), float(self._pos_y.max())),
-            "Z": (float(self._pos_z.min()), float(self._pos_z.max())),
-        }
-        fmin = int(self._frames.min())
-        fmax = int(self._frames.max())
+        # Compute axis ranges + frame range.  Prefer spots; fall back to
+        # the first available image volume; finally fall back to a
+        # generous default so the slider has sensible bounds.
+        self._ranges = self._derive_axis_ranges()
+        fmin, fmax = self._derive_frame_range()
+
+        # If no spots, the per-track filters and the spots/tracks
+        # controls must be disabled (they'd just be dead weight) —
+        # this is done in ``_update_widget_availability`` after the
+        # widgets are built.
 
         # Separate napari viewer in 2D
         self.viewer = napari.Viewer(title="Cross-Section View", ndisplay=2)
@@ -1337,6 +1370,17 @@ class CrossSectionViewer:
         btn_color_radvel.changed.connect(lambda: self._set_color("radial_vel"))
         btn_color_track = PushButton(text="Colour by Track ID")
         btn_color_track.changed.connect(lambda: self._set_color("track_id"))
+        # Stored so we can disable them all when no spots are loaded.
+        self._color_buttons = [
+            btn_color_frame,
+            btn_color_depth,
+            btn_color_depth_travel,
+            btn_color_theta,
+            btn_color_phi,
+            btn_color_speed,
+            btn_color_radvel,
+            btn_color_track,
+        ]
 
         # ── Annotation toggles ──
         self.show_landmarks_check = CheckBox(
@@ -1563,6 +1607,146 @@ class CrossSectionViewer:
             self._refresh_filter_count_label()
         except Exception:
             pass
+
+        # Enable/disable widgets that depend on optional data
+        # (spots / tracks).  Has to run *after* the widget tree has
+        # been built, so it lives at the very end of __init__.
+        self._update_widget_availability()
+
+    # ── Modularity helpers ───────────────────────────────────────────
+    # The cross-section viewer is intentionally data-agnostic: it can
+    # run with any combination of raw, processed, segmented, spots and
+    # tracks.  When spots are missing, axis ranges + frame bounds are
+    # derived from the first available image volume so the viewer
+    # still opens with sensible defaults.
+
+    def _derive_axis_ranges(self) -> dict:
+        """Return {(lo, hi)} per axis.  Spots win; otherwise image dims.
+
+        When no spots are loaded we use the shape of the first image
+        volume we can find (in order: segmentation, processed, raw).
+        The axis range is treated in *voxel* units; the parent's
+        ``_display_ds`` factor is applied so a half-res display volume
+        still matches the world coordinates the spots would use.
+        """
+        if self._pos_x.size > 0:
+            return {
+                "X": (float(self._pos_x.min()), float(self._pos_x.max())),
+                "Y": (float(self._pos_y.min()), float(self._pos_y.max())),
+                "Z": (float(self._pos_z.min()), float(self._pos_z.max())),
+            }
+
+        # Fall back to the shape of the first available image volume.
+        ds = float(getattr(self.parent, "_display_ds", 1) or 1)
+        vol = self._first_image_volume()
+        if vol is None:
+            # No data at all — return generous defaults; sliders will
+            # still function, the user just gets an empty viewer.
+            return {"X": (0.0, 1000.0), "Y": (0.0, 1000.0), "Z": (0.0, 1000.0)}
+        # 3D volume is (Z, Y, X)
+        nZ, nY, nX = vol.shape
+        return {
+            "X": (0.0, float((nX - 1) * ds)),
+            "Y": (0.0, float((nY - 1) * ds)),
+            "Z": (0.0, float((nZ - 1) * ds)),
+        }
+
+    def _derive_frame_range(self) -> tuple[int, int]:
+        """Return (fmin, fmax) in FRAME units.  Spots win; otherwise image count."""
+        if self._frames.size > 0:
+            return int(self._frames.min()), int(self._frames.max())
+
+        # Fall back to the number of timepoints in the first available
+        # image volume.  The image volume may be either a single 4D
+        # array (T, Z, Y, X) — e.g. a 4D zarr — or a list of 3D arrays
+        # (one per timepoint) — e.g. a folder of per-TP tiffs.
+        n_tp = self._count_image_timepoints()
+        if n_tp <= 0:
+            return 0, 0
+        return 0, n_tp - 1
+
+    def _count_image_timepoints(self) -> int:
+        """Number of timepoints in the first available image source.
+
+        Returns 0 when no image data is loaded.
+        """
+        parent = self.parent
+
+        # Segmentation: a single 4D (T, Z, Y, X) dask array
+        seg = getattr(parent, "_segments_data", None)
+        if seg is not None:
+            try:
+                arr = np.asarray(seg)
+                if arr.ndim == 4:
+                    return int(arr.shape[0])
+                # 3D segments → single timepoint
+                if arr.ndim == 3:
+                    return 1
+            except Exception:
+                pass
+
+        # Processed: a list of 3D volumes (one per TP)
+        proc = getattr(parent, "_processed_frames", None)
+        if proc is not None and len(proc) > 0:
+            return len(proc)
+
+        # Raw: a list of 3D volumes under _image_layers["raw"]["frames"]
+        raw_dict = getattr(parent, "_image_layers", {}).get("raw", {})
+        raw = raw_dict.get("frames") if isinstance(raw_dict, dict) else None
+        if raw is not None and len(raw) > 0:
+            return len(raw)
+
+        return 0
+
+    def _first_image_volume(self):
+        """Return the first available image volume (Z, Y, X).
+
+        Priority: segmentation → processed → raw → single image
+        returned by ``_get_image_array``.  Returns ``None`` if nothing
+        has been loaded.
+        """
+        parent = self.parent
+
+        # Segmentation (dask-backed in the main viewer; underlying 4D
+        # or 3D).  We strip the time axis if present so callers can
+        # treat all returned volumes uniformly as (Z, Y, X).
+        seg = getattr(parent, "_segments_data", None)
+        if seg is not None:
+            try:
+                arr = np.asarray(seg)
+                if arr.ndim == 4:
+                    return arr[0]
+                if arr.ndim == 3:
+                    return arr
+            except Exception:
+                pass
+
+        # Processed: list of 3D volumes (one per timepoint)
+        proc = getattr(parent, "_processed_frames", None)
+        if proc is not None and len(proc) > 0:
+            try:
+                return np.asarray(proc[0])
+            except Exception:
+                return None
+
+        # Raw (stored under _image_layers["raw"]["frames"]): same shape
+        raw_dict = getattr(parent, "_image_layers", {}).get("raw", {})
+        raw = raw_dict.get("frames") if isinstance(raw_dict, dict) else None
+        if raw is not None and len(raw) > 0:
+            try:
+                return np.asarray(raw[0])
+            except Exception:
+                return None
+
+        # Last-ditch: helper on the main viewer (returns a single 3D vol)
+        getter = getattr(parent, "_get_image_array", None)
+        if callable(getter):
+            try:
+                return np.asarray(getter())
+            except Exception:
+                return None
+
+        return None
 
     # ── Quick-jump helpers ───────────────────────────────────────────
 
@@ -2183,6 +2367,66 @@ class CrossSectionViewer:
             except Exception:
                 pass
 
+    def _update_widget_availability(self) -> None:
+        """Enable/disable widgets that depend on optional data.
+
+        Modular: spots and tracks are optional.  When they're missing
+        the corresponding widgets are disabled so the user gets clear
+        feedback instead of a dead control.  Called at the end of init
+        and may be called again if a parent's data set changes.
+        """
+        has_spots = self._has_spots
+        has_tracks = self._has_tracks
+
+        def _set_enabled(widget, enabled: bool) -> None:
+            if widget is None:
+                return
+            try:
+                widget.enabled = enabled
+            except Exception:
+                pass
+
+        # ── Spots-dependent widgets ──
+        _set_enabled(getattr(self, "show_tracks_check", None), has_tracks)
+        _set_enabled(getattr(self, "max_tracks_slider", None), has_tracks)
+        _set_enabled(getattr(self, "track_width_slider", None), has_tracks)
+        _set_enabled(
+            getattr(self, "min_track_length_spin", None), has_tracks
+        )
+        _set_enabled(getattr(self, "max_speed_slider", None), has_tracks)
+        _set_enabled(getattr(self, "random_sample_n", None), has_tracks)
+        _set_enabled(
+            getattr(self, "btn_random_sample", None), has_tracks
+        )
+        _set_enabled(
+            getattr(self, "btn_random_sample_reset", None), has_tracks
+        )
+        _set_enabled(
+            getattr(self, "mirror_main_selection_cb", None), has_tracks
+        )
+        _set_enabled(getattr(self, "display_pct_slider", None), has_spots)
+        _set_enabled(getattr(self, "point_size_slider", None), has_spots)
+        # Export filtered tracks is inherently spots-only.
+        _set_enabled(
+            getattr(self, "btn_export_filtered", None), has_tracks
+        )
+        # All colour modes are per-spot — disable when no spots.
+        for btn in getattr(self, "_color_buttons", []) or []:
+            _set_enabled(btn, has_spots)
+
+        # ── Status hint ──
+        lbl = getattr(self, "lbl_info", None)
+        if lbl is not None:
+            if not has_spots and not self._has_processed and not self._has_raw and not self._has_seg:
+                lbl.value = (
+                    "No data loaded — load a Spots CSV, a Segments .zarr, "
+                    "a Processed image or a Raw image to populate the view."
+                )
+            elif not has_spots:
+                lbl.value = (
+                    "Images only — load a Spots CSV to add nuclei and tracks."
+                )
+
     def _set_color(self, mode: str):
         needed = {
             "depth": "SPHERICAL_DEPTH",
@@ -2191,6 +2435,12 @@ class CrossSectionViewer:
             "phi": "PHI_DEG",
             "radial_vel": "RADIAL_VELOCITY_SMOOTH",
         }
+        # All per-spot colour modes require spots.  Without spots the
+        # only sensible mode is the (no-op) frame mode — and there's
+        # nothing to colour anyway.
+        if not self._has_spots:
+            self.viewer.status = "Color modes need a Spots CSV."
+            return
         if mode in needed and needed[mode] not in self.df.columns:
             self.viewer.status = f"'{mode}' not available — fit sphere first."
             return
@@ -2348,6 +2598,8 @@ class CrossSectionViewer:
 
     def _project(self, idx: np.ndarray) -> np.ndarray:
         """Project indexed spots to 2D [v, h] coordinates."""
+        if not self._has_spots or self._pos_x.size == 0:
+            return np.zeros((0, 2), dtype=float)
         v_col, h_col = self._AXES_MAP[self._axis]
         _col_arr = {"POSITION_X": self._pos_x, "POSITION_Y": self._pos_y, "POSITION_Z": self._pos_z}
         h = _col_arr[h_col][idx]
@@ -2981,11 +3233,31 @@ class CrossSectionViewer:
         R_inv = R1.T @ R2.T
 
         v_col, h_col = self._AXES_MAP[axis]
+        # Orient-extent: prefer spots; fall back to the underlying image
+        # volume shape so the oriented grid still has a sensible
+        # bounding box when no spots have been loaded.
         df = self.parent.spots
-        v_min = float(df[v_col].min())
-        v_max = float(df[v_col].max())
-        h_min = float(df[h_col].min())
-        h_max = float(df[h_col].max())
+        if df is not None and len(df) > 0:
+            v_min = float(df[v_col].min())
+            v_max = float(df[v_col].max())
+            h_min = float(df[h_col].min())
+            h_max = float(df[h_col].max())
+        else:
+            vol = self._first_image_volume()
+            if vol is not None:
+                nZ, nY, nX = vol.shape
+                # POSITION_* column → volume axis size (3D vol is Z, Y, X)
+                col_axis_size = {
+                    "POSITION_X": nX,
+                    "POSITION_Y": nY,
+                    "POSITION_Z": nZ,
+                }
+                v_size = col_axis_size[v_col]
+                h_size = col_axis_size[h_col]
+                v_min, v_max = 0.0, float((v_size - 1) * ds)
+                h_min, h_max = 0.0, float((h_size - 1) * ds)
+            else:
+                v_min = v_max = h_min = h_max = 0.0
 
         # Cap grid resolution for speed (256 max)
         n_v = min(max(int((v_max - v_min) / max(ds, 1)) + 1, 10), 256)
@@ -3290,8 +3562,11 @@ class CrossSectionViewer:
 
     def _get_colors(self, idx: np.ndarray) -> np.ndarray:
         """Color the cross-section points."""
-        if len(idx) == 0:
+        if not self._has_spots or len(idx) == 0:
             return np.array([[0.5, 0.5, 0.5, 1.0]])
+        df = self.df
+        if df is None:
+            return np.full((len(idx), 4), [0.5, 0.5, 0.5, 1.0], dtype=float)
 
         df = self.df
         mode = self._color_mode
@@ -3427,7 +3702,12 @@ class CrossSectionViewer:
             )
             return
 
-        all_frames = sorted(self.df["FRAME"].unique())
+        all_frames = sorted(self.df["FRAME"].unique()) if self._has_spots else None
+        if all_frames is None:
+            # Fall back to the frame slider's min/max when no spots.
+            all_frames = list(range(
+                int(self.frame_slider.min), int(self.frame_slider.max) + 1
+            ))
         frames = [int(f) for f in all_frames if f_start <= f <= f_end][::f_step]
         if not frames:
             self.viewer.status = "No frames in selected range!"
@@ -3554,6 +3834,8 @@ class CrossSectionViewer:
     def _compute_speed(self, idx: np.ndarray) -> np.ndarray:
         """Per-spot displacement speed for selected indices."""
         df = self.df
+        if df is None or len(df) == 0:
+            return np.full(len(idx), np.nan, dtype=float)
         speed = np.full(len(df), np.nan)
         if "TRACK_ID" not in df.columns:
             return speed[idx]
@@ -5929,6 +6211,11 @@ class EmbryoViewer:
         self._add_spots_layer()
         self._add_tracks_layer()
 
+        # (The cross-section viewer reads spots via the parent's
+        # ``spots`` attribute on every rebuild, so a freshly loaded
+        # dataset is picked up automatically the next time the user
+        # opens a new cross-section window.)
+
         n_s = f"{len(self.spots):,}"
         n_f = self.spots["FRAME"].nunique()
         has_tid = (
@@ -6307,8 +6594,20 @@ class EmbryoViewer:
         btn_record_video.changed.connect(self._record_video)
 
         # ── Cross-section ──
+        # The cross-section viewer is intentionally modular: it works
+        # with any combination of raw, processed, segmented and tracks,
+        # and even with NO data (an empty viewer is opened and becomes
+        # useful as soon as the user loads something).  Image layers
+        # are optional overlays; spots are optional; tracks are
+        # optional.  The button is always enabled.
         btn_cross_section = PushButton(text="✂ Cross-Section View")
         btn_cross_section.changed.connect(self._open_cross_section)
+        btn_cross_section.tooltip = (
+            "Open a 2D cross-section viewer. Modular: any combination\n"
+            "of raw, processed, segmented and tracks is supported.\n"
+            "Loads of new data are picked up next time you open a viewer."
+        )
+        self.btn_cross_section = btn_cross_section
 
         container = Container(
             widgets=[
@@ -8243,11 +8542,12 @@ class EmbryoViewer:
     # ── Cross-section view ────────────────────────────────────────────
 
     def _open_cross_section(self):
-        """Open a cross-section 2D scatter viewer in a separate window."""
-        if self.spots is None:
-            self.viewer.status = "Load spots first!"
-            return
+        """Open a cross-section 2D scatter viewer in a separate window.
 
+        Modular: opens with any combination of raw, processed, segmented
+        and tracks.  When no data is loaded yet, opens an empty viewer
+        that becomes useful as soon as something is loaded.
+        """
         self.viewer.status = "Opening cross-section viewer..."
         CrossSectionViewer(self)
 
