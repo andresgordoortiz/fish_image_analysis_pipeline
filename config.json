@@ -1,14 +1,12 @@
 {
   "_readme": "SPIM 4D pipeline config. Most users only need to edit input.directory, output.directory, and toggle the *_enabled flags. Paths can be absolute or relative to the repo dir. Input accepts a folder of per-timepoint TIFFs (t0001_*.tif, t0002_*.tif, ...) or a single hyperstack file (.czi, .tif, .tiff).",
-
   "pipeline": {
     "_comment": "Informational only.",
     "name": "SPIM 4D Image Processing Pipeline",
     "version": "1.0.0",
-    "author": "Andrés Gordo & Guilherme Ventura",
+    "author": "Andr\u00e9s Gordo & Guilherme Ventura",
     "institute": "IMP Vienna"
   },
-
   "input": {
     "_comment_directory": "Folder = per-timepoint TIFFs named t0001_*.tif, ... File = single hyperstack (.czi, .tif, .tiff).",
     "directory": "./subset/",
@@ -17,7 +15,6 @@
     "_comment_max_timepoints": "Optional. Only process the first N timepoints. null = use all.",
     "max_timepoints": null
   },
-
   "output": {
     "_comment_directory": "Where to write results. Will be created if it does not exist.",
     "directory": "./subset_results/",
@@ -28,19 +25,16 @@
     "_comment_skip_merge": "Skip the final 4D merge. Recommended for large data; you only need per-timepoint TIFFs for the viewer.",
     "skip_merge": false
   },
-
   "seqera_tower": {
     "_comment": "Paste your Seqera Platform access token to monitor runs in the browser (https://tower.nf -> Runs). Get one from tower.nf -> Settings -> Your tokens.",
     "enabled": true,
     "access_token": "eyJ0aWQiOiAxMzM2Nn0uZWRlMTAxYmIzZGE4ZDNjMzJjM2M1MmZkZThhNjBhZGI2M2EyNjE4Mg=="
   },
-
   "roi_cropping": {
     "_comment": "Crop every timepoint to a region drawn in Fiji (Edit > Selection > Add to Manager > save as .roi). Leave enabled=false to skip.",
     "enabled": false,
     "roi_path": "./medaka_spim_crop.roi"
   },
-
   "voxel_size": {
     "_comment": "Physical voxel size in micrometres. Required for tracking. auto_detect=true tries to read it from file metadata (CZI / OME-TIFF).",
     "auto_detect": false,
@@ -48,90 +42,44 @@
     "y_um": 0.347,
     "z_um": 2.0
   },
-
   "downscaling": {
     "_comment": "Optional pre-pipeline XY downscaling. Applied BEFORE segmentation regardless of whether preprocessing runs. 1.0 = no downscale. <1.0 trades resolution for speed/RAM.",
     "enabled": true,
     "factor": 0.33
   },
-
   "raw_export": {
-    "_comment": "Optional export of the RAW (unprocessed) input, sliced to be isotropic and downscaled so it can be overlaid on the tracks in ultrack_viewer.py. Runs INDEPENDENTLY of preprocessing/segmentation/tracking — the preprocessed chain still operates on the original-resolution raw input and produces its own volume. The exported raw volume is meant for visualization only (overlay with --processed in the viewer).",
+    "_comment": "Optional export of the RAW (unprocessed) input, sliced to be isotropic and downscaled so it can be overlaid on the tracks in ultrack_viewer.py. Runs INDEPENDENTLY of preprocessing/segmentation/tracking \u2014 the preprocessed chain still operates on the original-resolution raw input and produces its own volume. The exported raw volume is meant for visualization only (overlay with --processed in the viewer).",
     "enabled": false,
-    "_comment_factor": "XY scale factor (<1.0 = downscale). Independent of downscaling.factor — pick a value appropriate for napari display (typically 0.25–0.5 for a multi-GB acquisition). 1.0 = no downscale.",
+    "_comment_factor": "XY scale factor (<1.0 = downscale). Independent of downscaling.factor \u2014 pick a value appropriate for napari display (typically 0.25\u20130.5 for a multi-GB acquisition). 1.0 = no downscale.",
     "factor": 0.33,
     "_comment_isotropic": "Resample Z so voxels match the downscaled XY pixel size. Required for correct registration with the tracks in the viewer (tracks are emitted in isotropic coordinates).",
     "isotropic_reslice": true
   },
-
   "preprocessing": {
-    "_comment": "Shading + Z-intensity correction + deblurring. Produces an isotropic, intensity-normalised stack ready for segmentation.",
+    "_comment": "Modular preprocessing \u2014 three independent NumPy/SciPy steps (CPU only), ported from AIAF-32. Produces an isotropic, shading-corrected, depth-flattened stack ready for segmentation. Each step has sane defaults; override here only when you know why.",
     "enabled": true,
-    "_comment_isotropic_reslice": "Resample Z so voxels become isotropic. Recommended for segmentation / tracking / viewer overlay.",
-    "isotropic_reslice": true,
-    "_comment_method": "'deconvolution' (GPU Richardson-Lucy, uses psf_path) or 'selfnet' (deep-learning deblurring, uses selfnet.model_path).",
-    "method": "deconvolution",
-
-    "selfnet": {
-      "_comment": "Only used when method = 'selfnet'.",
-      "model_path": "/groups/pinheiro/user/andres.gordo/selfnet_models/deblur_net.pkl",
-      "_comment_per_view": "Optional per-view models. Leave null to reuse model_path for both XZ and YZ.",
-      "model_path_xz": null,
-      "model_path_yz": null,
-      "ngf": 64,
-      "n_blocks": 6,
-      "norm": "instance",
-      "batch_size": 8,
-      "net_min_v": 0,
-      "net_max_v": 65535,
-      "_comment_net_normalization": "Training-matched percentile normalisation applied to the Self-Net input. Set no_net_normalization=true to feed the corrected stack directly.",
-      "net_percentile_low": 30,
-      "net_percentile_high": 99.999,
-      "net_thres_scale": 1.5,
-      "no_net_normalization": false
+    "_comment_planar": "XY shading correction. Estimates a smooth flat-field from the mean-Z projection and divides every slice by it. Larger sigma_xy = smoother field.",
+    "planar": {
+      "sigma_xy": 64.0
     },
-
-    "_comment_psf": "Point spread function .tif used by Richardson-Lucy. Only used when method = 'deconvolution'.",
-    "psf_path": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Andres/scripts_from_Andres/image_processing_script/psf_models/PSF_small_low-res.tif",
-    "save_intermediates": true,
-    "deconvolution": {
-      "_comment": "Tuned to sweep experiment 23_wbns_xy_only_gentle on 2026-07-09. niter=0 skips XY Richardson-Lucy; niterz=0 skips XZ Richardson-Lucy. The pipeline guards both with `if niter > 0` / `if niterz > 0`, so 0 is the canonical 'disabled' value here.",
-      "niter": 0,
-      "niterz": 0,
-      "padding": 64
+    "_comment_depth": "Z intensity correction. Rescales each Z slice so a robust per-slice statistic (default p99) is constant along Z, with a moving-average smoothing window to avoid noisy single-slice spikes.",
+    "depth": {
+      "_comment_mode": "Per-slice statistic: 'mean', 'median', or 'pXX' (e.g. 'p95', 'p99').",
+      "mode": "p99",
+      "_comment_smooth_window": "Moving-average window along Z (odd integer). <=1 disables smoothing.",
+      "smooth_window": 9,
+      "_comment_gain_clip": "Clamp the multiplicative gain per slice so dark Z slices do not get amplified to noise.",
+      "gain_min": 0.25,
+      "gain_max": 4.0
     },
-
-    "normalization": {
-      "_comment": "Output intensity normalisation (percentile clip + rescale to [min_v, max_v]).",
-      "min_v": 0,
-      "max_v": 65535,
-      "percentile_low": 10.0,
-      "percentile_high": 99.9
-    },
-    "background_subtraction": {
-      "_comment": "WBNS (wavelet-based background subtraction) on XY then on transposed XZ. Same algorithm and parameters as the debug branch's stage_wbns. Tuned to sweep experiment 23_wbns_xy_only_gentle on 2026-07-09: gentle XY subtraction (resolution_px0=6, noise_lvl=1) with XZ subtraction disabled (resolution_pz0=0).",
-      "resolution_px0": 6,
-      "resolution_pz0": 0,
-      "noise_lvl": 1
-    },
-    "postprocessing": {
-      "_comment": "Final Gaussian smoothing sigma. NOTE: spim_pipeline.py reads --sigma (default 1.0) and ignores this key, so to actually use 1.2 to match debug, pass --sigma 1.2 on the CLI.",
-      "sigma": 1.2
-    },
-    "correction_flags": {
-      "_comment": "Force-disable individual correction steps (debugging only). All false = all corrections enabled (matches debug branch's default).",
-      "no_clahe": false,
-      "no_z_correction": false,
-      "no_shading": false
-    },
-
-    "debug_preprocessing": {
-      "_comment": "Optional per-timepoint QA. Saves side-by-side raw vs preprocessed for the first timepoints.",
-      "enabled": true,
-      "save_masks": false
+    "_comment_isotropic": "Resample Z so the voxel size matches the (smaller) XY pixel size. Cubic spline by default; linear is faster but blockier.",
+    "isotropic": {
+      "_comment_target_um": "Target isotropic voxel size in micrometres. Set to the smaller of your raw X and Y pixel size.",
+      "target_um": 0.374,
+      "_comment_order": "Spline interpolation order (1 = linear, 3 = cubic).",
+      "order": 3
     }
   },
-
   "segmentation": {
     "_comment": "3D Cellpose segmentation. Runs on a GPU node. Set enabled=false to skip.",
     "enabled": true,
@@ -154,12 +102,10 @@
     "_comment_downscale_labels": "Downscale the saved label volume by this factor. 1.0 = full res. Useful when the label volume is too big for the viewer.",
     "downscale_labels": 1.0
   },
-
   "benchmark": {
     "_comment": "Writes a small CSV/JSON with per-timepoint timing and memory stats.",
     "enabled": true
   },
-
   "tracking": {
     "_comment": "Cell tracking with ultrack. Set enabled=true to run the full chain (prep -> segment -> link -> solve -> export). Needs segmentation enabled too.",
     "enabled": true,
@@ -171,7 +117,6 @@
       "min_area": 10
     }
   },
-
   "system": {
     "_comment": "Container images and resume behaviour. Most users never need to touch this.",
     "container_image": "library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559",

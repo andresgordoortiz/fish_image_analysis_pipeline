@@ -16,12 +16,12 @@ import java.nio.file.Paths
 
 // Parameters - only config_json is required, everything else comes from it
 params.config_json = null
-params.preprocessing_script = './spim_pipeline_fixed.py'
-// Self-Net deblurring front-end (alternative to deconvolution). The Self-Net
-// script reuses helpers from the deconvolution script (spim_pipeline_fixed.py)
-// and WBNS.py, so both are staged alongside it when method='selfnet'.
-params.selfnet_script = './spim_selfnet_preprocess.py'
-params.wbns_script = './WBNS.py'
+// Modular preprocessing scripts (lean, single-purpose, ported from AIAF-32).
+// Each one is a small CLI: read TIFF -> apply one correction -> write TIFF.
+// They chain in the workflow as: planar -> depth -> isotropic.
+params.planar_correction_script = './bin/planar_intensity_correction.py'
+params.depth_correction_script  = './bin/depth_intensity_correction.py'
+params.isotropic_resample_script = './bin/isotropic_resample.py'
 params.merge_script = './merge_hyperstack.py'
 params.benchmark_script = './benchmark_pipeline.py'
 params.prep_ultrack_script = './prep_ultrack_cellpose.py'
@@ -46,9 +46,13 @@ if (!params.config_json) {
     exit 1
 }
 
-if (!file(params.preprocessing_script).exists()) {
-    log.error "Preprocessing script not found: ${params.preprocessing_script}"
-    exit 1
+// Existence checks for the modular preprocessing scripts. Fail fast at
+// launch (before submitting any SLURM jobs) if any of them are missing.
+[params.planar_correction_script, params.depth_correction_script, params.isotropic_resample_script].each { script_path ->
+    if (!file(script_path).exists()) {
+        log.error "Modular preprocessing script not found: ${script_path}"
+        exit 1
+    }
 }
 
 // Load configuration from JSON
@@ -198,33 +202,19 @@ if (downscaling_factor <= 0.0d || downscaling_factor > 1.0d) {
 def effective_scaling = downscaling_enabled ? downscaling_factor : 1.0d
 def run_standalone_downscaling = skip_preprocessing && effective_scaling < 1.0d
 
-// Adapter map so the existing --image_scaling CLI plumbing keeps working
-// inside PREPROCESS_DECONVOLVE / PREPROCESS_SELFNET after the rename of
-// preprocessing.image_scaling -> downscaling.factor.
-def preprocess_config = (config.preprocessing ?: [:]) + [image_scaling: effective_scaling] // NOSONAR
-
-// Preprocessing method: 'deconvolution' (GPU Richardson-Lucy, default) or
-// 'selfnet' (Self-Net deep-learning deblurring / isotropic reconstruction).
-def preprocess_method = (config.preprocessing?.method ?: 'deconvolution').toString().toLowerCase()
-if (!(preprocess_method in ['deconvolution', 'selfnet'])) {
-    log.error "Unknown preprocessing.method '${preprocess_method}'. Use 'deconvolution' or 'selfnet'."
-    exit 1
-}
-// Validate Self-Net settings up front so the run fails fast (not 50 jobs in).
-if (!skip_preprocessing && preprocess_method == 'selfnet') {
-    def sn = config.preprocessing?.selfnet
-    if (!sn || !sn.model_path) {
-        log.error "preprocessing.method='selfnet' requires preprocessing.selfnet.model_path in config.json"
-        exit 1
-    }
-    def sn_model = sanitizePath(sn.model_path.toString())
-    if (!file(sn_model).exists()) {
-        log.error "Self-Net model not found: ${sn.model_path} (resolved to: ${file(sn_model)})"
-        exit 1
-    }
-    log.info "Preprocessing method: SELF-NET (model: ${sn_model})"
-} else if (!skip_preprocessing) {
-    log.info "Preprocessing method: DECONVOLUTION"
+// Modular preprocessing parameters. Defaults match the AIAF-32 calibrated
+// values for typical SPIM embryo stacks (p99 + window 9 + isotropic at the
+// smallest XY pixel size). Each parameter is optional in config.json — when
+// absent we fall back to these defaults.
+def planar_sigma_xy   = (config.preprocessing?.planar?.sigma_xy     != null) ? (config.preprocessing.planar.sigma_xy     as Double) : 64.0d
+def depth_mode        = (config.preprocessing?.depth?.mode          ?: 'p99').toString()
+def depth_smooth      = (config.preprocessing?.depth?.smooth_window != null) ? (config.preprocessing.depth.smooth_window as Integer) : 9
+def depth_gain_min    = (config.preprocessing?.depth?.gain_min      != null) ? (config.preprocessing.depth.gain_min      as Double) : 0.25d
+def depth_gain_max    = (config.preprocessing?.depth?.gain_max      != null) ? (config.preprocessing.depth.gain_max      as Double) : 4.0d
+def iso_target_um     = (config.preprocessing?.isotropic?.target_um != null) ? (config.preprocessing.isotropic.target_um as Double) : 0.374d
+def iso_order         = (config.preprocessing?.isotropic?.order     != null) ? (config.preprocessing.isotropic.order     as Integer) : 3
+if (!skip_preprocessing) {
+    log.info "Preprocessing method: MODULAR (planar sigma=${planar_sigma_xy} px, depth=${depth_mode}/w${depth_smooth}, isotropic=${iso_target_um} µm/order=${iso_order})"
 }
 
 // Optional: limit input to the first N timepoints (after sorting). Useful when
@@ -278,27 +268,14 @@ if (!config.tracking.prep.containsKey('boundary_width'))  { config.tracking.prep
 if (!config.tracking.prep.containsKey('min_area'))        { config.tracking.prep.min_area = 10 }
 def skip_tracking = config.tracking?.enabled != true
 
-// Set defaults for debug_preprocessing (lives inside preprocessing section)
-if (!config.preprocessing.containsKey('debug_preprocessing')) {
-    config.preprocessing.debug_preprocessing = [enabled: false]
-}
-def dbg = config.preprocessing.debug_preprocessing
-if (!dbg.containsKey('save_masks')) { dbg.save_masks = false }
-// Always inherit cellpose params from segmentation section so the debug
-// analysis uses the exact same model & thresholds as the real segmentation.
-dbg.cellpose_model              = dbg.cellpose_model              ?: config.segmentation?.model              ?: 'cyto3'
-dbg.cellpose_diameter           = dbg.cellpose_diameter           ?: config.segmentation?.diameter           ?: 30
-dbg.cellpose_flow_threshold     = dbg.cellpose_flow_threshold     ?: config.segmentation?.flow_threshold     ?: 0.8
-dbg.cellpose_cellprob_threshold = dbg.cellpose_cellprob_threshold ?: config.segmentation?.cellprob_threshold ?: 0.0
-dbg.cellpose_do_3d              = dbg.cellpose_do_3d              ?: config.segmentation?.do_3d              ?: true
-dbg.cellpose_min_size           = dbg.cellpose_min_size           ?: config.segmentation?.min_size           ?: 15
-def run_debug_preprocessing = dbg.enabled ?: false
+// Debug-preprocessing (per-stage nuclei tracking) was tied to the
+// intermediate TIFs emitted by the old monolithic PREPROCESS_DECONVOLVE /
+// PREPROCESS_SELFNET. The new modular pipeline has no intermediates to
+// inspect (each step is its own process), so this feature is no longer
+// available. The standalone debug_nuclei_*.py scripts are kept in the repo
+// for ad-hoc QA against manually-provided stacks.
+def run_debug_preprocessing = false
 
-// Debug preprocessing requires save_intermediates — force it on
-if (run_debug_preprocessing && !config.preprocessing.save_intermediates) {
-    log.warn "debug_preprocessing.enabled=true requires save_intermediates=true — forcing save_intermediates on"
-    config.preprocessing.save_intermediates = true
-}
 
 // Validate tracking config if enabled
 if (!skip_tracking) {
@@ -363,7 +340,7 @@ def xy_downscale_info = downscaling_enabled ? "Enabled (factor=${effective_scali
 def label_downscale_info = downscale_labels < 1.0 ? "${downscale_labels} (Fiji nearest-neighbor)" : "Disabled"
 def seg_mode_info = config.segmentation.do_3d ? "3D" : (config.segmentation.stitch_threshold != null ? "2D+Stitch(${config.segmentation.stitch_threshold})" : "2D")
 def tracking_info = skip_tracking ? "SKIPPED" : "Enabled (ultrack)"
-def debug_info = run_debug_preprocessing ? "ENABLED (nuclei tracking per stage)" : "Disabled"
+def debug_info = "Disabled (modular pipeline — no intermediates to inspect)"
 def preproc_info = skip_preprocessing ? (preprocessed_dir ? "SKIPPED (using ${preprocessed_dir})" : "SKIPPED (using raw input)") : "Enabled"
 def raw_export_info = raw_export_enabled ? "Enabled (factor=${raw_export_factor}, iso=${raw_export_iso})" : "Disabled"
 
@@ -1212,8 +1189,8 @@ if img.ndim != 3:
     raise SystemExit(f"Expected 3D ZYX input, got shape {img.shape}")
 print(f"Input  shape: {img.shape}, dtype: {img.dtype}, scale={scale}")
 
-# XY downscale using the same cubic anti-aliased algorithm the per-timepoint
-# preprocessing scripts use (spim_pipeline_fixed.py / spim_selfnet_preprocess.py).
+# XY downscale using the same cubic anti-aliased algorithm the modular
+# preprocessing pipeline uses (bin/isotropic_resample.py).
 out = rescale(img, (1.0, scale, scale), order=3,
               preserve_range=True, anti_aliasing=True)
 x_res = xy_pixel_in / scale
@@ -1641,282 +1618,131 @@ PYTHON_SCRIPT
 }
 
 // ============================================================================
-// PROCESS: Preprocess and Deconvolve Single Timepoint
+// PROCESS: Planar (XY) shading correction — modular, ported from AIAF-32
 // ============================================================================
+//
+// Each step in the new modular preprocessing pipeline is its own Nextflow
+// process: this lets us scale resources per step (e.g. depth correction is
+// O(Z) memory-light while planar correction is O(Z*Y*X) memory-heavy), and
+// lets us re-run a single step with `-resume` when only one of them changes.
+//
+// Chain: PLANAR_CORRECTION -> DEPTH_CORRECTION -> ISOTROPIC -> segmentation.
 
-process PREPROCESS_DECONVOLVE {
+process PLANAR_CORRECTION {
     tag "t${String.format('%04d', timepoint)}"
 
-    maxRetries 2
-    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
-
-    // Only publish per-timepoint preprocessed TIFFs when the 4D hyperstack
-    // merge is disabled. Otherwise the same data ends up in publishDir twice
-    // (once per timepoint, once inside 4D_hyperstack_processed.tif).
     publishDir "${params.output_dir}/01_preprocessed",
         mode: 'copy',
-        pattern: "*_processed.tif",
+        pattern: "*_planar.tif",
         enabled: skip_merge
 
     publishDir "${params.output_dir}/logs/preprocessing",
         mode: 'copy',
         pattern: "*.log"
 
-    publishDir "${params.output_dir}/intermediates/t${String.format('%04d', timepoint)}",
-        mode: 'copy',
-        pattern: "intermediates/*.tif"
-
     container params.container
 
     input:
     tuple val(timepoint), path(image_file)
     path metadata_json
-    path preproc_script
-    val preprocess_config
+    path planar_script
 
     output:
-    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_processed.tif"), emit: processed
-    path "t${String.format('%04d', timepoint)}_preprocess.log", emit: log
-    tuple val(timepoint), path("intermediates/*.tif"), optional: true, emit: intermediates
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_planar.tif"), emit: corrected
+    path "t${String.format('%04d', timepoint)}_planar.log", emit: log
 
     script:
-    def cfg = preprocess_config
     def t_formatted = String.format('%04d', timepoint)
     def filename = image_file.name
-    def config_json_str = groovy.json.JsonOutput.toJson(cfg).replace("'", "\\'")
-    def script_name = preproc_script.name
+    def script_name = planar_script.name
     """
     #!/bin/bash
     set -euo pipefail
 
-    # Activate micromamba environment
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
 
     echo "============================================"
-    echo "Preprocessing timepoint: ${timepoint}"
-    echo "File: ${filename}"
-    echo "Preprocessing script: ${script_name}"
+    echo "Planar (XY) shading correction — timepoint ${timepoint}"
+    echo "Input : ${filename}"
+    echo "Sigma : ${planar_sigma_xy} px"
     echo "============================================"
 
-    # Verify script is present
-    if [ ! -f "${script_name}" ]; then
-        echo "ERROR: Preprocessing script not found: ${script_name}"
-        echo "Contents of work directory:"
-        ls -lh
-        exit 1
-    fi
+    python3 \${script_name} \\
+        --input  "${filename}" \\
+        --output "t${t_formatted}_planar.tif" \\
+        --sigma_xy ${planar_sigma_xy} \\
+        2>&1 | tee "t${t_formatted}_planar.log"
 
-    # Run preprocessing with all parameters from config
-    python3 << 'PYTHON_EOF'
-import json
-import sys
-import os
-import subprocess
-
-# Load metadata
-with open('${metadata_json}', 'r') as f:
-    metadata = json.load(f)
-
-# Load config - parse from JSON string to handle booleans correctly
-config = json.loads('${config_json_str}')
-
-# Get voxel sizes from metadata (these are already configured - auto-detected or manual)
-# NOTE: ROI cropping does not change voxel sizes, only image dimensions
-xy_pixel = metadata['x_resolution_um']  # Use configured X resolution
-z_pixel = metadata['imagej']['spacing']  # Use configured Z spacing
-
-print(f"Using voxel sizes from metadata:")
-print(f"  XY pixel size: {xy_pixel:.4f} µm")
-print(f"  Z pixel size: {z_pixel:.4f} µm")
-print(f"  Source: {metadata.get('voxel_size_source', 'unknown')}")
-if metadata.get('was_roi_cropped', False):
-    print(f"  Note: Image was ROI-cropped (voxel size unchanged)")
-print("")
-
-# Build command for preprocessing script
-cmd = [
-    'python3', '${script_name}',
-    '--input_file', '${filename}',
-    '--outdir', '.',
-    '--psf_path', config['psf_path'],
-    '--image_scaling', str(config['image_scaling']),
-    '--xy_pixel', str(xy_pixel),  # Pass configured XY voxel size
-    '--z_pixel', str(z_pixel),    # Pass configured Z voxel size
-    '--niter', str(config['deconvolution']['niter']),
-    '--niterz', str(config['deconvolution']['niterz']),
-    '--percentile_low', str(config['normalization']['percentile_low']),
-    '--percentile_high', str(config['normalization']['percentile_high']),
-    '--sigma', str(config['postprocessing']['sigma']),
-    '--min_v', str(config['normalization']['min_v']),
-    '--max_v', str(config['normalization']['max_v']),
-    '--resolution_px0', str(config['background_subtraction']['resolution_px0']),
-    '--resolution_pz0', str(config['background_subtraction']['resolution_pz0']),
-    '--noise_lvl', str(config['background_subtraction']['noise_lvl']),
-    '--padding', str(config['deconvolution']['padding']),
-]
-
-# Add optional flags from correction_flags
-if config['correction_flags'].get('no_clahe', False):
-    cmd.append('--no_clahe')
-if config['correction_flags'].get('no_z_correction', False):
-    cmd.append('--no_z_correction')
-if config['correction_flags'].get('no_shading', False):
-    cmd.append('--no_shading')
-
-print("Preprocessing command:", ' '.join(cmd))
-print("\\n" + "="*60)
-
-# Execute
-result = subprocess.run(cmd, capture_output=True, text=True)
-
-# Save log
-with open('t${t_formatted}_preprocess.log', 'w') as f:
-    f.write("STDOUT:\\n")
-    f.write(result.stdout)
-    f.write("\\n\\nSTDERR:\\n")
-    f.write(result.stderr)
-
-print(result.stdout)
-if result.stderr:
-    print("STDERR:", result.stderr, file=sys.stderr)
-
-if result.returncode != 0:
-    print(f"ERROR: Preprocessing failed with exit code {result.returncode}")
-    sys.exit(result.returncode)
-PYTHON_EOF
-
-    # Find and rename output to standard format with ROBUST pattern matching
-    echo ""
-    echo "Finding processed output file..."
-    echo "Expected scaling: ${cfg.image_scaling}"
-    echo "All TIF files in directory:"
-    ls -lh *.tif 2>/dev/null || echo "No .tif files found"
-    echo ""
-
-    # Try multiple patterns to find the output
-    ORIGINAL_OUTPUT=""
-
-    # Pattern 1: Standard scaling string
-    if [ -z "\$ORIGINAL_OUTPUT" ]; then
-        SCALING_STR=\$(echo "${cfg.image_scaling}" | sed 's/\\.//g')
-        echo "Trying pattern 1: *_\${SCALING_STR}*.tif"
-        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*_\${SCALING_STR}*.tif" -not -name "${filename}" 2>/dev/null | head -1)
-        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
-    fi
-
-    # Pattern 2: Percentage string
-    if [ -z "\$ORIGINAL_OUTPUT" ]; then
-        SCALING_PCT=\$(python3 -c "print(int(${cfg.image_scaling} * 100))")
-        echo "Trying pattern 2: *_\${SCALING_PCT}*.tif"
-        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*_\${SCALING_PCT}*.tif" -not -name "${filename}" 2>/dev/null | head -1)
-        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
-    fi
-
-    # Pattern 3: Any new .tif file
-    if [ -z "\$ORIGINAL_OUTPUT" ]; then
-        echo "Trying pattern 3: any new .tif file (not input)"
-        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" -newer "${script_name}" 2>/dev/null | head -1)
-        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
-    fi
-
-    # Pattern 4: Any .tif file that's not the input
-    if [ -z "\$ORIGINAL_OUTPUT" ]; then
-        echo "Trying pattern 4: any .tif file (not input)"
-        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" 2>/dev/null | head -1)
-        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
-    fi
-
-    if [ -n "\$ORIGINAL_OUTPUT" ]; then
-        echo ""
-        echo "SUCCESS: Found processed file: \$ORIGINAL_OUTPUT"
-        echo "Renaming to: t${t_formatted}_processed.tif"
-        mv "\$ORIGINAL_OUTPUT" "t${t_formatted}_processed.tif"
-        echo "✓ File renamed successfully"
-    else
-        echo ""
-        echo "ERROR: No processed output found after trying all patterns"
-        echo "Directory contents:"
-        ls -lha
-        exit 1
-    fi
-
-    # Restore and update metadata to processed image
-    python3 << 'RESTORE_META'
-import tifffile
-import json
-
-# Load original metadata
-with open('${metadata_json}', 'r') as f:
-    metadata = json.load(f)
-
-# Load processed image
-img = tifffile.imread('t${t_formatted}_processed.tif')
-
-# Recalculate voxel sizes after scaling AND isotropic reslicing
-# The preprocessing script (spim_pipeline_fixed.py) does TWO things:
-#   1. Rescales XY by image_scaling (0.5) -> XY voxel size doubles
-#   2. Reslices Z to make voxels isotropic -> Z slices are interpolated
-#
-# After XY scaling:
-x_res = metadata['x_resolution_um'] / ${cfg.image_scaling}
-y_res = metadata['y_resolution_um'] / ${cfg.image_scaling}
-original_z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
-
-# After isotropic reslicing: the preprocessing script interpolates Z so that
-# z_spacing matches the scaled XY pixel size. We can compute the actual new
-# Z spacing from the original vs processed Z dimensions.
-original_z_slices = metadata['shape']['dimensions'][0]  # original Z count
-new_z_slices = img.shape[0]  # actual Z count after reslicing
-
-if new_z_slices != original_z_slices:
-    # Image was resliced to isotropic - recalculate Z spacing
-    z_spacing = original_z_slices * original_z_spacing / new_z_slices
-    print(f"Isotropic reslicing detected:")
-    print(f"  Z slices: {original_z_slices} -> {new_z_slices}")
-    print(f"  Z spacing: {original_z_spacing:.4f} -> {z_spacing:.4f} µm")
-else:
-    # No reslicing occurred (already isotropic)
-    z_spacing = original_z_spacing
-
-print(f"Voxel sizes after preprocessing:")
-print(f"  Original: {metadata['x_resolution_um']:.4f} x {metadata['y_resolution_um']:.4f} x {original_z_spacing:.4f} µm")
-print(f"  Final:    {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm (isotropic)")
-if metadata.get('was_roi_cropped', False):
-    print(f"  (Image was ROI-cropped before preprocessing)")
-
-# Re-save with preserved metadata
-tifffile.imwrite(
-    't${t_formatted}_processed.tif',
-    img,
-    imagej=True,
-    resolution=(1.0/x_res, 1.0/y_res),
-    metadata={
-        'spacing': z_spacing,
-        'unit': 'um',
-        'axes': 'ZYX',
-        'TimePoint': ${timepoint},
-        'WasROICropped': metadata.get('was_roi_cropped', False)
-    }
-)
-
-print(f"Metadata restored for timepoint ${timepoint}")
-RESTORE_META
-
-    echo "Preprocessing completed for timepoint ${timepoint}"
+    echo "✓ Planar correction complete: t${t_formatted}_planar.tif"
     """
 }
 
 // ============================================================================
-// PROCESS: Preprocess Single Timepoint with Self-Net deblurring
-// (alternative to PREPROCESS_DECONVOLVE; selected via preprocessing.method)
+// PROCESS: Depth (Z) intensity correction — modular, ported from AIAF-32
 // ============================================================================
 
-process PREPROCESS_SELFNET {
+process DEPTH_CORRECTION {
     tag "t${String.format('%04d', timepoint)}"
 
-    maxRetries 2
-    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
+    publishDir "${params.output_dir}/01_preprocessed",
+        mode: 'copy',
+        pattern: "*_depth.tif",
+        enabled: skip_merge
+
+    publishDir "${params.output_dir}/logs/preprocessing",
+        mode: 'copy',
+        pattern: "*.log"
+
+    container params.container
+
+    input:
+    tuple val(timepoint), path(image_file)
+    path metadata_json
+    path depth_script
+
+    output:
+    tuple val(timepoint), path("t${String.format('%04d', timepoint)}_depth.tif"), emit: corrected
+    path "t${String.format('%04d', timepoint)}_depth.log", emit: log
+
+    script:
+    def t_formatted = String.format('%04d', timepoint)
+    def filename = image_file.name
+    def script_name = depth_script.name
+    """
+    #!/bin/bash
+    set -euo pipefail
+
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
+    echo "============================================"
+    echo "Depth (Z) intensity correction — timepoint ${timepoint}"
+    echo "Input  : ${filename}"
+    echo "Mode   : ${depth_mode}"
+    echo "Window : ${depth_smooth}"
+    echo "Gain   : [${depth_gain_min}, ${depth_gain_max}]"
+    echo "============================================"
+
+    python3 \${script_name} \\
+        --input         "${filename}" \\
+        --output        "t${t_formatted}_depth.tif" \\
+        --mode          "${depth_mode}" \\
+        --smooth_window ${depth_smooth} \\
+        --gain_min      ${depth_gain_min} \\
+        --gain_max      ${depth_gain_max} \\
+        2>&1 | tee "t${t_formatted}_depth.log"
+
+    echo "✓ Depth correction complete: t${t_formatted}_depth.tif"
+    """
+}
+
+// ============================================================================
+// PROCESS: Isotropic Z resampling — modular, ported from AIAF-32
+// ============================================================================
+
+process ISOTROPIC {
+    tag "t${String.format('%04d', timepoint)}"
 
     publishDir "${params.output_dir}/01_preprocessed",
         mode: 'copy',
@@ -1932,232 +1758,37 @@ process PREPROCESS_SELFNET {
     input:
     tuple val(timepoint), path(image_file)
     path metadata_json
-    path selfnet_script
-    path shared_lib       // spim_pipeline_fixed.py (provides shared helpers)
-    path wbns_lib         // WBNS.py (imported by the shared lib)
-    val preprocess_config
+    path iso_script
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_processed.tif"), emit: processed
-    path "t${String.format('%04d', timepoint)}_preprocess.log", emit: log
-    tuple val(timepoint), path("intermediates/*.tif"), optional: true, emit: intermediates
+    path "t${String.format('%04d', timepoint)}_iso.log", emit: log
 
     script:
-    def cfg = preprocess_config
     def t_formatted = String.format('%04d', timepoint)
     def filename = image_file.name
-    def config_json_str = groovy.json.JsonOutput.toJson(cfg).replace("'", "\\'")
-    def script_name = selfnet_script.name
+    def script_name = iso_script.name
     """
     #!/bin/bash
     set -euo pipefail
 
-    # Activate micromamba environment
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
 
     echo "============================================"
-    echo "Preprocessing timepoint: ${timepoint} (Self-Net)"
-    echo "File: ${filename}"
-    echo "Self-Net script: ${script_name}"
+    echo "Isotropic Z resampling — timepoint ${timepoint}"
+    echo "Input  : ${filename}"
+    echo "Target : ${iso_target_um} µm (order=${iso_order})"
     echo "============================================"
 
-    if [ ! -f "${script_name}" ]; then
-        echo "ERROR: Self-Net script not found: ${script_name}"
-        echo "Contents of work directory:"
-        ls -lh
-        exit 1
-    fi
+    python3 \${script_name} \\
+        --input     "${filename}" \\
+        --output    "t${t_formatted}_processed.tif" \\
+        --target_um ${iso_target_um} \\
+        --order     ${iso_order} \\
+        2>&1 | tee "t${t_formatted}_iso.log"
 
-    # Run Self-Net preprocessing with all parameters from config
-    python3 << 'PYTHON_EOF'
-import json
-import sys
-import subprocess
-
-# Load metadata
-with open('${metadata_json}', 'r') as f:
-    metadata = json.load(f)
-
-# Load config - parse from JSON string to handle booleans correctly
-config = json.loads('${config_json_str}')
-selfnet = config.get('selfnet', {})
-
-xy_pixel = metadata['x_resolution_um']
-z_pixel = metadata['imagej']['spacing']
-
-print(f"Using voxel sizes from metadata:")
-print(f"  XY pixel size: {xy_pixel:.4f} um")
-print(f"  Z pixel size: {z_pixel:.4f} um")
-print(f"  Source: {metadata.get('voxel_size_source', 'unknown')}")
-print("")
-
-cmd = [
-    'python3', '${script_name}',
-    '--input_file', '${filename}',
-    '--outdir', '.',
-    '--model_path', str(selfnet['model_path']),
-    '--image_scaling', str(config['image_scaling']),
-    '--xy_pixel', str(xy_pixel),
-    '--z_pixel', str(z_pixel),
-    '--ngf', str(selfnet.get('ngf', 64)),
-    '--n_blocks', str(selfnet.get('n_blocks', 6)),
-    '--norm', str(selfnet.get('norm', 'instance')),
-    '--batch_size', str(selfnet.get('batch_size', 8)),
-    '--net_min_v', str(selfnet.get('net_min_v', 0)),
-    '--net_max_v', str(selfnet.get('net_max_v', 65535)),
-    '--net_percentile_low', str(selfnet.get('net_percentile_low', 30)),
-    '--net_percentile_high', str(selfnet.get('net_percentile_high', 99.999)),
-    '--net_thres_scale', str(selfnet.get('net_thres_scale', 1.5)),
-    '--percentile_low', str(config['normalization']['percentile_low']),
-    '--percentile_high', str(config['normalization']['percentile_high']),
-    '--sigma', str(config['postprocessing']['sigma']),
-    '--min_v', str(config['normalization']['min_v']),
-    '--max_v', str(config['normalization']['max_v']),
-    '--resolution_px0', str(config['background_subtraction']['resolution_px0']),
-    '--resolution_pz0', str(config['background_subtraction']['resolution_pz0']),
-    '--noise_lvl', str(config['background_subtraction']['noise_lvl']),
-]
-
-# Optional separate per-view models
-if selfnet.get('model_path_xz'):
-    cmd.extend(['--model_path_xz', str(selfnet['model_path_xz'])])
-if selfnet.get('model_path_yz'):
-    cmd.extend(['--model_path_yz', str(selfnet['model_path_yz'])])
-
-# Correction flags
-if config['correction_flags'].get('no_clahe', False):
-    cmd.append('--no_clahe')
-if config['correction_flags'].get('no_z_correction', False):
-    cmd.append('--no_z_correction')
-if config['correction_flags'].get('no_shading', False):
-    cmd.append('--no_shading')
-
-# Self-Net specific: optionally disable the training-matched input normalization
-if selfnet.get('no_net_normalization', False):
-    cmd.append('--no_net_normalization')
-
-print("Self-Net command:", ' '.join(cmd))
-print("\\n" + "="*60)
-
-result = subprocess.run(cmd, capture_output=True, text=True)
-
-with open('t${t_formatted}_preprocess.log', 'w') as f:
-    f.write("STDOUT:\\n")
-    f.write(result.stdout)
-    f.write("\\n\\nSTDERR:\\n")
-    f.write(result.stderr)
-
-print(result.stdout)
-if result.stderr:
-    print("STDERR:", result.stderr, file=sys.stderr)
-
-if result.returncode != 0:
-    print(f"ERROR: Self-Net preprocessing failed with exit code {result.returncode}")
-    sys.exit(result.returncode)
-PYTHON_EOF
-
-    # Find and rename output to standard format with ROBUST pattern matching
-    echo ""
-    echo "Finding processed output file..."
-    echo "Expected scaling: ${cfg.image_scaling}"
-    echo "All TIF files in directory:"
-    ls -lh *.tif 2>/dev/null || echo "No .tif files found"
-    echo ""
-
-    ORIGINAL_OUTPUT=""
-
-    if [ -z "\$ORIGINAL_OUTPUT" ]; then
-        SCALING_STR=\$(echo "${cfg.image_scaling}" | sed 's/\\.//g')
-        echo "Trying pattern 1: *_\${SCALING_STR}*.tif"
-        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*_\${SCALING_STR}*.tif" -not -name "${filename}" 2>/dev/null | head -1)
-        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
-    fi
-
-    if [ -z "\$ORIGINAL_OUTPUT" ]; then
-        SCALING_PCT=\$(python3 -c "print(int(${cfg.image_scaling} * 100))")
-        echo "Trying pattern 2: *_\${SCALING_PCT}*.tif"
-        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*_\${SCALING_PCT}*.tif" -not -name "${filename}" 2>/dev/null | head -1)
-        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
-    fi
-
-    if [ -z "\$ORIGINAL_OUTPUT" ]; then
-        echo "Trying pattern 3: any new .tif file (not input)"
-        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" -newer "${script_name}" 2>/dev/null | head -1)
-        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
-    fi
-
-    if [ -z "\$ORIGINAL_OUTPUT" ]; then
-        echo "Trying pattern 4: any .tif file (not input)"
-        ORIGINAL_OUTPUT=\$(find . -maxdepth 1 -name "*.tif" -not -name "${filename}" 2>/dev/null | head -1)
-        [ -n "\$ORIGINAL_OUTPUT" ] && echo "  ✓ Found: \$ORIGINAL_OUTPUT"
-    fi
-
-    if [ -n "\$ORIGINAL_OUTPUT" ]; then
-        echo ""
-        echo "SUCCESS: Found processed file: \$ORIGINAL_OUTPUT"
-        echo "Renaming to: t${t_formatted}_processed.tif"
-        mv "\$ORIGINAL_OUTPUT" "t${t_formatted}_processed.tif"
-        echo "✓ File renamed successfully"
-    else
-        echo ""
-        echo "ERROR: No processed output found after trying all patterns"
-        echo "Directory contents:"
-        ls -lha
-        exit 1
-    fi
-
-    # Restore and update metadata to processed image.
-    # Self-Net performs the SAME two geometric operations as the deconv path:
-    #   1. Rescales XY by image_scaling
-    #   2. Reconstructs/upsamples Z to make voxels isotropic
-    # so the Z spacing can be recomputed from the original vs processed Z count.
-    python3 << 'RESTORE_META'
-import tifffile
-import json
-
-with open('${metadata_json}', 'r') as f:
-    metadata = json.load(f)
-
-img = tifffile.imread('t${t_formatted}_processed.tif')
-
-x_res = metadata['x_resolution_um'] / ${cfg.image_scaling}
-y_res = metadata['y_resolution_um'] / ${cfg.image_scaling}
-original_z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
-
-original_z_slices = metadata['shape']['dimensions'][0]
-new_z_slices = img.shape[0]
-
-if new_z_slices != original_z_slices:
-    z_spacing = original_z_slices * original_z_spacing / new_z_slices
-    print(f"Isotropic reconstruction detected:")
-    print(f"  Z slices: {original_z_slices} -> {new_z_slices}")
-    print(f"  Z spacing: {original_z_spacing:.4f} -> {z_spacing:.4f} um")
-else:
-    z_spacing = original_z_spacing
-
-print(f"Voxel sizes after Self-Net preprocessing:")
-print(f"  Original: {metadata['x_resolution_um']:.4f} x {metadata['y_resolution_um']:.4f} x {original_z_spacing:.4f} um")
-print(f"  Final:    {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} um (isotropic)")
-
-tifffile.imwrite(
-    't${t_formatted}_processed.tif',
-    img,
-    imagej=True,
-    resolution=(1.0/x_res, 1.0/y_res),
-    metadata={
-        'spacing': z_spacing,
-        'unit': 'um',
-        'axes': 'ZYX',
-        'TimePoint': ${timepoint},
-        'WasROICropped': metadata.get('was_roi_cropped', False)
-    }
-)
-
-print(f"Metadata restored for timepoint ${timepoint}")
-RESTORE_META
-
-    echo "Self-Net preprocessing completed for timepoint ${timepoint}"
+    echo "✓ Isotropic resample complete: t${t_formatted}_processed.tif"
     """
 }
 
@@ -2248,7 +1879,7 @@ if not config.get('save_npy', True):
 
 # Add anisotropy if specified
 # (null = isotropic, which is what the preprocessed stack is AFTER the
-# spim_pipeline_fixed.py isotropic reslice AND after we now write proper
+# bin/isotropic_resample.py ISOTROPIC process AND after we now write proper
 # ImageJ voxel-size metadata into the TIFF. Passing --anisotropy 1.0
 # explicitly tells Cellpose "voxels are isotropic, do NOT resample Z",
 # which avoids a 3x Z upsample that previously OOMed the segmentation
@@ -3038,132 +2669,6 @@ PYEOF
 }
 
 // ============================================================================
-// PROCESS: Debug Preprocessing — Nuclei Tracking per Stage (GPU)
-// ============================================================================
-
-process DEBUG_PREPROCESS_NUCLEI {
-    tag "t${String.format('%04d', timepoint)}_${stage_name}"
-
-    maxRetries 2
-    errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
-
-    publishDir "${params.output_dir}/debug_preprocessing/t${String.format('%04d', timepoint)}",
-        mode: 'copy',
-        pattern: "*.json"
-
-    publishDir "${params.output_dir}/debug_preprocessing/t${String.format('%04d', timepoint)}/masks",
-        mode: 'copy',
-        pattern: "*_mask.tif"
-
-    publishDir "${params.output_dir}/logs/debug_preprocessing",
-        mode: 'copy',
-        pattern: "*.log"
-
-    container params.container
-
-    input:
-    tuple val(timepoint), val(stage_name), path(stage_tif)
-    path debug_script
-    val debug_config
-
-    output:
-    tuple val(timepoint), path("${stage_name}_nuclei_stats.json"), emit: metrics
-    path "*_mask.tif", optional: true, emit: masks
-    path "debug_nuclei_${stage_name}.log", emit: log
-
-    script:
-    def cfg = debug_config
-    def t_formatted = String.format('%04d', timepoint)
-    def model = cfg.cellpose_model ?: 'cyto3'
-    def save_mask_flag = cfg.save_masks ? '--save_mask' : ''
-    """
-    #!/bin/bash
-    set -euo pipefail
-
-    eval "\$(micromamba shell hook --shell bash)"
-    micromamba activate microscopy_env
-
-    exec > >(tee debug_nuclei_${stage_name}.log) 2>&1
-
-    echo "============================================"
-    echo "Debug Preprocessing — Nuclei Tracking"
-    echo "Timepoint: ${timepoint}"
-    echo "Stage: ${stage_name}"
-    echo "File: ${stage_tif}"
-    echo "============================================"
-
-    python3 ${debug_script} \\
-        --input_file "${stage_tif}" \\
-        --stage_name "${stage_name}" \\
-        --outdir . \\
-        --cellpose_model "${model}" \\
-        --diameter ${cfg.cellpose_diameter} \\
-        --flow_threshold ${cfg.cellpose_flow_threshold} \\
-        --cellprob_threshold ${cfg.cellpose_cellprob_threshold} \\
-        --min_size ${cfg.cellpose_min_size} \\
-        ${cfg.cellpose_do_3d ? '--do_3d' : ''} \\
-        ${save_mask_flag}
-
-    echo ""
-    echo "✓ Nuclei tracking complete for ${stage_name}"
-    """
-}
-
-// ============================================================================
-// PROCESS: Debug Preprocessing — Nuclei Comparison Report (CPU)
-// ============================================================================
-
-process DEBUG_PREPROCESS_REPORT {
-    tag "t${String.format('%04d', timepoint)}"
-
-    maxRetries 1
-    errorStrategy 'terminate'
-
-    publishDir "${params.output_dir}/debug_preprocessing/t${String.format('%04d', timepoint)}/report",
-        mode: 'copy',
-        pattern: "report/*"
-
-    publishDir "${params.output_dir}/logs/debug_preprocessing",
-        mode: 'copy',
-        pattern: "*.log"
-
-    container params.container
-
-    input:
-    tuple val(timepoint), path(json_files)
-    path report_script
-
-    output:
-    path "report/*", emit: report
-    path "debug_report_t${String.format('%04d', timepoint)}.log", emit: log
-
-    script:
-    def t_formatted = String.format('%04d', timepoint)
-    """
-    #!/bin/bash
-    set -euo pipefail
-
-    eval "\$(micromamba shell hook --shell bash)"
-    micromamba activate microscopy_env
-
-    exec > >(tee debug_report_t${t_formatted}.log) 2>&1
-
-    echo "============================================"
-    echo "Debug Preprocessing — Nuclei Report"
-    echo "Timepoint: ${timepoint}"
-    echo "JSON files: \$(ls -1 *.json | wc -l)"
-    echo "============================================"
-
-    python3 ${report_script} \\
-        --json_dir . \\
-        --outdir report/
-
-    echo ""
-    echo "✓ Report generated for timepoint ${timepoint}"
-    """
-}
-
-// ============================================================================
 // MAIN WORKFLOW
 // ============================================================================
 
@@ -3472,89 +2977,43 @@ workflow {
         }
 
     } else {
-        // ---- Normal preprocessing ----
+        // ---- Normal preprocessing: PLANAR -> DEPTH -> ISOTROPIC ----
+        //
+        // Lean modular chain (ported from AIAF-32). Each step is its own
+        // Nextflow process so:
+        //   1. resources can be tuned per step (planar is XY-heavy, depth is Z-light)
+        //   2. any single step can be re-run with `nextflow run -resume` after a
+        //      parameter change
+        //   3. intermediate TIFFs (planar / depth) are published and useful for QA
+        log.info "Preprocessing chain: planar -> depth -> isotropic"
+        planar_script_ch = Channel.fromPath(params.planar_correction_script, checkIfExists: true)
+        depth_script_ch  = Channel.fromPath(params.depth_correction_script,  checkIfExists: true)
+        iso_script_ch    = Channel.fromPath(params.isotropic_resample_script, checkIfExists: true)
 
-        if (preprocess_method == 'selfnet') {
-            // Self-Net deblurring front-end. Stage the Self-Net script plus the
-            // shared helper libs (spim_pipeline_fixed.py + WBNS.py) so all
-            // imports resolve inside the task work dir.
-            log.info "Preprocessing each timepoint with Self-Net deblurring"
-            selfnet_script_ch = Channel.fromPath(params.selfnet_script, checkIfExists: true)
-            shared_lib_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
-            wbns_lib_ch = Channel.fromPath(params.wbns_script, checkIfExists: true)
-
-            PREPROCESS_SELFNET(
-                processing_input,
-                shared_metadata,
-                selfnet_script_ch.collect(),
-                shared_lib_ch.collect(),
-                wbns_lib_ch.collect(),
-                preprocess_config
-            )
-
-            preprocessed_processed = PREPROCESS_SELFNET.out.processed
-            preprocessed_intermediates = PREPROCESS_SELFNET.out.intermediates
-        } else {
-            // Create channel for preprocessing script
-            preproc_script_ch = Channel.fromPath(params.preprocessing_script, checkIfExists: true)
-
-            // 2. Preprocess and deconvolve each timepoint
-            PREPROCESS_DECONVOLVE(
-                processing_input,
-                shared_metadata,
-                preproc_script_ch.collect(),
-                preprocess_config
-            )
-
-            preprocessed_processed = PREPROCESS_DECONVOLVE.out.processed
-            preprocessed_intermediates = PREPROCESS_DECONVOLVE.out.intermediates
-        }
-
-        // 2b. OPTIONAL: Debug preprocessing — run Cellpose on each intermediate stage
-        if (run_debug_preprocessing) {
-        log.info "Debug preprocessing ENABLED — will run nuclei tracking on intermediates"
-        log.info "  Cellpose model: ${config.preprocessing.debug_preprocessing.cellpose_model}"
-        log.info "  save_intermediates: ${config.preprocessing.save_intermediates}"
-
-        debug_nuclei_script_ch = Channel.fromPath(params.debug_nuclei_script, checkIfExists: true)
-        debug_report_script_ch = Channel.fromPath(params.debug_report_script, checkIfExists: true)
-
-        // The preprocessing process emits:
-        //   intermediates: tuple(timepoint, path("intermediates/*.tif"))
-        // flatMap fans out each intermediate TIF into a separate item so
-        // Nextflow can schedule them in parallel.
-
-        debug_paired_ch = preprocessed_intermediates
-            .flatMap { timepoint, tifs ->
-                if (tifs instanceof List) {
-                    return tifs.collect { tif -> tuple(timepoint, tif.baseName, tif) }
-                } else if (tifs != null) {
-                    return [tuple(timepoint, tifs.baseName, tifs)]
-                } else {
-                    return []
-                }
-            }
-
-        DEBUG_PREPROCESS_NUCLEI(
-            debug_paired_ch,
-            debug_nuclei_script_ch.collect(),
-            config.preprocessing.debug_preprocessing
+        // Step 1: planar (XY) shading correction
+        PLANAR_CORRECTION(
+            processing_input,
+            shared_metadata,
+            planar_script_ch.collect()
         )
 
-        // Collect all JSONs per timepoint for the report
-        debug_report_input = DEBUG_PREPROCESS_NUCLEI.out.metrics
-            .groupTuple(by: 0)  // Group by timepoint → [timepoint, [json1, json2, ...]]
-
-        DEBUG_PREPROCESS_REPORT(
-            debug_report_input,
-            debug_report_script_ch.collect()
+        // Step 2: depth (Z) intensity correction, consumes planar output
+        DEPTH_CORRECTION(
+            PLANAR_CORRECTION.out.corrected,
+            shared_metadata,
+            depth_script_ch.collect()
         )
-    } else {
-        log.info "Debug preprocessing DISABLED"
-    }
 
-        // Use the preprocessing output as segmentation input
-        segmentation_input = preprocessed_processed
+        // Step 3: isotropic Z resampling, consumes depth output. The result is
+        // named *_processed.tif to keep the downstream CELLPOSE_SEGMENT input
+        // contract identical to the old monolithic pipeline.
+        ISOTROPIC(
+            DEPTH_CORRECTION.out.corrected,
+            shared_metadata,
+            iso_script_ch.collect()
+        )
+
+        segmentation_input = ISOTROPIC.out.processed
 
     } // end skip_preprocessing else
 

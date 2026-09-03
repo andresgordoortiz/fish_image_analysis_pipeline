@@ -1,6 +1,6 @@
 # SPIM 4D Image Processing Pipeline
 
-A Nextflow pipeline for lightsheet (SPIM) microscopy data: deconvolution, segmentation with Cellpose, cell tracking with **ultrack**, and merging into 4D stacks you can open in the `ultrack_viewer` GUI.
+A Nextflow pipeline for lightsheet (SPIM) microscopy data: modular preprocessing (XY shading + Z intensity correction + isotropic resampling), segmentation with Cellpose, cell tracking with **ultrack**, and merging into 4D stacks you can open in the `ultrack_viewer` GUI.
 
 **Authors:** Andrés Gordo & Guilherme Ventura · **Institute:** IMP Vienna
 
@@ -67,7 +67,7 @@ Toggles to control what runs (set to `true` / `false`):
 
 | Section | What it does |
 | --- | --- |
-| `preprocessing.enabled` | Shading + Z correction + deconvolution (or Self-Net) |
+| `preprocessing.enabled` | Modular preprocessing (planar + depth correction + isotropic resampling). All CPU. |
 | `roi_cropping.enabled`  | Crop every timepoint to a Fiji `.roi` rectangle |
 | `downscaling.enabled`   | XY downscale applied BEFORE segmentation (uses `downscaling.factor`) |
 | `raw_export.enabled`    | Export the raw input sliced-isotropic + downscaled for `ultrack_viewer.py --processed` (independent of preprocessing) |
@@ -157,16 +157,18 @@ rsync -avh --progress \
 
 ### 1.9 Overlay tracks on the **RAW** signal (`raw_export`)
 
-The preprocessed chain (`01_preprocessed/`) applies shading correction,
-Z intensity correction, deconvolution / Self-Net deblurring, etc.
+The preprocessed chain (`01_preprocessed/`) applies shading correction
+(planar) + Z intensity correction (depth) + isotropic resampling.
+Each step is a small, independent NumPy/SciPy script under `bin/`
+(ported from the AIAF-32 modular scripts); see
+[Preprocessing details](#preprocessing-details) below.
 That's great for segmentation, but when you want to **interpret** a
 track — confirming whether a cell actually ingressed, judging whether a
 jump is a real movement or a segmentation artefact — you want to see
 the tracks on the **raw** signal, not on the processed one.
-
-`raw_export` writes a parallel, downscaled + isotropic copy of the
-raw input under `01b_raw_isotropic/`. It is fully independent of the
-preprocessing chain (no shading correction, no CLAHE, no
+depth flattening — just the
+same `XY cubic rescale + optional isotropic Z resample` used by
+`DOWNSCALE_XY`, applied to the RAW preprocessing chain (no shading correction, no CLAHE, no
 deconvolution — just the same `XY cubic rescale + optional
 isotropic Z resample` used by `DOWNSCALE_XY`, applied to the RAW
 input).
@@ -281,6 +283,56 @@ Flag cheatsheet:
 > Paths with spaces: wrap them in double quotes, e.g. `--tracks "03_tracking\results\my tracks.csv"`.
 
 Once napari opens, use the layer panel to toggle the processed volume, the segmentation labels, and the tracks on/off. The time slider scrubs through timepoints.
+
+---
+
+## Preprocessing details
+
+The preprocessing chain is intentionally **modular**: each correction is its
+own small Python script under `bin/`, its own Nextflow process, and its own
+SLURM resource profile. This makes every step independently tunable,
+testable, and re-runnable with `nextflow run -resume` after a parameter
+change.
+
+```
+SPLIT_INPUT_FILE (optional, for hyperstack inputs)
+       │
+       ▼
+  CROP_WITH_ROI (optional)
+       │
+       ▼
+PLANAR_CORRECTION ──► DEPTH_CORRECTION ──► ISOTROPIC ──► Cellpose → ultrack
+```
+
+| Step | Script | What it does | Default parameters |
+| --- | --- | --- | --- |
+| Planar (XY) shading | `bin/planar_intensity_correction.py` | Estimates a smooth flat-field from the mean-Z projection and divides every slice by it. | `sigma_xy = 64` |
+| Depth (Z) intensity | `bin/depth_intensity_correction.py` | Rescales each Z slice so a robust per-slice statistic is constant along Z, with moving-average smoothing. | `mode = p99`, `smooth_window = 9`, `gain_clip = [0.25, 4.0]` |
+| Isotropic resample | `bin/isotropic_resample.py` | Resamples Z so the voxel size matches the smallest XY pixel size. | `target_um = 0.374`, `order = 3` (cubic) |
+
+All three are pure NumPy + SciPy, run on CPU, and chain via Nextflow. The
+math is ported from the AIAF-32 modular scripts and adapted to read/write
+plain TIFFs with ImageJ metadata (voxel sizes round-trip through every
+step, so downstream Cellpose / ultrack / viewer see the corrected geometry
+automatically).
+
+To tune any step, edit its block in `config.json`:
+
+```json
+{
+  "preprocessing": {
+    "enabled": true,
+    "planar":    { "sigma_xy": 64.0 },
+    "depth":     { "mode": "p99", "smooth_window": 9, "gain_min": 0.25, "gain_max": 4.0 },
+    "isotropic": { "target_um": 0.374, "order": 3 }
+  }
+}
+```
+
+To disable preprocessing entirely (e.g. you already have preprocessed
+TIFFs from another tool) set `preprocessing.enabled = false` and point
+`preprocessing.preprocessed_dir` at the folder containing the timepoint
+TIFFs.
 
 ---
 
