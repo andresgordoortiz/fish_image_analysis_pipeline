@@ -1664,6 +1664,15 @@ process PLANAR_CORRECTION {
     echo "Sigma : ${planar_sigma_xy} px"
     echo "============================================"
 
+    # The python_packages_spim container ships with micromamba and a
+    # microscopy_env that contains python3 + numpy + scipy + skimage +
+    # tifffile. Bare `python3` is NOT on PATH until we activate the env,
+    # and MAMBA_ROOT_PREFIX is required because the base image doesn't
+    # export it.
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
+
     python3 bin/planar_intensity_correction.py \\
         --input   "${filename}" \\
         --output  "t${t_formatted}_planar.tif" \\
@@ -1715,6 +1724,10 @@ process DEPTH_CORRECTION {
     echo "Window : ${depth_smooth}"
     echo "Gain   : [${depth_gain_min}, ${depth_gain_max}]"
     echo "============================================"
+
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
 
     python3 bin/depth_intensity_correction.py \\
         --input         "${filename}" \\
@@ -1768,6 +1781,10 @@ process ISOTROPIC {
     echo "Input  : ${filename}"
     echo "Target : ${iso_target_um} µm (order=${iso_order})"
     echo "============================================"
+
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    eval "\$(micromamba shell hook --shell bash)"
+    micromamba activate microscopy_env
 
     python3 bin/isotropic_resample.py \\
         --input     "${filename}" \\
