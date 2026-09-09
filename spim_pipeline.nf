@@ -1536,14 +1536,46 @@ tifffile.imwrite(
         # reads these directly from tf.imagej_metadata on the reader side.
         'x_resolution_um': x_res,
         'y_resolution_um': y_res,
-        'TimePoint': ${timepoint},
-        'WasROICropped': metadata.get('was_roi_cropped', False),
-        'RawExported': True,
-        'ScalingFactor': scale,
-        'IsotropicResliced': bool(do_iso),
-        'PipelineStage': 'raw_export',
     },
 )
+# Stash the per-timepoint bookkeeping tags on top of the ImageJ block
+# that tifffile.imwrite just produced, using the SAME r+ overwrite
+# pattern DOWNSCALE_XY and CELLPOSE_SEGMENT use.
+#
+# IMPORTANT: tifffile.imwrite's `metadata={...}` kwarg lowercases ALL
+# keys when building the ImageDescription text (verified: passing
+# {'TimePoint': 287} produces 'timepoint=287' in the file). That made
+# EXPORT_RAW_ISOTROPIC outputs inconsistent with DOWNSCALE_XY /
+# CELLPOSE_SEGMENT outputs (which use TitleCase via r+ overwrite),
+# breaking Fiji's Concatenate / Merge Channels dialogs with a
+# misleading 'bit depth mismatch' error.
+#
+# Use chr(10) for newlines (no backslash-n literals in heredocs;
+# see repo memory 2026-09-09).
+import os as _os_raw
+_NL_RAW = _os_raw.linesep
+_tp_int_raw = ${timepoint}
+_tp_str_raw = str(_tp_int_raw)
+_was_roi_raw = str(metadata.get('was_roi_cropped', False)).lower()
+_do_iso_str_raw = str(bool(do_iso)).lower()
+_scale_str_raw = str(scale)
+extra_tags_raw = (
+    _NL_RAW + 'TimePoint=' + _tp_str_raw +
+    _NL_RAW + 'WasROICropped=' + _was_roi_raw +
+    _NL_RAW + 'RawExported=True' +
+    _NL_RAW + 'ScalingFactor=' + _scale_str_raw +
+    _NL_RAW + 'IsotropicResliced=' + _do_iso_str_raw +
+    _NL_RAW + 'PipelineStage=raw_export'
+)
+with tifffile.TiffFile(out_name, mode='r+') as tf:
+    page = tf.pages[0]
+    tag = page.tags.get('ImageDescription')
+    if tag is not None:
+        current_desc = (tag.value.decode('latin-1', errors='replace')
+                        if isinstance(tag.value, bytes) else (tag.value or ''))
+        new_desc = current_desc.rstrip(_NL_RAW) + extra_tags_raw + _NL_RAW
+        tag.overwrite(new_desc.encode('latin-1', errors='replace'))
+
 print(f"Wrote {out_name}")
 PYTHON_EOF
     """
