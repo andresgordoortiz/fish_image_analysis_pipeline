@@ -140,6 +140,19 @@ def write_tiff(
     convention in micrometres), and X/Y resolutions in units-per-micron
     so that downstream readers (ImageJ, napari, ultrack) recover the
     correct physical pixel sizes.
+
+    ``force_bigtiff=True`` is mandatory for the ISOTROPIC step: at this
+    pipeline's typical Z step (2.0 µm) resampled to 0.374 µm isotropic
+    the output Z grows ~5.3×, and a (458, 1576, 1576) uint16 input
+    produces a ~12 GB volume. Even with zlib compression the on-disk
+    data offset can exceed 4 GB, which trips the classic-TIFF 32-bit
+    offset cap and crashes tifffile with
+    ``struct.error: 'I' format requires 0 <= number <= 4294967295``
+    (this was hit on t0198, 2026-09-09). PLANAR / DEPTH are shape-
+    preserving so they don't trip this; they still benefit from BigTIFF
+    consistency. Fiji/ImageJ read BigTIFF files fine, and tifffile
+    preserves the ImageJ metadata block when ``imagej=True`` and
+    ``force_bigtiff=True`` are combined.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,6 +161,7 @@ def write_tiff(
         str(path),
         volume.astype(volume.dtype, copy=False),
         imagej=True,
+        force_bigtiff=True,
         resolution=(1.0 / x_um, 1.0 / y_um),
         metadata={
             "spacing": z_um,
