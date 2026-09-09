@@ -1219,7 +1219,7 @@ from skimage.transform import rescale
 # for correct metadata round-tripping (the in-script tifffile.imread here
 # is only used for the actual data array; the read_tiff call below gives
 # us the real voxel sizes from the input TIFF's metadata).
-sys.path.insert(0, 'bin')
+_sys.path.insert(0, 'bin')
 from _tiff_io import VoxelSizes, read_tiff, write_tiff
 
 with open('${metadata_json}', 'r') as f:
@@ -1290,7 +1290,7 @@ print(f"After XY rescale: {out.shape}  X/Y pixel size -> {x_res:.4f} x {y_res:.4
 # preprocessing.enabled=false but downscaling.enabled=true AND
 # preprocessing.isotropic_reslice=true.
 if do_iso:
-    zoom_z = z_pixel_in / x_res
+    zoom_z = input_z_um / x_res
     if abs(zoom_z - 1.0) < 1e-3:
         print("Z already isotropic, skipping.")
     else:
@@ -1305,7 +1305,7 @@ else:
     # skip_preprocessing-with-user-supplied-preprocessed-files path,
     # where the external preprocessed files may already carry any Z
     # geometry and we don't want to overwrite it.
-    out_z_um = z_pixel_in
+    out_z_um = input_z_um
 
 if out.dtype != np.uint16:
     out = np.clip(out.astype(np.int32), 0, 65535).astype(np.uint16)
