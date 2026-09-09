@@ -1182,35 +1182,57 @@ process DOWNSCALE_XY {
     python3 << 'PYTHON_EOF'
 import json
 import re as _re
+import sys as _sys
 import numpy as np
 import tifffile
 from skimage.transform import rescale
 
+# Make the staged bin/ importable so we can use _tiff_io.read_tiff / write_tiff
+# for correct metadata round-tripping (the in-script tifffile.imread here
+# is only used for the actual data array; the read_tiff call below gives
+# us the real voxel sizes from the input TIFF's metadata).
+sys.path.insert(0, 'bin')
+from _tiff_io import VoxelSizes, read_tiff, write_tiff
+
 with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
-xy_pixel_in = float(metadata['x_resolution_um'])
-z_pixel_in  = float(metadata['imagej']['spacing']) if 'imagej' in metadata else 1.0
+# Read the input's TRUE voxel sizes from the TIFF metadata (not from
+# shared_metadata.json — that holds the raw-input values and is wrong
+# for anything downstream of PLANAR/DEPTH/ISOTROPIC, which mutate the
+# voxel geometry). shared_metadata is still used below for non-spatial
+# bookkeeping (WasROICropped, TimePoint, etc.).
+in_vol = read_tiff('${filename}')
+xy_pixel_in = in_vol.voxel.x
+y_pixel_in  = in_vol.voxel.y
+z_pixel_in  = in_vol.voxel.z
+img = in_vol.data
+print(f"Input  shape: {img.shape}, dtype: {img.dtype}, "
+      f"voxel={xy_pixel_in:.4f}x{y_pixel_in:.4f}x{z_pixel_in:.4f} µm, scale=${scale_factor_py}")
+
 scale = float(${scale_factor_py})
 do_iso = (${reslice_py} == 'True')
 
 if not (0.0 < scale <= 1.0):
     raise SystemExit(f"scale_factor must satisfy 0 < scale <= 1, got {scale}")
 
-img = tifffile.imread('${filename}')
 if img.ndim != 3:
     raise SystemExit(f"Expected 3D ZYX input, got shape {img.shape}")
-print(f"Input  shape: {img.shape}, dtype: {img.dtype}, scale={scale}")
 
 # XY downscale using the same cubic anti-aliased algorithm the modular
 # preprocessing pipeline uses (bin/isotropic_resample.py).
 out = rescale(img, (1.0, scale, scale), order=3,
               preserve_range=True, anti_aliasing=True)
 x_res = xy_pixel_in / scale
-y_res = float(metadata['y_resolution_um']) / scale
+y_res = y_pixel_in / scale
 print(f"After XY rescale: {out.shape}  X/Y pixel size -> {x_res:.4f} x {y_res:.4f} µm")
 
 # Optional isotropic Z reslice in the same task, matching RESLICE_ISOTROPIC.
+# When invoked AFTER the PREPROCESS chain, ISOTROPIC has already made Z
+# isotropic on the way in, so this branch is normally skipped (the .nf
+# passes reslice_isotropic=false). It still fires for the standalone-
+# downscale path when the user has preprocessing.enabled=false but
+# downscaling.enabled=true AND preprocessing.isotropic_reslice=true.
 if do_iso:
     zoom_z = z_pixel_in / x_res
     if abs(zoom_z - 1.0) < 1e-3:
@@ -1220,6 +1242,17 @@ if do_iso:
         new_z = int(round(out.shape[0] * zoom_z))
         print(f"Isotropic Z reslice: {out.shape[0]} -> {new_z} (zoom_z={zoom_z:.4f})")
         out = ndi_zoom(out, (zoom_z, 1.0, 1.0), order=1, prefilter=False)
+    out_z_um = x_res  # isotropic → Z spacing matches the new XY
+else:
+    # No Z reslice this pass: keep the input's Z spacing unchanged. This
+    # is the critical fix — previously this script wrote the raw-input
+    # Z spacing (2.0 µm) from shared_metadata.json into the output, even
+    # when the input was the post-ISOTROPIC stack with Z=0.374 µm. That
+    # mismatch silently broke every downstream voxel-size calculation
+    # (CELLPOSE_SEGMENT mask-metadata math, viewer overlay alignment,
+    # tracking coordinates) — see repo memory "DOWNSCALE_XY writes
+    # wrong Z spacing" 2026-09-09.
+    out_z_um = z_pixel_in
 
 if out.dtype != np.uint16:
     out = np.clip(out.astype(np.int32), 0, 65535).astype(np.uint16)
@@ -1228,23 +1261,36 @@ m = _re.search(r'_Channel\\s*(\\d+)', '${filename}')
 channel = m.group(1) if m else '1'
 out_name = f"t${t_formatted}_dscale_Channel {channel}.tif"
 
-tifffile.imwrite(
-    out_name,
-    out,
-    imagej=True,
-    resolution=(1.0/x_res, 1.0/y_res),
-    metadata={
-        'spacing': z_pixel_in if not do_iso else x_res,
-        'unit': 'um',
-        'axes': 'ZYX',
-        'TimePoint': ${timepoint},
-        'WasROICropped': metadata.get('was_roi_cropped', False),
-        'XYDownscaled': True,
-        'ScalingFactor': scale,
-        'IsotropicResliced': bool(do_iso),
-    },
+write_tiff(out_name, out, VoxelSizes(out_z_um, y_res, x_res))
+
+# Stash the extra bookkeeping tags on top of the standard ImageJ block
+# that write_tiff() already produced. We re-open the file in r+ mode and
+# patch the ImageDescription text (the only ImageJ-extension tag that
+# survives a BigTIFF write without breaking downstream readers). This is
+# the same convention PLANAR/DEPTH/ISOTROPIC use — see bin/_tiff_io.py
+# callers that wrap write_tiff() with a follow-up metadata patch.
+with tifffile.TiffFile(out_name) as tf:
+    page = tf.pages[0]
+    desc = (page.tags.get('ImageDescription').value
+            if 'ImageDescription' in page.tags else '')
+    if isinstance(desc, bytes):
+        desc = desc.decode('latin-1', errors='replace')
+extra_tags = (
+    f"\nTimePoint={int(${timepoint})}"
+    f"\nWasROICropped={str(metadata.get('was_roi_cropped', False)).lower()}"
+    f"\nXYDownscaled=True"
+    f"\nScalingFactor={scale}"
+    f"\nIsotropicResliced={str(bool(do_iso)).lower()}"
 )
-print(f"Wrote {out_name}")
+with tifffile.TiffFile(out_name, mode='r+') as tf:
+    page = tf.pages[0]
+    tag = page.tags.get('ImageDescription')
+    if tag is not None:
+        new_desc = (desc or '').rstrip('\n') + extra_tags + '\n'
+        tag.overwrite(new_desc.encode('latin-1', errors='replace'))
+
+print(f"Wrote {out_name}  voxel={x_res:.4f}x{y_res:.4f}x{out_z_um:.4f} µm "
+      f"(XY factor={scale}, do_iso={do_iso})")
 PYTHON_EOF
     """
 }
@@ -1952,46 +1998,100 @@ PYTHON_EOF
 import tifffile
 import json
 import numpy as np
+import sys as _sys
 
-# Load metadata
+# Save log
+with open('t${t_formatted}_segment.log', 'a') as _flog:
+    _flog.write("\n\n=== POST-CELLPOSE METADATA WRITE ===\n")
+
+# Make bin/ importable so we can use _tiff_io.read_tiff / write_tiff
+# for correct metadata round-tripping — same pattern as the DOWNSCALE_XY
+# task. Without this, the in-script tifffile.imread for the input file
+# cannot recover voxel sizes from the (post-ISOTROPIC, post-DOWNSCALE_XY)
+# TIFF metadata, and we'd silently fall back to 1.0 µm defaults — which
+# is the root cause of the 2026-09-09 "Z=5.0 µm on segmented.tif" bug.
+_sys.path.insert(0, 'bin')
+from _tiff_io import VoxelSizes, read_tiff, write_tiff
+
 with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
-# Load mask
-mask = tifffile.imread("t${t_formatted}_segmented.tif")
+# Read voxel sizes FROM THE INPUT TIFF (which already reflects any
+# ISOTROPIC reslicing and XY downscaling). shared_metadata.json holds
+# the raw-input values and is the wrong source after PLANAR/DEPTH/
+# ISOTROPIC have run — it has XY=0.347, Z=2.0 µm, while the actual
+# input to Cellpose is XY=0.694, Z=0.374 µm after DOWNSCALE_XY.
+in_vol = read_tiff('${filename}')
+input_x_um = in_vol.voxel.x
+input_y_um = in_vol.voxel.y
+input_z_um = in_vol.voxel.z
+print(f"Cellpose input voxel size: {input_x_um:.4f} x {input_y_um:.4f} x {input_z_um:.4f} µm  "
+      f"(shape={in_vol.data.shape})")
 
-# Calculate voxel sizes (accounting for preprocessing scaling AND isotropic reslicing)
-x_res = metadata['x_resolution_um'] / ${image_scaling}
-y_res = metadata['y_resolution_um'] / ${image_scaling}
-original_z_spacing = metadata['imagej']['spacing'] if 'imagej' in metadata else 1.0
+# Load mask and detect its axis order.
+# Cellpose with do_3d=True returns the mask in the same ZYX order as the
+# input — but some 2D / stitch paths emit (Y, X, Z) instead. We assume
+# the axis with the SMALLEST dimension is Z (the typical lightsheet
+# anisotropy) and the LARGEST two are Y and X. This is robust to both
+# axis orderings without needing to read a TIFF axis tag from Cellpose's
+# output (which Cellpose doesn't always write).
+mask_full = tifffile.imread("t${t_formatted}_segmented.tif")
+if mask_full.ndim == 2:
+    # 2D mask — happens when do_3d=False and input was treated as a single
+    # 2D slice. Expand to (1, Y, X) so the downstream tifffile.imwrite
+    # axis declaration matches.
+    mask_full = mask_full[np.newaxis, ...]
+sorted_shape = sorted(mask_full.shape)
+z_axis = mask_full.shape.index(sorted_shape[0])
+y_axis = mask_full.shape.index(sorted_shape[1])
+x_axis = mask_full.shape.index(sorted_shape[2])
+if (z_axis, y_axis, x_axis) != (0, 1, 2):
+    print(f"Cellpose output is in axis order ({z_axis},{y_axis},{x_axis}); "
+          f"reordering to (0,1,2) ZYX")
+    mask_full = np.transpose(mask_full, (z_axis, y_axis, x_axis))
+mask = mask_full
+print(f"Mask shape (ZYX): {mask.shape}")
 
-# After isotropic reslicing, Z spacing changes to match scaled XY pixel size.
-# Compute from original vs actual Z dimensions.
-original_z_slices = metadata['shape']['dimensions'][0]
-new_z_slices = mask.shape[0]
-
-if new_z_slices != original_z_slices:
-    z_spacing = original_z_slices * original_z_spacing / new_z_slices
-else:
-    z_spacing = original_z_spacing
+# Voxel sizes for the mask follow the input (the mask is a per-pixel
+# labelling, it cannot change geometry). Cellpose with --do_3D + a
+# non-1.0 anisotropy value can in principle emit a mask at a different
+# Z resolution than the input, but the standard config in this pipeline
+# passes --anisotropy=1.0 (the preprocessed stack is isotropic by then),
+# which guarantees the mask Z matches the input Z. We mirror the input
+# voxel sizes exactly — same XY µm/px, same Z µm.
+x_res = input_x_um
+y_res = input_y_um
+z_spacing = input_z_um
 
 print(f"Segmentation mask voxel size: {x_res:.4f} x {y_res:.4f} x {z_spacing:.4f} µm")
 
-# Re-save with metadata
-tifffile.imwrite(
+# Re-save with metadata via _tiff_io.write_tiff so the ImageJ block is
+# written consistently with every other writer in the pipeline (bigtiff,
+# unit='um', axes='ZYX'). We then patch the extra bookkeeping tags
+# (TimePoint, LabelImage, WasROICropped) onto the ImageDescription text
+# in a follow-up r+ pass — same convention DOWNSCALE_XY uses.
+write_tiff(
     "t${t_formatted}_segmented.tif",
     mask.astype(np.uint16),
-    imagej=True,
-    resolution=(1.0/x_res, 1.0/y_res),
-    metadata={
-        'spacing': z_spacing,
-        'unit': 'um',
-        'axes': 'ZYX',
-        'TimePoint': ${timepoint},
-        'LabelImage': True,
-        'WasROICropped': metadata.get('was_roi_cropped', False)
-    }
+    VoxelSizes(z_spacing, y_res, x_res),
 )
+with tifffile.TiffFile("t${t_formatted}_segmented.tif") as tf:
+    page = tf.pages[0]
+    desc = (page.tags.get('ImageDescription').value
+            if 'ImageDescription' in page.tags else '')
+    if isinstance(desc, bytes):
+        desc = desc.decode('latin-1', errors='replace')
+extra_tags = (
+    f"\nTimePoint={int(${timepoint})}"
+    f"\nLabelImage=True"
+    f"\nWasROICropped={str(metadata.get('was_roi_cropped', False)).lower()}"
+)
+with tifffile.TiffFile("t${t_formatted}_segmented.tif", mode='r+') as tf:
+    page = tf.pages[0]
+    tag = page.tags.get('ImageDescription')
+    if tag is not None:
+        new_desc = (desc or '').rstrip('\n') + extra_tags + '\n'
+        tag.overwrite(new_desc.encode('latin-1', errors='replace'))
 print(f"Metadata preserved in segmentation mask for timepoint ${timepoint}")
 PRESERVE_MASK_META
 
