@@ -1315,23 +1315,22 @@ with tifffile.TiffFile(out_name) as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: do NOT write 'dollar-brace ... dollar-brace' inside a Python
-# f-string, AND do not rely on Groovy GString interpolation of any
-# Groovy var inside Python single-quoted strings either (the latter
-# is unreliable for some Nextflow versions — see repo memory
-# 2026-09-09). Instead, extract the timepoint value as a regular
-# Python integer via a Groovy expression OUTSIDE any Python string,
-# so the literal dollar-brace syntax never reaches Python.
-# timepoint (Groovy var) is e.g. the integer 9; t_formatted is its
-# 4-digit zero-padded string version ("0009"). We use timepoint here
-# because the TimePoint tag value is numeric.
+# NOTE: avoid multi-line implicit f-string concatenation (Python
+# requires an open paren OR a backslash continuation to span lines,
+# and we hit a "EOL while scanning string literal" error on the
+# cluster in some Nextflow versions when the implicit concatenation
+# is at the wrong indentation level). Use plain 'newline' escape
+# sequences in single-line strings instead. See repo memory 2026-09-09.
 _tp_int = ${timepoint}
+_tp_str = str(_tp_int)
+_was_roi = str(metadata.get('was_roi_cropped', False)).lower()
+_do_iso_str = str(bool(do_iso)).lower()
 extra_tags = (
-    f"\nTimePoint={_tp_int}"
-    f"\nWasROICropped={str(metadata.get('was_roi_cropped', False)).lower()}"
-    f"\nXYDownscaled=True"
-    f"\nScalingFactor={scale}"
-    f"\nIsotropicResliced={str(bool(do_iso)).lower()}"
+    '\nTimePoint=' + _tp_str +
+    '\nWasROICropped=' + _was_roi +
+    '\nXYDownscaled=True' +
+    '\nScalingFactor=' + str(scale) +
+    '\nIsotropicResliced=' + _do_iso_str
 )
 with tifffile.TiffFile(out_name, mode='r+') as tf:
     page = tf.pages[0]
@@ -1340,8 +1339,9 @@ with tifffile.TiffFile(out_name, mode='r+') as tf:
         new_desc = (desc or '').rstrip('\n') + extra_tags + '\n'
         tag.overwrite(new_desc.encode('latin-1', errors='replace'))
 
-print(f"Wrote {out_name}  voxel={x_res:.4f}x{y_res:.4f}x{out_z_um:.4f} µm "
-      f"(XY factor={scale}, do_iso={do_iso})")
+print('Wrote ' + out_name + '  voxel=' +
+      ('%.4f' % x_res) + 'x' + ('%.4f' % y_res) + 'x' + ('%.4f' % out_z_um) + ' um '
+      ' (XY factor=' + str(scale) + ', do_iso=' + _do_iso_str + ')')
 PYTHON_EOF
     """
 }
@@ -2173,17 +2173,16 @@ with tifffile.TiffFile("t${t_formatted}_segmented.tif") as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: do NOT write any dollar-brace Groovy interpolation inside a
-# Python f-string, AND do NOT rely on Groovy GString interpolation of
-# Groovy vars inside Python single-quoted strings either (see
-# DOWNSCALE_XY heredoc comment, repo memory 2026-09-09). Use
-# timepoint directly on a plain assignment outside any string so
-# the literal dollar-brace syntax never reaches Python.
+# NOTE: avoid multi-line implicit f-string concatenation (see
+# DOWNSCALE_XY heredoc comment, repo memory 2026-09-09). Use plain
+# 'newline' escape sequences in single-line strings instead.
 _tp_int = ${timepoint}
+_tp_str = str(_tp_int)
+_was_roi = str(metadata.get('was_roi_cropped', False)).lower()
 extra_tags = (
-    f"\nTimePoint={_tp_int}"
-    f"\nLabelImage=True"
-    f"\nWasROICropped={str(metadata.get('was_roi_cropped', False)).lower()}"
+    '\nTimePoint=' + _tp_str +
+    '\nLabelImage=True' +
+    '\nWasROICropped=' + _was_roi
 )
 with tifffile.TiffFile("t${t_formatted}_segmented.tif", mode='r+') as tf:
     page = tf.pages[0]
@@ -2191,7 +2190,7 @@ with tifffile.TiffFile("t${t_formatted}_segmented.tif", mode='r+') as tf:
     if tag is not None:
         new_desc = (desc or '').rstrip('\n') + extra_tags + '\n'
         tag.overwrite(new_desc.encode('latin-1', errors='replace'))
-print(f"Metadata preserved in segmentation mask for timepoint {_tp_int}")
+print('Metadata preserved in segmentation mask for timepoint ' + _tp_str)
 PRESERVE_MASK_META
 
     else
