@@ -102,29 +102,27 @@ def main() -> None:
         "--out_voxel_y_um", type=float, default=None,
         help="Output Y voxel size in µm. See --out_voxel_x_um.",
     )
-    args = parser.parse_args()
-
-    vol = read_tiff(args.input)
-    # make_isotropic needs the input voxel sizes to compute the new Z shape.
-    # If read_tiff() returned bogus Z (e.g. 1.0 µm default because the
-    # input TIFF had no ImageJ block), the .nf pipeline can override via
-    # --input_voxel_z_um. We use read_tiff's Z unless explicitly
-    # overridden.
     parser.add_argument(
         "--input_voxel_z_um", type=float, default=None,
         help="Override input Z voxel size in µm (used to compute the Z "
-             "resample factor). Falls back to read_tiff().vol.voxel.z.",
+             "resample factor). Falls back to read_tiff().vol.voxel.z. "
+             "The .nf pipeline passes the canonical Z from "
+             "shared_metadata.json here so the input Z is the user's "
+             "configured raw-input value, not the bogus 1.0 µm default "
+             "the raw TIFF's ImageJ block carries.",
     )
-    # Re-parse with the new arg added. Simpler: just look it up from the
-    # namespace if it was passed, else from read_tiff.
-    cli_args = args  # local alias for readability below
+    args = parser.parse_args()
+
+    vol = read_tiff(args.input)
+    # Build the (z, y, x) input-voxel tuple for make_isotropic. Prefer
+    # the user-provided --input_voxel_z_um (the canonical config value),
+    # fall back to read_tiff()'s recovery (which may be bogus for raw
+    # input TIFFs that lack proper ImageJ metadata).
     input_z_um = (
-        cli_args.input_voxel_z_um
-        if cli_args.input_voxel_z_um is not None
+        args.input_voxel_z_um
+        if args.input_voxel_z_um is not None
         else vol.voxel.z
     )
-    # Build a corrected (z, y, x) tuple for make_isotropic so the Z
-    # calculation uses the user-provided input Z, not the bogus TIFF Z.
     corrected_input_voxel = (input_z_um, vol.voxel.y, vol.voxel.x)
     iso = make_isotropic(vol.data, corrected_input_voxel, args.target_um, order=args.order)
     # Output voxel sizes: Z = target_um (the new isotropic Z); XY = raw
