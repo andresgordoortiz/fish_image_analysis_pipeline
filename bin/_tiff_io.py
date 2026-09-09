@@ -113,15 +113,44 @@ def read_tiff(path: Path | str) -> Volume:
     z_um, y_um, x_um = 1.0, 1.0, 1.0
     try:
         with tifffile.TiffFile(str(path)) as tf:
-            # Step 3 (run once, outside the page loop): TiffFile-level
+            # Step A (run once, outside the page loop): TiffFile-level
             # imagej_metadata. tifffile 2024.6.18 has this on TiffFile but
             # not on TiffPage, so we look it up here. Returns a dict for
             # ImageJ hyperstacks, None for plain TIFFs without ImageJ
-            # metadata.
+            # metadata. This is the PRIMARY recovery path for files written
+            # by bin/_tiff_io.write_tiff() because write_tiff embeds the
+            # XY voxel sizes as x_resolution_um / y_resolution_um in the
+            # metadata dict (bypassing the ResolutionUnit ambiguity in
+            # XResolution/YResolution tags — see step 5 below for why).
             tf_ij_meta = getattr(tf, "imagej_metadata", None)
             tf_ij_spacing = None
+            tf_ij_x_um = None
+            tf_ij_y_um = None
             if isinstance(tf_ij_meta, dict):
                 tf_ij_spacing = tf_ij_meta.get("spacing")
+                # x_resolution_um / y_resolution_um keys are written by
+                # write_tiff() since the chain reorder commit on
+                # 2026-09-09 (to bypass the XResolution unit ambiguity
+                # across tifffile versions).
+                x_key = tf_ij_meta.get("x_resolution_um")
+                y_key = tf_ij_meta.get("y_resolution_um")
+                if x_key is not None:
+                    try:
+                        tf_ij_x_um = float(x_key)
+                    except (TypeError, ValueError):
+                        tf_ij_x_um = None
+                if y_key is not None:
+                    try:
+                        tf_ij_y_um = float(y_key)
+                    except (TypeError, ValueError):
+                        tf_ij_y_um = None
+            # Apply XY from imagej_metadata IMMEDIATELY (before any XResolution
+            # tag fallback that might produce nonsense on tifffile versions
+            # whose ResolutionUnit=1 (NONE) is misinterpreted as cm-based).
+            if tf_ij_x_um is not None and tf_ij_x_um > 0:
+                x_um = tf_ij_x_um
+            if tf_ij_y_um is not None and tf_ij_y_um > 0:
+                y_um = tf_ij_y_um
 
             for page in tf.pages:
                 # ------------------------------------------------------------
@@ -176,8 +205,12 @@ def read_tiff(path: Path | str) -> Volume:
                 # tifffile version since 2018. Last-resort fallback for
                 # files written by very old tifffile that have ``spacing=``
                 # in ImageDescription but no proper ImageJ metadata block.
+                # Also recovers ``x_resolution_um=`` / ``y_resolution_um=``
+                # for files written by older versions of write_tiff (or
+                # other tools) that put the keys as raw key=value lines
+                # rather than relying on tf.imagej_metadata parsing.
                 # ------------------------------------------------------------
-                if z_um == 1.0:
+                if z_um == 1.0 or x_um == 1.0 or y_um == 1.0:
                     desc_tag = page.tags.get("ImageDescription")
                     if desc_tag is not None:
                         desc_value = desc_tag.value
@@ -191,9 +224,23 @@ def read_tiff(path: Path | str) -> Volume:
                         if isinstance(desc_value, str):
                             for token in desc_value.splitlines():
                                 token = token.strip()
-                                if token.startswith("spacing="):
+                                if z_um == 1.0 and token.startswith("spacing="):
                                     try:
                                         z_um = float(token.split("=", 1)[1])
+                                    except (ValueError, IndexError):
+                                        pass
+                                elif x_um == 1.0 and token.startswith("x_resolution_um="):
+                                    try:
+                                        v = float(token.split("=", 1)[1])
+                                        if v > 0:
+                                            x_um = v
+                                    except (ValueError, IndexError):
+                                        pass
+                                elif y_um == 1.0 and token.startswith("y_resolution_um="):
+                                    try:
+                                        v = float(token.split("=", 1)[1])
+                                        if v > 0:
+                                            y_um = v
                                     except (ValueError, IndexError):
                                         pass
 
@@ -315,6 +362,15 @@ def write_tiff(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     z_um, y_um, x_um = voxel.as_tuple()
+    # NOTE: tifffile's `resolution` kwarg interacts badly with the TIFF
+    # ResolutionUnit tag across versions (2024.6.18 vs 2026.x), so we
+    # ALSO embed x_resolution_um / y_resolution_um directly into the
+    # ImageJ metadata block. tifffile writes these into the ImageJ
+    # description as ``x_resolution_um=0.6940\ny_resolution_um=0.6940``
+    # which round-trips reliably through tf.imagej_metadata (TiffFile-
+    # level, present on 2024.6.18) AND through the raw ImageDescription
+    # byte scan. read_tiff() reads them first, before the XResolution
+    # tag path, so the unit ambiguity is bypassed entirely.
     tifffile.imwrite(
         str(path),
         volume.astype(volume.dtype, copy=False),
@@ -325,6 +381,8 @@ def write_tiff(
             "spacing": z_um,
             "unit": "um",
             "axes": "ZYX",
+            "x_resolution_um": x_um,
+            "y_resolution_um": y_um,
         },
         compression=compression,
     )

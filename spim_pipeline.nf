@@ -1530,6 +1530,12 @@ tifffile.imwrite(
         'spacing': z_pixel_in if not do_iso else x_res,
         'unit': 'um',
         'axes': 'ZYX',
+        # Bypass the XResolution/YResolution ResolutionUnit ambiguity
+        # across tifffile versions (2024.6.18 vs 2026.x write the same
+        # `resolution=(...)` kwarg differently). bin/_tiff_io.read_tiff()
+        # reads these directly from tf.imagej_metadata on the reader side.
+        'x_resolution_um': x_res,
+        'y_resolution_um': y_res,
         'TimePoint': ${timepoint},
         'WasROICropped': metadata.get('was_roi_cropped', False),
         'RawExported': True,
