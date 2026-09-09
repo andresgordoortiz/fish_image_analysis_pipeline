@@ -1318,8 +1318,19 @@ with tifffile.TiffFile(out_name) as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
+# NOTE: do NOT write "${...}" inside a Python f-string. The Groovy
+# GString interpolation runs BEFORE bash sees the heredoc and SHOULD
+# substitute ${timepoint} to its value, but on at least one recent
+# run (2026-09-09, work/7c/8f19e6ab...) the literal "${timepoint}"
+# survived to the rendered .command.sh, then Python's f-string parser
+# saw "{int(${timepoint})}" and crashed with "EOL while scanning
+# string literal". Workaround: extract the timepoint value as a
+# regular Python literal via a Groovy GString assignment outside any
+# f-string. t_formatted is a 4-digit zero-padded string (e.g. "0009"),
+# which we parse to int for the TimePoint tag value.
+_tp_int = int('${t_formatted}')
 extra_tags = (
-    f"\nTimePoint={int(${timepoint})}"
+    f"\nTimePoint={_tp_int}"
     f"\nWasROICropped={str(metadata.get('was_roi_cropped', False)).lower()}"
     f"\nXYDownscaled=True"
     f"\nScalingFactor={scale}"
@@ -2165,8 +2176,13 @@ with tifffile.TiffFile("t${t_formatted}_segmented.tif") as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
+# NOTE: do NOT write "${...}" inside a Python f-string. See DOWNSCALE_XY
+# heredoc for the full story (2026-09-09 work/7c/8f19e6ab crash). Same
+# workaround: extract t_formatted as a regular Python string via a
+# Groovy GString assignment outside any f-string.
+_tp_int = int('${t_formatted}')
 extra_tags = (
-    f"\nTimePoint={int(${timepoint})}"
+    f"\nTimePoint={_tp_int}"
     f"\nLabelImage=True"
     f"\nWasROICropped={str(metadata.get('was_roi_cropped', False)).lower()}"
 )
@@ -2176,7 +2192,7 @@ with tifffile.TiffFile("t${t_formatted}_segmented.tif", mode='r+') as tf:
     if tag is not None:
         new_desc = (desc or '').rstrip('\n') + extra_tags + '\n'
         tag.overwrite(new_desc.encode('latin-1', errors='replace'))
-print(f"Metadata preserved in segmentation mask for timepoint ${timepoint}")
+print(f"Metadata preserved in segmentation mask for timepoint {_tp_int}")
 PRESERVE_MASK_META
 
     else
