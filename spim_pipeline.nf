@@ -1120,9 +1120,22 @@ if out.dtype != np.uint16:
 print(f"Output shape: {out.shape}, dtype: {out.dtype}")
 
 # Preserve original Channel <c> filename so downstream stages keep working
-import re
-m = re.search(r'_Channel\\s*(\\d+)', '${filename}')
-channel = m.group(1) if m else '1'
+# NOTE: no backslashes in this heredoc body — Nextflow 25.04.7's bash
+# heredoc pass-through was eating backslashes and breaking regex/string
+# escapes (see repo memory 2026-09-09). We split on the literal
+# _Channel prefix instead of using a regex.
+channel = '1'
+_idx = '${filename}'.find('_Channel ')
+if _idx >= 0:
+    _rest = '${filename}'[_idx + len('_Channel '):]
+    _digits = ''
+    for _ch in _rest:
+        if _ch.isdigit():
+            _digits += _ch
+        else:
+            break
+    if _digits:
+        channel = _digits
 out_name = f"t${t_formatted}_iso_Channel {channel}.tif"
 
 tifffile.imwrite(
@@ -1297,8 +1310,19 @@ else:
 if out.dtype != np.uint16:
     out = np.clip(out.astype(np.int32), 0, 65535).astype(np.uint16)
 
-m = _re.search(r'_Channel\\s*(\\d+)', '${filename}')
-channel = m.group(1) if m else '1'
+# No backslashes — see note in RESLICE_ISOTROPIC above
+channel = '1'
+_idx = '${filename}'.find('_Channel ')
+if _idx >= 0:
+    _rest = '${filename}'[_idx + len('_Channel '):]
+    _digits = ''
+    for _ch in _rest:
+        if _ch.isdigit():
+            _digits += _ch
+        else:
+            break
+    if _digits:
+        channel = _digits
 out_name = f"t${t_formatted}_dscale_Channel {channel}.tif"
 
 write_tiff(out_name, out, VoxelSizes(out_z_um, y_res, x_res))
@@ -1315,13 +1339,13 @@ with tifffile.TiffFile(out_name) as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: the literal '\\n' patterns below were tripping the bash heredoc
-# pass-through on Nextflow 25.04.7 + tifffile 2024.6.18 — the backslash
-# got lost somewhere in the pipeline and Python saw an unescaped
-# newline inside the string literal (EOL while scanning string
-# literal). Use os.linesep (== '\n' on Linux) as a function call instead
-# of an escape sequence to sidestep the entire escaping chain. See
-# repo memory 2026-09-09.
+# NOTE: prior heredoc versions used literal backslash-n in string
+# literals and comments; the bash heredoc pass-through on Nextflow
+# 25.04.7 ate the backslash and Python saw an unescaped newline (EOL
+# while scanning string literal). We now use os.linesep instead of
+# any backslash escape sequences for newlines (Python strings
+# concat with the function return), and this comment avoids
+# backslash characters entirely. See repo memory 2026-09-09.
 import os as _os
 _NL = _os.linesep
 _tp_int = ${timepoint}
@@ -1481,8 +1505,19 @@ if do_iso:
 if out.dtype != np.uint16:
     out = np.clip(out.astype(np.int32), 0, 65535).astype(np.uint16)
 
-m = _re.search(r'_Channel\\s*(\\d+)', '${filename}')
-channel = m.group(1) if m else '1'
+# No backslashes — see note in RESLICE_ISOTROPIC above
+channel = '1'
+_idx = '${filename}'.find('_Channel ')
+if _idx >= 0:
+    _rest = '${filename}'[_idx + len('_Channel '):]
+    _digits = ''
+    for _ch in _rest:
+        if _ch.isdigit():
+            _digits += _ch
+        else:
+            break
+    if _digits:
+        channel = _digits
 out_name = f"t${t_formatted}_raw_iso_Channel {channel}.tif"
 
 tifffile.imwrite(
@@ -1696,19 +1731,22 @@ try:
             metadata['software'] = tags['Software'].value
 
     # Save metadata
+    # NOTE: use chr(10) instead of backslash-n for newlines in f-strings —
+    # the bash heredoc pass-through on Nextflow 25.04.7 was eating backslashes
+    # (see repo memory 2026-09-09).
     print("Saving metadata to JSON...", file=sys.stderr)
     with open('shared_metadata.json', 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"\\nMetadata Configuration:")
+    print(chr(10) + "Metadata Configuration:")
     print(f"  Source: {metadata['voxel_size_source']}")
     print(f"  ROI cropped: {was_cropped}")
     print(f"  Image shape: {metadata['shape']['dimensions']} (ZYX)")
     print(f"  Voxel size: {x_resolution_um:.4f} x {y_resolution_um:.4f} x {z_spacing:.4f} µm")
-    print("\\nFull metadata:")
+    print(chr(10) + "Full metadata:")
     print(json.dumps(metadata, indent=2))
 
-    print("\\nSUCCESS: Metadata extraction/configuration completed", file=sys.stderr)
+    print(chr(10) + "SUCCESS: Metadata extraction/configuration completed", file=sys.stderr)
 
 except Exception as e:
     print(f"ERROR: {type(e).__name__}: {str(e)}", file=sys.stderr)
@@ -2033,10 +2071,13 @@ print("")
 result = subprocess.run(cmd, capture_output=True, text=True)
 
 # Save log
+# NOTE: use chr(10) for newlines instead of the usual backslash-n escape
+# sequence; the bash heredoc pass-through on Nextflow 25.04.7 was eating
+# backslashes (see repo memory 2026-09-09).
 with open('t${t_formatted}_segment.log', 'w') as f:
-    f.write("STDOUT:\\n")
+    f.write("STDOUT:" + chr(10))
     f.write(result.stdout)
-    f.write("\\n\\nSTDERR:\\n")
+    f.write(chr(10) + chr(10) + "STDERR:" + chr(10))
     f.write(result.stderr)
 
 print(result.stdout)
@@ -2064,8 +2105,10 @@ import numpy as np
 import sys as _sys
 
 # Save log
+# NOTE: use chr(10) for newlines instead of backslash-n escape sequences;
+# the bash heredoc pass-through on Nextflow 25.04.7 was eating backslashes.
 with open('t${t_formatted}_segment.log', 'a') as _flog:
-    _flog.write("\n\n=== POST-CELLPOSE METADATA WRITE ===\n")
+    _flog.write(chr(10) + chr(10) + "=== POST-CELLPOSE METADATA WRITE ===" + chr(10))
 
 # Make bin/ importable so we can use _tiff_io.read_tiff / write_tiff
 # for correct metadata round-tripping — same pattern as the DOWNSCALE_XY
@@ -2176,10 +2219,13 @@ with tifffile.TiffFile("t${t_formatted}_segmented.tif") as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: use os.linesep instead of '\\n' literal escape sequences — the
-# bash heredoc pass-through on Nextflow 25.04.7 was eating the backslash
-# somewhere and Python saw an unescaped newline inside the string literal
-# (EOL while scanning string literal). See repo memory 2026-09-09.
+# NOTE: prior heredoc versions used literal backslash-n in string
+# literals and comments; the bash heredoc pass-through on Nextflow
+# 25.04.7 ate the backslash and Python saw an unescaped newline
+# inside the string literal (EOL while scanning string literal).
+# We now use os.linesep instead of any backslash escape sequences
+# for newlines, and this comment avoids backslash characters
+# entirely. See repo memory 2026-09-09.
 import os as _os
 _NL = _os.linesep
 _tp_int = ${timepoint}
@@ -2665,13 +2711,28 @@ process ULTRACK_SEGMENT {
 
     # Override database path in config to force writing into workdir
     # ultrack sqlite uses working_dir + database_file_name (NOT address)
+    # NOTE: no backslashes in this heredoc body — Nextflow 25.04.7's bash
+    # heredoc pass-through was eating backslashes (see repo memory
+    # 2026-09-09). We replace via line iteration instead of re.sub.
     python3 << 'PYEOF'
-import re, pathlib
-cfg = pathlib.Path('${ultrack_config_toml}').read_text()
+import pathlib
+cfg_path = pathlib.Path('${ultrack_config_toml}')
+cfg = cfg_path.read_text()
+cfg_lines = cfg.split(chr(10))
 
 # Remove any existing data_config fields we need to override
-for key in ('database', 'address', 'working_dir', 'database_file_name'):
-    cfg = re.sub(rf'^\\s*{key}\\s*=.*\$', '', cfg, flags=re.M)
+remove_keys = ('database', 'address', 'working_dir', 'database_file_name')
+new_lines = []
+for _line in cfg_lines:
+    _stripped = _line.lstrip()
+    _drop = False
+    for _key in remove_keys:
+        if _stripped.startswith(_key + ' ') or _stripped.startswith(_key + '=') or _stripped == _key:
+            _drop = True
+            break
+    if not _drop:
+        new_lines.append(_line)
+cfg = chr(10).join(new_lines)
 
 # Insert correct fields under [data_config]
 NL = chr(10)
@@ -2735,11 +2796,24 @@ process ULTRACK_LINK {
     set -euo pipefail
 
     # Re-patch database path to point to the local workdir copy
+    # NOTE: no backslashes — see ULTRACK_CONFIG_EDIT block above
     python3 << 'PYEOF'
-import re, pathlib
-cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-for key in ('database', 'address', 'working_dir', 'database_file_name'):
-    cfg = re.sub(rf'^\\s*{key}\\s*=.*\$', '', cfg, flags=re.M)
+import pathlib
+cfg_path = pathlib.Path('${ultrack_config_toml}')
+cfg = cfg_path.read_text()
+cfg_lines = cfg.split(chr(10))
+remove_keys = ('database', 'address', 'working_dir', 'database_file_name')
+new_lines = []
+for _line in cfg_lines:
+    _stripped = _line.lstrip()
+    _drop = False
+    for _key in remove_keys:
+        if _stripped.startswith(_key + ' ') or _stripped.startswith(_key + '=') or _stripped == _key:
+            _drop = True
+            break
+    if not _drop:
+        new_lines.append(_line)
+cfg = chr(10).join(new_lines)
 NL = chr(10)
 new_fields = f'database = "sqlite"{NL}working_dir = "."{NL}database_file_name = "data.db"'
 if '[data_config]' in cfg:
@@ -2790,11 +2864,24 @@ process ULTRACK_SOLVE {
     set -euo pipefail
 
     # Re-patch database path to point to the local workdir copy
+    # NOTE: no backslashes — see ULTRACK_CONFIG_EDIT block above
     python3 << 'PYEOF'
-import re, pathlib
-cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-for key in ('database', 'address', 'working_dir', 'database_file_name'):
-    cfg = re.sub(rf'^\\s*{key}\\s*=.*\$', '', cfg, flags=re.M)
+import pathlib
+cfg_path = pathlib.Path('${ultrack_config_toml}')
+cfg = cfg_path.read_text()
+cfg_lines = cfg.split(chr(10))
+remove_keys = ('database', 'address', 'working_dir', 'database_file_name')
+new_lines = []
+for _line in cfg_lines:
+    _stripped = _line.lstrip()
+    _drop = False
+    for _key in remove_keys:
+        if _stripped.startswith(_key + ' ') or _stripped.startswith(_key + '=') or _stripped == _key:
+            _drop = True
+            break
+    if not _drop:
+        new_lines.append(_line)
+cfg = chr(10).join(new_lines)
 NL = chr(10)
 new_fields = f'database = "sqlite"{NL}working_dir = "."{NL}database_file_name = "data.db"'
 if '[data_config]' in cfg:
@@ -2854,11 +2941,24 @@ process ULTRACK_EXPORT {
     exec > >(tee ultrack_export.log) 2>&1
 
     # Re-patch database path to point to the local workdir copy
+    # NOTE: no backslashes — see ULTRACK_CONFIG_EDIT block above
     python3 << 'PYEOF'
-import re, pathlib
-cfg = pathlib.Path('${ultrack_config_toml}').read_text()
-for key in ('database', 'address', 'working_dir', 'database_file_name'):
-    cfg = re.sub(rf'^\\s*{key}\\s*=.*\$', '', cfg, flags=re.M)
+import pathlib
+cfg_path = pathlib.Path('${ultrack_config_toml}')
+cfg = cfg_path.read_text()
+cfg_lines = cfg.split(chr(10))
+remove_keys = ('database', 'address', 'working_dir', 'database_file_name')
+new_lines = []
+for _line in cfg_lines:
+    _stripped = _line.lstrip()
+    _drop = False
+    for _key in remove_keys:
+        if _stripped.startswith(_key + ' ') or _stripped.startswith(_key + '=') or _stripped == _key:
+            _drop = True
+            break
+    if not _drop:
+        new_lines.append(_line)
+cfg = chr(10).join(new_lines)
 NL = chr(10)
 new_fields = f'database = "sqlite"{NL}working_dir = "."{NL}database_file_name = "data.db"'
 if '[data_config]' in cfg:
