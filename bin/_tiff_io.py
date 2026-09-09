@@ -53,33 +53,41 @@ def read_tiff(path: Path | str) -> Volume:
     """Read a 3D TIFF (ZYX) and return the volume + voxel sizes.
 
     Voxel sizes are recovered, in order of preference:
-      1. ``page.physical_pixel_sizes`` (Z, Y, X) — tifffile >= 2024.9.20
-         only. Not present in older tifffile (e.g. 2024.6.18, which is
-         what this pipeline's container ships — verified on
+
+      1. ``page.physical_pixel_sizes`` (tifffile >= 2024.9.20) — added
+         AFTER this pipeline's container-shipped version (2024.6.18), so
+         this path is gated behind ``hasattr``. Verified missing on
          2026-09-09 via ``AttributeError: 'TiffPage' object has no
-         attribute 'physical_pixel_sizes'``). When present, this is the
-         most reliable path because it already converts the
-         ``XResolution``/``YResolution`` tags using the file's
-         ``ResolutionUnit`` (the manual conversion below is a frequent
-         source of 100x off-by-unit errors).
-      2. ``page.imagej_metadata['spacing']`` (Z) — tifffile >= 2024
-         exposes the parsed ImageJ metadata block as a dict on every
-         page. This is the path that works in 2024.6.18.
-      3. Raw ``page.tags['ImageDescription']`` byte scan for ``spacing=``
-         — last-resort fallback that works on every tifffile version
-         since 2018, including tifffile >= 2024 which removed the
-         deprecated ``page.imagej_description`` string attribute.
-      4. Manual conversion of ``page.tags['XResolution']`` /
-         ``YResolution`` + ``ResolutionUnit`` for XY (Z already recovered
-         from steps 2 or 3). The unit conversion is the dangerous part —
-         TIFF's RATIONAL ``XResolution`` is stored as a fraction with a
-         unit chosen by ``ResolutionUnit`` (1 = none, 2 = inch,
-         3 = centimeter). ImageJ's default ``ResolutionUnit`` is
-         ``CENTIMETER`` for hyperstack writes, so a written value of
-         ``96.0 / 1`` means "96 pixels per cm" → 1/96 cm = 0.0104 cm =
-         104 µm, NOT 0.0104 µm. We do this conversion explicitly in
-         step 4.
-      5. Loud warning + fall back to ``(1.0, 1.0, 1.0)`` µm.
+         attribute 'physical_pixel_sizes'``.
+
+      2. ``page.imagej_metadata['spacing']`` (tifffile >= 2024.x where
+         x >= some patch level) — ALSO not present on 2024.6.18.
+         Verified missing on 2026-09-09 via ``AttributeError: 'TiffPage'
+         object has no attribute 'imagej_metadata'``. We try it
+         defensively (gate behind ``hasattr``) so the same code works
+         when the container gets bumped to a newer tifffile.
+
+      3. ``TiffFile.imagej_metadata`` (parsed at file-open time, exists
+         in tifffile 2024.6.18 as a TiffFile-level attribute even when
+         the page-level dict is missing). This is the primary Z-recovery
+         path on 2024.6.18 — verified available as of 2024.x.
+
+      4. Raw ``page.tags['ImageDescription']`` byte scan for ``spacing=``
+         (TIFF core tag, present in every tifffile version since 2018).
+         The byte-string scan is the most reliable path for files written
+         by older tifffile (< 2022) that include ``spacing=`` in the raw
+         ImageDescription but not in any parsed ImageJ metadata block.
+
+      5. Manual ``XResolution``/``YResolution`` + ``ResolutionUnit``
+         conversion to µm/pixel for XY. TIFF core tags (always present).
+         ImageJ writes RATIONAL ``XResolution`` as pixels-per-cm by
+         default (``ResolutionUnit=3``), so a written value of (96, 1)
+         means 96 pixels per cm → 1/96 cm = 0.0104 cm = 104 µm, NOT
+         0.0104 µm. Without this conversion, our prior bug fix tried to
+         divide 1 by ``XResolution`` directly, producing 0.0104 µm and
+         silently corrupting every downstream XY calculation.
+
+      6. Loud WARNING + fall back to ``(1.0, 1.0, 1.0)`` µm.
 
     The defaults are NEVER used silently — every fallback emits a
     ``WARNING:`` line on stdout so the Nextflow task log catches it.
@@ -105,54 +113,69 @@ def read_tiff(path: Path | str) -> Volume:
     z_um, y_um, x_um = 1.0, 1.0, 1.0
     try:
         with tifffile.TiffFile(str(path)) as tf:
+            # Step 3 (run once, outside the page loop): TiffFile-level
+            # imagej_metadata. tifffile 2024.6.18 has this on TiffFile but
+            # not on TiffPage, so we look it up here. Returns a dict for
+            # ImageJ hyperstacks, None for plain TIFFs without ImageJ
+            # metadata.
+            tf_ij_meta = getattr(tf, "imagej_metadata", None)
+            tf_ij_spacing = None
+            if isinstance(tf_ij_meta, dict):
+                tf_ij_spacing = tf_ij_meta.get("spacing")
+
             for page in tf.pages:
                 # ------------------------------------------------------------
                 # Step 1: physical_pixel_sizes (tifffile >= 2024.9.20 only).
                 # Returns PhysicalPixelSizes(z, y, x) in the unit declared by
                 # the file's ``imagej_metadata['unit']`` (defaults to µm for
                 # ImageJ hyperstacks written with ``unit='um'``, which is
-                # what this pipeline always uses). If the attribute is
-                # missing on the installed tifffile version, ``getattr``
-                # returns None and we skip to step 2.
+                # what this pipeline always uses).
                 # ------------------------------------------------------------
-                pps = getattr(page, "physical_pixel_sizes", None)
-                if pps is not None:
-                    try:
-                        if pps.z is not None and pps.z > 0:
-                            z_um = float(pps.z)
-                        if pps.y is not None and pps.y > 0:
-                            y_um = float(pps.y)
-                        if pps.x is not None and pps.x > 0:
-                            x_um = float(pps.x)
-                    except Exception:
-                        pass
+                if hasattr(page, "physical_pixel_sizes"):
+                    pps = page.physical_pixel_sizes
+                    if pps is not None:
+                        try:
+                            if pps.z is not None and pps.z > 0:
+                                z_um = float(pps.z)
+                            if pps.y is not None and pps.y > 0:
+                                y_um = float(pps.y)
+                            if pps.x is not None and pps.x > 0:
+                                x_um = float(pps.x)
+                        except Exception:
+                            pass
 
                 # ------------------------------------------------------------
-                # Step 2: imagej_metadata dict (tifffile >= 2024).
-                # This is the primary Z-spacing path for tifffile 2024.6.18
-                # (the version installed in this pipeline's container, as
-                # verified on 2026-09-09). ``page.imagej_metadata`` is a
-                # dict parsed from the ImageDescription text by tifffile;
-                # ``spacing`` is the ImageJ Z spacing (always in the unit
-                # declared by ``imagej_metadata['unit']``, which this
-                # pipeline writes as 'um').
+                # Step 2: page.imagej_metadata['spacing'] (defensive — only
+                # present in tifffile >= some 2024.x patch). Tifffile 2024.6.18
+                # does NOT have this attribute; hasattr gate avoids the
+                # AttributeError confirmed on 2026-09-09.
                 # ------------------------------------------------------------
-                ij_meta = getattr(page, "imagej_metadata", None)
-                if isinstance(ij_meta, dict) and z_um == 1.0:
-                    spacing_fallback = ij_meta.get("spacing")
+                if z_um == 1.0 and hasattr(page, "imagej_metadata"):
+                    ij_meta = page.imagej_metadata
+                    if isinstance(ij_meta, dict):
+                        spacing_fallback = ij_meta.get("spacing")
+                        try:
+                            if spacing_fallback is not None:
+                                z_um = float(spacing_fallback)
+                        except (TypeError, ValueError):
+                            pass
+
+                # ------------------------------------------------------------
+                # Step 3: TiffFile-level imagej_metadata (primary Z path on
+                # 2024.6.18). The dict is parsed from the ImageDescription
+                # text by tifffile when the file is opened.
+                # ------------------------------------------------------------
+                if z_um == 1.0 and tf_ij_spacing is not None:
                     try:
-                        if spacing_fallback is not None:
-                            z_um = float(spacing_fallback)
+                        z_um = float(tf_ij_spacing)
                     except (TypeError, ValueError):
                         pass
 
                 # ------------------------------------------------------------
-                # Step 3: raw ImageDescription byte scan. Works on every
-                # tifffile version since 2018. This is what we needed BEFORE
-                # the ``page.imagej_description`` attribute was removed in
-                # tifffile >= 2024 — and it's the only thing that works on
-                # files written by very old tifffile that have the token in
-                # ImageDescription but no proper ImageJ metadata block.
+                # Step 4: raw ImageDescription byte scan. Works on every
+                # tifffile version since 2018. Last-resort fallback for
+                # files written by very old tifffile that have ``spacing=``
+                # in ImageDescription but no proper ImageJ metadata block.
                 # ------------------------------------------------------------
                 if z_um == 1.0:
                     desc_tag = page.tags.get("ImageDescription")
@@ -175,14 +198,14 @@ def read_tiff(path: Path | str) -> Volume:
                                         pass
 
                 # ------------------------------------------------------------
-                # Step 4: manual XY resolution conversion (last-resort).
+                # Step 5: manual XY resolution conversion.
                 # TIFF stores ``XResolution``/``YResolution`` as a RATIONAL
                 # (numerator, denominator) in the unit given by
                 # ``ResolutionUnit``: 1=none, 2=inch, 3=centimeter. ImageJ
                 # writes these as ``pixels/cm`` by default
                 # (``ResolutionUnit=3``), so a value of (96, 1) means
-                # "96 pixels per cm" → 1/96 cm = 0.0104 cm = 104 µm.
-                # We convert to µm/pixel ourselves instead of trusting the
+                # "96 pixels per cm" → 1/96 cm = 0.0104 cm = 104 µm. We
+                # convert to µm/pixel ourselves instead of trusting the
                 # 1/res arithmetic, which silently produces wrong units
                 # when ``ResolutionUnit`` is anything but "none".
                 # ------------------------------------------------------------
@@ -205,16 +228,6 @@ def read_tiff(path: Path | str) -> Volume:
                                     unit_code = int(unit_tag.value)
                                 except (TypeError, ValueError):
                                     unit_code = 1
-                            # ``x_rational`` is "pixels per <unit>"; we want
-                            # "µm per pixel". Conversion factors per unit:
-                            #   unit_code=1 (none)         → x_rational already in
-                            #                                   pixels per unspecified
-                            #                                   unit, treat as per-cm
-                            #                                   (ImageJ convention)
-                            #   unit_code=2 (inch)         → 1/x_rational inch/px
-                            #                                   = 25400 / x_rational µm/px
-                            #   unit_code=3 (centimeter)   → 1/x_rational cm/px
-                            #                                   = 10000 / x_rational µm/px
                             if unit_code == 2:
                                 x_um_candidate = 25400.0 / x_rational if x_rational else None
                                 y_um_candidate = 25400.0 / y_rational if y_rational else None
