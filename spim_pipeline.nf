@@ -1213,16 +1213,13 @@ with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
 # Canonical voxel sizes from the user's config.json (passed in as
-# GString interpolations of the script-scope doubles metadata_voxel_x/y/z
-# defined near the top of spim_pipeline.nf). These are the raw-input
-# sizes and are used as the authoritative XY (raw input µm/px); the
-# actual input TIFF's ImageJ block is untrustworthy for this dataset
-# (lightsheet acquisition software commonly writes spacing=1.0 and
-# 96-dpi defaults that are not real measurements).
-# NOTE: do NOT write "${metadata_voxel_x}" inside this triple-quoted
-# Groovy GString comment — Groovy will try to interpolate it as a
-# division expression (metadata_voxel_x / y / z) and fail with
-# "No such variable: y". Just spell out the variable names instead.
+# GString interpolations of the script-scope doubles metadata_voxel_x,
+# metadata_voxel_y, metadata_voxel_z defined near the top of
+# spim_pipeline.nf). These are the raw-input sizes and are used as
+# the authoritative XY (raw input µm/px); the actual input TIFF's
+# ImageJ block is untrustworthy for this dataset (lightsheet
+# acquisition software commonly writes spacing=1.0 and 96-dpi
+# defaults that are not real measurements).
 canonical_x_um = float(${metadata_voxel_x})
 canonical_y_um = float(${metadata_voxel_y})
 canonical_z_um = float(${metadata_voxel_z})
@@ -1318,15 +1315,16 @@ with tifffile.TiffFile(out_name) as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: do NOT write "${...}" inside a Python f-string, AND do NOT
-# rely on Groovy GString interpolation of ${t_formatted} inside
-# Python single-quoted strings either (the latter is unreliable when
-# the heredoc is processed by certain Nextflow versions — see repo
-# memory 2026-09-09). Instead, extract the timepoint value as a
-# regular Python integer via a Groovy expression OUTSIDE any
-# Python string, so the literal "${...}" never reaches Python.
-# t_formatted is e.g. "0009"; we parse it to int for the TimePoint
-# tag value (0-padded as a string, but the tag itself is numeric).
+# NOTE: do NOT write 'dollar-brace ... dollar-brace' inside a Python
+# f-string, AND do not rely on Groovy GString interpolation of any
+# Groovy var inside Python single-quoted strings either (the latter
+# is unreliable for some Nextflow versions — see repo memory
+# 2026-09-09). Instead, extract the timepoint value as a regular
+# Python integer via a Groovy expression OUTSIDE any Python string,
+# so the literal dollar-brace syntax never reaches Python.
+# timepoint (Groovy var) is e.g. the integer 9; t_formatted is its
+# 4-digit zero-padded string version ("0009"). We use timepoint here
+# because the TimePoint tag value is numeric.
 _tp_int = ${timepoint}
 extra_tags = (
     f"\nTimePoint={_tp_int}"
@@ -2175,12 +2173,12 @@ with tifffile.TiffFile("t${t_formatted}_segmented.tif") as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: do NOT write "${...}" inside a Python f-string, AND do NOT
-# rely on Groovy GString interpolation of ${t_formatted} inside
-# Python single-quoted strings either (see DOWNSCALE_XY heredoc
-# comment, repo memory 2026-09-09). Use ${timepoint} directly on a
-# plain assignment outside any string so the literal "${...}" never
-# reaches Python.
+# NOTE: do NOT write any dollar-brace Groovy interpolation inside a
+# Python f-string, AND do NOT rely on Groovy GString interpolation of
+# Groovy vars inside Python single-quoted strings either (see
+# DOWNSCALE_XY heredoc comment, repo memory 2026-09-09). Use
+# timepoint directly on a plain assignment outside any string so
+# the literal dollar-brace syntax never reaches Python.
 _tp_int = ${timepoint}
 extra_tags = (
     f"\nTimePoint={_tp_int}"
