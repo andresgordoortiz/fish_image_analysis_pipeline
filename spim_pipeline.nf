@@ -123,7 +123,20 @@ if (!_input_path_file.isDirectory()) {
 }
 
 params.input_dir   = _raw_input_dir
-params.output_dir  = sanitizePath(config.output.directory)
+// Resolve output_dir to an ABSOLUTE path. The user-facing config.json
+// value is typically a relative path like "./results_mk_2508_stephane/"
+// (relative to the Nextflow launch directory). Nextflow's `publishDir`
+// evaluates its argument in the task's work dir context — if the path
+// is relative it gets resolved against the work dir instead of the
+// launch dir, and since the work dir lives inside the read-only
+// container overlay, `publishDir` silently falls back to writing the
+// bare filenames at the launch directory root (we saw this on
+// 2026-09-09: ~190 t####_*.tif files scattered across the repo dir
+// while ./results_mk_2508_stephane/ held only logs and metadata).
+// `file(...).toAbsolutePath()` pins the path to the launch dir so
+// every publishDir writes into the intended results tree regardless
+// of where Nextflow evaluates it.
+params.output_dir  = file(sanitizePath(config.output.directory)).toAbsolutePath().toString()
 params.channel     = config.input?.channel ?: 0  // 0 = auto-detect (required when file has only 1 channel)
 params.input_file  = _raw_input_file
 // Container images are ALWAYS taken from nextflow.config (shared long-term
