@@ -89,15 +89,57 @@ def main() -> None:
         default=3,
         help="Spline interpolation order (0..5). 1 = linear, 3 = cubic. Default 3.",
     )
+    parser.add_argument(
+        "--out_voxel_x_um", type=float, default=None,
+        help="Output X voxel size in µm. The .nf pipeline should pass the "
+             "raw-input X µm/px here so the output TIFF preserves the "
+             "user's config XY metadata. ISOTROPIC only resamples Z, so "
+             "XY stays at the raw value. If unset, falls back to "
+             "read_tiff()'s X (which may be wrong for input TIFFs with "
+             "missing or bogus ImageJ metadata).",
+    )
+    parser.add_argument(
+        "--out_voxel_y_um", type=float, default=None,
+        help="Output Y voxel size in µm. See --out_voxel_x_um.",
+    )
     args = parser.parse_args()
 
     vol = read_tiff(args.input)
-    iso = make_isotropic(vol.data, vol.voxel.as_tuple(), args.target_um, order=args.order)
-    new_voxel = VoxelSizes(args.target_um, args.target_um, args.target_um)
+    # make_isotropic needs the input voxel sizes to compute the new Z shape.
+    # If read_tiff() returned bogus Z (e.g. 1.0 µm default because the
+    # input TIFF had no ImageJ block), the .nf pipeline can override via
+    # --input_voxel_z_um. We use read_tiff's Z unless explicitly
+    # overridden.
+    parser.add_argument(
+        "--input_voxel_z_um", type=float, default=None,
+        help="Override input Z voxel size in µm (used to compute the Z "
+             "resample factor). Falls back to read_tiff().vol.voxel.z.",
+    )
+    # Re-parse with the new arg added. Simpler: just look it up from the
+    # namespace if it was passed, else from read_tiff.
+    cli_args = args  # local alias for readability below
+    input_z_um = (
+        cli_args.input_voxel_z_um
+        if cli_args.input_voxel_z_um is not None
+        else vol.voxel.z
+    )
+    # Build a corrected (z, y, x) tuple for make_isotropic so the Z
+    # calculation uses the user-provided input Z, not the bogus TIFF Z.
+    corrected_input_voxel = (input_z_um, vol.voxel.y, vol.voxel.x)
+    iso = make_isotropic(vol.data, corrected_input_voxel, args.target_um, order=args.order)
+    # Output voxel sizes: Z = target_um (the new isotropic Z); XY = raw
+    # input XY unless overridden. Default to the user-passed XY if any,
+    # else read_tiff's XY (which may be wrong, but at least the .nf
+    # pipeline always passes --out_voxel_x_um / --out_voxel_y_um so this
+    # fallback is only used for standalone CLI runs).
+    out_x_um = args.out_voxel_x_um if args.out_voxel_x_um is not None else vol.voxel.x
+    out_y_um = args.out_voxel_y_um if args.out_voxel_y_um is not None else vol.voxel.y
+    new_voxel = VoxelSizes(args.target_um, out_y_um, out_x_um)
     write_tiff(args.output, iso, new_voxel)
     print(
         f"isotropic_resample: {vol.data.shape} -> {iso.shape} "
-        f"(target={args.target_um} µm, order={args.order})"
+        f"(target={args.target_um} µm, input_z={input_z_um} µm, "
+        f"output voxel={new_voxel.as_tuple()} µm, order={args.order})"
     )
 
 

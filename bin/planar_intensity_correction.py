@@ -93,16 +93,43 @@ def main() -> None:
         default=2.0,
         help="Maximum multiplicative gain (clamps dark-region amplification). Default: 2.0.",
     )
+    parser.add_argument(
+        "--voxel_x_um", type=float, default=None,
+        help="Output X voxel size in µm. If set, overrides what read_tiff() "
+             "returns. The .nf pipeline should always pass this from "
+             "shared_metadata.json so the output TIFF's voxel metadata is "
+             "the user's config values, not whatever the input TIFF's "
+             "ImageJ block happens to say.",
+    )
+    parser.add_argument(
+        "--voxel_y_um", type=float, default=None,
+        help="Output Y voxel size in µm. See --voxel_x_um.",
+    )
+    parser.add_argument(
+        "--voxel_z_um", type=float, default=None,
+        help="Output Z voxel size in µm. See --voxel_x_um.",
+    )
     args = parser.parse_args()
 
     vol = read_tiff(args.input)
     corrected, _field = planar_intensity_correction(
         vol.data, sigma_xy=args.sigma_xy, max_ratio=args.max_ratio
     )
-    write_tiff(args.output, corrected, vol.voxel)
+    # Prefer explicit CLI voxel sizes (the .nf pipeline passes these from
+    # shared_metadata.json), fall back to whatever read_tiff() recovered.
+    # The fallback fires only when the script is run standalone (no .nf
+    # wrapper), in which case the user's --x_um/--y_um/--z_um or the
+    # input TIFF's metadata is the only source available.
+    from _tiff_io import VoxelSizes
+    out_voxel = VoxelSizes(
+        z=args.voxel_z_um if args.voxel_z_um is not None else vol.voxel.z,
+        y=args.voxel_y_um if args.voxel_y_um is not None else vol.voxel.y,
+        x=args.voxel_x_um if args.voxel_x_um is not None else vol.voxel.x,
+    )
+    write_tiff(args.output, corrected, out_voxel)
     print(
         f"planar_intensity_correction: {vol.data.shape} -> {corrected.shape} "
-        f"(sigma_xy={args.sigma_xy}, voxel={vol.voxel.as_tuple()} µm)"
+        f"(sigma_xy={args.sigma_xy}, voxel={out_voxel.as_tuple()} µm)"
     )
 
 

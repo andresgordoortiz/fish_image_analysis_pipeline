@@ -226,6 +226,21 @@ def depth_gain_min    = (config.preprocessing?.depth?.gain_min      != null) ? (
 def depth_gain_max    = (config.preprocessing?.depth?.gain_max      != null) ? (config.preprocessing.depth.gain_max      as Double) : 4.0d
 def iso_target_um     = (config.preprocessing?.isotropic?.target_um != null) ? (config.preprocessing.isotropic.target_um as Double) : 0.374d
 def iso_order         = (config.preprocessing?.isotropic?.order     != null) ? (config.preprocessing.isotropic.order     as Integer) : 3
+
+// Canonical voxel sizes from EXTRACT_METADATA. Declared at script scope so
+// they are visible from inside every process's ``script:`` block (process
+// bodies are interpolated lazily when the process is invoked, but they
+// capture Groovy script-level variables the same way closures do). The
+// actual values are assigned inside ``workflow { }`` right after
+// EXTRACT_METADATA writes shared_metadata.json to disk; until then we
+// keep conservative defaults so a stray reference during parse-time
+// validation doesn't trip up Nextflow's pre-flight checks. See the
+// in-workflow comment for the rationale and the source-of-truth
+// provenance (short version: don't trust the input TIFF's ImageJ block
+// for physical voxel sizes; the user's config.json is canonical).
+double metadata_voxel_x = 0.347d
+double metadata_voxel_y = 0.347d
+double metadata_voxel_z = 2.0d
 if (!skip_preprocessing) {
     log.info "Preprocessing method: MODULAR (planar sigma=${planar_sigma_xy} px, depth=${depth_mode}/w${depth_smooth}, isotropic=${iso_target_um} µm/order=${iso_order})"
 }
@@ -1197,18 +1212,41 @@ from _tiff_io import VoxelSizes, read_tiff, write_tiff
 with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
-# Read the input's TRUE voxel sizes from the TIFF metadata (not from
-# shared_metadata.json — that holds the raw-input values and is wrong
-# for anything downstream of PLANAR/DEPTH/ISOTROPIC, which mutate the
-# voxel geometry). shared_metadata is still used below for non-spatial
-# bookkeeping (WasROICropped, TimePoint, etc.).
+# Canonical voxel sizes from the user's config.json (passed in as
+# ${metadata_voxel_x/y/z} GString interpolations of the script-scope
+# variables defined near the top of spim_pipeline.nf). These are the
+# raw-input sizes and are used as the authoritative XY (raw input
+# µm/px); the actual input TIFF's ImageJ block is untrustworthy for
+# this dataset (lightsheet acquisition software commonly writes
+# spacing=1.0 and 96-dpi defaults that are not real measurements).
+canonical_x_um = float(${metadata_voxel_x})
+canonical_y_um = float(${metadata_voxel_y})
+canonical_z_um = float(${metadata_voxel_z})
+
+# Read the input's data array (NOT its voxel sizes — see below).
 in_vol = read_tiff('${filename}')
-xy_pixel_in = in_vol.voxel.x
-y_pixel_in  = in_vol.voxel.y
-z_pixel_in  = in_vol.voxel.z
 img = in_vol.data
+
+# Trust read_tiff()'s voxel sizes ONLY if they're in a sane physical
+# range. The input's Z is the source of truth for "what Z spacing does
+# this stack actually carry" (which is the post-ISOTROPIC Z if the
+# upstream chain ran, e.g. 0.374 µm). The input's XY is unused here
+# because DOWNSCALE_XY rescales XY by ``scale`` regardless.
+def _is_sane_voxel(v):
+    return v is not None and 0.05 < v < 100.0
+
+input_z_um = in_vol.voxel.z if _is_sane_voxel(in_vol.voxel.z) else canonical_z_um
+
+# XY: always start from the canonical (raw-input) value and divide by
+# the downscale factor. This is correct regardless of what the input
+# TIFF claims, because the downscale factor is the same one applied to
+# the data array above.
+xy_pixel_in = canonical_x_um
+y_pixel_in  = canonical_y_um
+
 print(f"Input  shape: {img.shape}, dtype: {img.dtype}, "
-      f"voxel={xy_pixel_in:.4f}x{y_pixel_in:.4f}x{z_pixel_in:.4f} µm, scale=${scale_factor_py}")
+      f"voxel={xy_pixel_in:.4f}x{y_pixel_in:.4f}x{input_z_um:.4f} µm "
+      f"(XY canonical, Z from input), scale=${scale_factor_py}")
 
 scale = float(${scale_factor_py})
 do_iso = (${reslice_py} == 'True')
@@ -1733,9 +1771,12 @@ process PLANAR_CORRECTION {
     micromamba activate microscopy_env
 
     python3 bin/planar_intensity_correction.py \\
-        --input   "${filename}" \\
-        --output  "t${t_formatted}_planar.tif" \\
-        --sigma_xy ${planar_sigma_xy} \\
+        --input     "${filename}" \\
+        --output    "t${t_formatted}_planar.tif" \\
+        --sigma_xy  ${planar_sigma_xy} \\
+        --voxel_x_um ${metadata_voxel_x} \\
+        --voxel_y_um ${metadata_voxel_y} \\
+        --voxel_z_um ${metadata_voxel_z} \\
         2>&1 | tee "t${t_formatted}_planar.log"
 
     echo "Planar correction complete: t${t_formatted}_planar.tif"
@@ -1795,6 +1836,9 @@ process DEPTH_CORRECTION {
         --smooth_window ${depth_smooth} \\
         --gain_min      ${depth_gain_min} \\
         --gain_max      ${depth_gain_max} \\
+        --voxel_x_um    ${metadata_voxel_x} \\
+        --voxel_y_um    ${metadata_voxel_y} \\
+        --voxel_z_um    ${metadata_voxel_z} \\
         2>&1 | tee "t${t_formatted}_depth.log"
 
     echo "Depth correction complete: t${t_formatted}_depth.tif"
@@ -1846,10 +1890,13 @@ process ISOTROPIC {
     micromamba activate microscopy_env
 
     python3 bin/isotropic_resample.py \\
-        --input     "${filename}" \\
-        --output    "t${t_formatted}_processed.tif" \\
-        --target_um ${iso_target_um} \\
-        --order     ${iso_order} \\
+        --input             "${filename}" \\
+        --output            "t${t_formatted}_processed.tif" \\
+        --target_um         ${iso_target_um} \\
+        --order             ${iso_order} \\
+        --out_voxel_x_um    ${metadata_voxel_x} \\
+        --out_voxel_y_um    ${metadata_voxel_y} \\
+        --input_voxel_z_um  ${metadata_voxel_z} \\
         2>&1 | tee "t${t_formatted}_iso.log"
 
     echo "Isotropic resample complete: t${t_formatted}_processed.tif"
@@ -2016,15 +2063,43 @@ from _tiff_io import VoxelSizes, read_tiff, write_tiff
 with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
-# Read voxel sizes FROM THE INPUT TIFF (which already reflects any
-# ISOTROPIC reslicing and XY downscaling). shared_metadata.json holds
-# the raw-input values and is the wrong source after PLANAR/DEPTH/
-# ISOTROPIC have run — it has XY=0.347, Z=2.0 µm, while the actual
-# input to Cellpose is XY=0.694, Z=0.374 µm after DOWNSCALE_XY.
+# Canonical voxel sizes from the user's config.json (passed in as
+# ${metadata_voxel_x/y/z} GString interpolations of the script-scope
+# variables defined near the top of spim_pipeline.nf). The CELL's input
+# TIFF's ImageJ block is untrustworthy (lightsheet acquisition software
+# commonly writes spacing=1.0 + 96-dpi defaults that are not real
+# measurements), so we use the canonical config values instead.
+#
+# The mask inherits XY from the raw config (0.347 µm/px); DOWNSCALE_XY
+# (if enabled) would have already halved XY to 0.694 µm/px in the input
+# file. To pick up the actual input XY rather than the raw config XY,
+# we read the input's XY via read_tiff and only fall back to the
+# canonical XY when read_tiff returned the bogus 1.0 / 0.0104 defaults.
 in_vol = read_tiff('${filename}')
-input_x_um = in_vol.voxel.x
-input_y_um = in_vol.voxel.y
-input_z_um = in_vol.voxel.z
+canonical_x_um = float(${metadata_voxel_x})
+canonical_y_um = float(${metadata_voxel_y})
+canonical_z_um = float(${metadata_voxel_z})
+
+# Trust read_tiff's XY ONLY if it's in a sane physical range (> 0.05
+# µm/px and < 100 µm/px — wider than any real microscope voxel but
+# narrower than the bogus 104 µm/px default). If it's outside that
+# band, fall back to the canonical config values.
+def _is_sane_voxel(v):
+    return v is not None and 0.05 < v < 100.0
+
+input_x_um = in_vol.voxel.x if _is_sane_voxel(in_vol.voxel.x) else canonical_x_um
+input_y_um = in_vol.voxel.y if _is_sane_voxel(in_vol.voxel.y) else canonical_y_um
+# Z: prefer the canonical config value (the user's true Z spacing) over
+# whatever the input TIFF claims — the input's Z could be the post-
+# ISOTROPIC 0.374 µm or the bogus 1.0 µm default or the raw 2.0 µm;
+# the canonical 2.0 µm (or whatever's in config.json) is what we want
+# for the input voxel sizes the user intended. After ISOTROPIC the
+# effective Z spacing IS 0.374 µm regardless of what the user wrote,
+# so the CELLPOSE_SEGMENT task actually wants the canonical_z_um here.
+# But that's only true if the input is the post-ISOTROPIC stack. For
+# now we trust the canonical value and override with read_tiff if sane.
+input_z_um = in_vol.voxel.z if _is_sane_voxel(in_vol.voxel.z) else canonical_z_um
+
 print(f"Cellpose input voxel size: {input_x_um:.4f} x {input_y_um:.4f} x {input_z_um:.4f} µm  "
       f"(shape={in_vol.data.shape})")
 
@@ -3009,6 +3084,39 @@ workflow {
 
     // Share the same metadata with all timepoints
     shared_metadata = EXTRACT_METADATA.out.metadata
+
+    // ---------------------------------------------------------------------
+    // Canonical voxel sizes from shared_metadata.json. We compute them
+    // here once (the user's config.json overrides OR the auto-detected
+    // values, whichever won in EXTRACT_METADATA) and pass them to every
+    // preprocessing / downscale / segmentation task as GString
+    // interpolations into the bash heredocs (${metadata_voxel_x} etc.).
+    //
+    // Why this matters: lightsheet acquisition software commonly writes
+    // spacing=1.0 / XResolution=96dpi into the raw TIFF's ImageJ block,
+    // and the raw TIFFs in this pipeline carry those bogus values. If a
+    // task re-reads voxel sizes from the input TIFF it inherits the
+    // bogus defaults and writes them straight into its output, silently
+    // corrupting every downstream stack-alignment / Cellpose-anisotropy
+    // / viewer-overlay calculation. Reading from shared_metadata.json
+    // (the user's config) is the single source of truth.
+    //
+    // The script-scope doubles metadata_voxel_x/y/z (declared near the
+    // top of this file alongside planar_sigma_xy etc.) are overwritten
+    // here so the existing ${metadata_voxel_x} interpolations in the
+    // process bodies can capture them via lexical scope.
+    // ---------------------------------------------------------------------
+    try {
+        def _sm = new groovy.json.JsonSlurper().parseText(file(shared_metadata).text)
+        metadata_voxel_x = (_sm.x_resolution_um as Double)
+        metadata_voxel_y = (_sm.y_resolution_um as Double)
+        metadata_voxel_z = (_sm.imagej?.spacing as Double) ?: 1.0d
+    } catch (Exception _e) {
+        log.warn "Could not parse shared_metadata.json for voxel sizes: ${_e.message}; " +
+                 "keeping conservative defaults (0.347, 0.347, 2.0)"
+    }
+    log.info "Canonical voxel sizes (from shared_metadata.json): " +
+             "x=${metadata_voxel_x} µm, y=${metadata_voxel_y} µm, z=${metadata_voxel_z} µm"
 
     // 1b. OPTIONAL: Raw export — produce a downscaled + isotropic version of
     //     the RAW (unprocessed) input for overlaying tracks in ultrack_viewer.

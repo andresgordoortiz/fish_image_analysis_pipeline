@@ -135,6 +135,22 @@ def main() -> None:
         default=4.0,
         help="Maximum multiplicative gain applied to any slice.",
     )
+    parser.add_argument(
+        "--voxel_x_um", type=float, default=None,
+        help="Output X voxel size in µm. If set, overrides what read_tiff() "
+             "returns. The .nf pipeline should always pass this from "
+             "shared_metadata.json so the output TIFF's voxel metadata is "
+             "the user's config values, not whatever the input TIFF's "
+             "ImageJ block happens to say.",
+    )
+    parser.add_argument(
+        "--voxel_y_um", type=float, default=None,
+        help="Output Y voxel size in µm. See --voxel_x_um.",
+    )
+    parser.add_argument(
+        "--voxel_z_um", type=float, default=None,
+        help="Output Z voxel size in µm. See --voxel_x_um.",
+    )
     args = parser.parse_args()
 
     vol = read_tiff(args.input)
@@ -144,10 +160,16 @@ def main() -> None:
         smooth_window=args.smooth_window,
         gain_clip=(args.gain_min, args.gain_max),
     )
-    write_tiff(args.output, corrected, vol.voxel)
+    from _tiff_io import VoxelSizes
+    out_voxel = VoxelSizes(
+        z=args.voxel_z_um if args.voxel_z_um is not None else vol.voxel.z,
+        y=args.voxel_y_um if args.voxel_y_um is not None else vol.voxel.y,
+        x=args.voxel_x_um if args.voxel_x_um is not None else vol.voxel.x,
+    )
+    write_tiff(args.output, corrected, out_voxel)
     print(
         f"depth_intensity_correction: {vol.data.shape} -> {corrected.shape} "
-        f"(mode={args.mode}, smooth={args.smooth_window}, voxel={vol.voxel.as_tuple()} µm)"
+        f"(mode={args.mode}, smooth={args.smooth_window}, voxel={out_voxel.as_tuple()} µm)"
     )
 
 
