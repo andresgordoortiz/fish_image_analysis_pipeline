@@ -1530,6 +1530,10 @@ tifffile.imwrite(
         'spacing': z_pixel_in if not do_iso else x_res,
         'unit': 'um',
         'axes': 'ZYX',
+        # IMPORTANT: declare channels=1 so Fiji's Merge Channels and
+        # Concatenate dialogs treat this as a single-channel Z-stack.
+        # Without this, Fiji refuses to combine with other stacks.
+        'channels': 1,
         # Bypass the XResolution/YResolution ResolutionUnit ambiguity
         # across tifffile versions (2024.6.18 vs 2026.x write the same
         # `resolution=(...)` kwarg differently). bin/_tiff_io.read_tiff()

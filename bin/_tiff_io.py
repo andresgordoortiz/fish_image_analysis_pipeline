@@ -381,6 +381,13 @@ def write_tiff(
             "spacing": z_um,
             "unit": "um",
             "axes": "ZYX",
+            # IMPORTANT: declare channels=1 so Fiji's Merge Channels and
+            # Concatenate dialogs treat this as a single-channel Z-stack.
+            # Without this, Fiji sees no `channels` key and refuses to
+            # combine the file with other stacks ("different bit depth"
+            # misleading error). This is the per-timepoint file shape, so
+            # channels is always 1.
+            "channels": 1,
             "x_resolution_um": x_um,
             "y_resolution_um": y_um,
         },
