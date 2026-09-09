@@ -1987,6 +1987,7 @@ process CELLPOSE_SEGMENT {
     path metadata_json
     val segment_config
     val image_scaling
+    path bin_dir            // entire bin/ so _tiff_io.py is importable
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_segmented.tif"), emit: segmented
@@ -3426,7 +3427,8 @@ workflow {
             segmentation_input,
             shared_metadata,
             config.segmentation,
-            effective_scaling
+            effective_scaling,
+            bin_dir_ch
         )
 
         // 4. OPTIONAL: Downscale segmented labels using Fiji headless (nearest-neighbor)
