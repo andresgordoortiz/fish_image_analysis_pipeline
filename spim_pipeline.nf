@@ -1315,28 +1315,31 @@ with tifffile.TiffFile(out_name) as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: avoid multi-line implicit f-string concatenation (Python
-# requires an open paren OR a backslash continuation to span lines,
-# and we hit a "EOL while scanning string literal" error on the
-# cluster in some Nextflow versions when the implicit concatenation
-# is at the wrong indentation level). Use plain 'newline' escape
-# sequences in single-line strings instead. See repo memory 2026-09-09.
+# NOTE: the literal '\\n' patterns below were tripping the bash heredoc
+# pass-through on Nextflow 25.04.7 + tifffile 2024.6.18 — the backslash
+# got lost somewhere in the pipeline and Python saw an unescaped
+# newline inside the string literal (EOL while scanning string
+# literal). Use os.linesep (== '\n' on Linux) as a function call instead
+# of an escape sequence to sidestep the entire escaping chain. See
+# repo memory 2026-09-09.
+import os as _os
+_NL = _os.linesep
 _tp_int = ${timepoint}
 _tp_str = str(_tp_int)
 _was_roi = str(metadata.get('was_roi_cropped', False)).lower()
 _do_iso_str = str(bool(do_iso)).lower()
 extra_tags = (
-    '\nTimePoint=' + _tp_str +
-    '\nWasROICropped=' + _was_roi +
-    '\nXYDownscaled=True' +
-    '\nScalingFactor=' + str(scale) +
-    '\nIsotropicResliced=' + _do_iso_str
+    _NL + 'TimePoint=' + _tp_str +
+    _NL + 'WasROICropped=' + _was_roi +
+    _NL + 'XYDownscaled=True' +
+    _NL + 'ScalingFactor=' + str(scale) +
+    _NL + 'IsotropicResliced=' + _do_iso_str
 )
 with tifffile.TiffFile(out_name, mode='r+') as tf:
     page = tf.pages[0]
     tag = page.tags.get('ImageDescription')
     if tag is not None:
-        new_desc = (desc or '').rstrip('\n') + extra_tags + '\n'
+        new_desc = (desc or '').rstrip(_NL) + extra_tags + _NL
         tag.overwrite(new_desc.encode('latin-1', errors='replace'))
 
 print('Wrote ' + out_name + '  voxel=' +
@@ -2173,22 +2176,25 @@ with tifffile.TiffFile("t${t_formatted}_segmented.tif") as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: avoid multi-line implicit f-string concatenation (see
-# DOWNSCALE_XY heredoc comment, repo memory 2026-09-09). Use plain
-# 'newline' escape sequences in single-line strings instead.
+# NOTE: use os.linesep instead of '\\n' literal escape sequences — the
+# bash heredoc pass-through on Nextflow 25.04.7 was eating the backslash
+# somewhere and Python saw an unescaped newline inside the string literal
+# (EOL while scanning string literal). See repo memory 2026-09-09.
+import os as _os
+_NL = _os.linesep
 _tp_int = ${timepoint}
 _tp_str = str(_tp_int)
 _was_roi = str(metadata.get('was_roi_cropped', False)).lower()
 extra_tags = (
-    '\nTimePoint=' + _tp_str +
-    '\nLabelImage=True' +
-    '\nWasROICropped=' + _was_roi
+    _NL + 'TimePoint=' + _tp_str +
+    _NL + 'LabelImage=True' +
+    _NL + 'WasROICropped=' + _was_roi
 )
 with tifffile.TiffFile("t${t_formatted}_segmented.tif", mode='r+') as tf:
     page = tf.pages[0]
     tag = page.tags.get('ImageDescription')
     if tag is not None:
-        new_desc = (desc or '').rstrip('\n') + extra_tags + '\n'
+        new_desc = (desc or '').rstrip(_NL) + extra_tags + _NL
         tag.overwrite(new_desc.encode('latin-1', errors='replace'))
 print('Metadata preserved in segmentation mask for timepoint ' + _tp_str)
 PRESERVE_MASK_META
