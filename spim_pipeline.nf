@@ -2181,14 +2181,30 @@ if mask_full.ndim == 2:
     # 2D slice. Expand to (1, Y, X) so the downstream tifffile.imwrite
     # axis declaration matches.
     mask_full = mask_full[np.newaxis, ...]
-sorted_shape = sorted(mask_full.shape)
-z_axis = mask_full.shape.index(sorted_shape[0])
-y_axis = mask_full.shape.index(sorted_shape[1])
-x_axis = mask_full.shape.index(sorted_shape[2])
-if (z_axis, y_axis, x_axis) != (0, 1, 2):
+# Detect axis order by dimension: the smallest axis is Z (typical lightsheet
+# anisotropy), the two larger ones are Y and X. When the two larger axes
+# happen to have the same dimension (common: square XY slices), we cannot
+# distinguish them by shape alone — but for a per-pixel label mask, the
+# axes are interchangeable (X and Y have the same µm/px and no semantic
+# distinction). We assume the existing order is correct unless the smallest
+# axis is NOT at position 0, which is the only case where a transpose is
+# actually needed. This avoids the bug where sorted_shape + list.index
+# returned (0,1,1) for a (231, 1152, 1152) mask because list.index returns
+# the first match (y_axis and x_axis both resolved to 1).
+if mask_full.shape[0] < mask_full.shape[1] and mask_full.shape[0] < mask_full.shape[2]:
+    z_axis, y_axis, x_axis = 0, 1, 2
+elif mask_full.shape[1] < mask_full.shape[0] and mask_full.shape[1] < mask_full.shape[2]:
+    z_axis, y_axis, x_axis = 1, 2, 0
     print(f"Cellpose output is in axis order ({z_axis},{y_axis},{x_axis}); "
           f"reordering to (0,1,2) ZYX")
     mask_full = np.transpose(mask_full, (z_axis, y_axis, x_axis))
+elif mask_full.shape[2] < mask_full.shape[0] and mask_full.shape[2] < mask_full.shape[1]:
+    z_axis, y_axis, x_axis = 2, 0, 1
+    print(f"Cellpose output is in axis order ({z_axis},{y_axis},{x_axis}); "
+          f"reordering to (0,1,2) ZYX")
+    mask_full = np.transpose(mask_full, (z_axis, y_axis, x_axis))
+# else: all axes equal, or no axis is strictly the smallest — assume (0,1,2)
+# and let the downstream tifffile.imwrite axis declaration do its job.
 mask = mask_full
 print(f"Mask shape (ZYX): {mask.shape}")
 
