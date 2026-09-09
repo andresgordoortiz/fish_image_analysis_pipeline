@@ -1213,12 +1213,16 @@ with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
 # Canonical voxel sizes from the user's config.json (passed in as
-# ${metadata_voxel_x/y/z} GString interpolations of the script-scope
-# variables defined near the top of spim_pipeline.nf). These are the
-# raw-input sizes and are used as the authoritative XY (raw input
-# µm/px); the actual input TIFF's ImageJ block is untrustworthy for
-# this dataset (lightsheet acquisition software commonly writes
-# spacing=1.0 and 96-dpi defaults that are not real measurements).
+# GString interpolations of the script-scope doubles metadata_voxel_x/y/z
+# defined near the top of spim_pipeline.nf). These are the raw-input
+# sizes and are used as the authoritative XY (raw input µm/px); the
+# actual input TIFF's ImageJ block is untrustworthy for this dataset
+# (lightsheet acquisition software commonly writes spacing=1.0 and
+# 96-dpi defaults that are not real measurements).
+# NOTE: do NOT write "${metadata_voxel_x}" inside this triple-quoted
+# Groovy GString comment — Groovy will try to interpolate it as a
+# division expression (metadata_voxel_x / y / z) and fail with
+# "No such variable: y". Just spell out the variable names instead.
 canonical_x_um = float(${metadata_voxel_x})
 canonical_y_um = float(${metadata_voxel_y})
 canonical_z_um = float(${metadata_voxel_z})
@@ -2065,11 +2069,15 @@ with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
 # Canonical voxel sizes from the user's config.json (passed in as
-# ${metadata_voxel_x/y/z} GString interpolations of the script-scope
-# variables defined near the top of spim_pipeline.nf). The CELL's input
-# TIFF's ImageJ block is untrustworthy (lightsheet acquisition software
+# GString interpolations of the script-scope doubles metadata_voxel_x/y/z
+# defined near the top of spim_pipeline.nf). The CELL's input TIFF's
+# ImageJ block is untrustworthy (lightsheet acquisition software
 # commonly writes spacing=1.0 + 96-dpi defaults that are not real
 # measurements), so we use the canonical config values instead.
+# NOTE: do NOT write the literal "metadata_voxel_x/y/z" shorthand
+# inside this triple-quoted Groovy GString comment (with or without the
+# dollar-brace) — Groovy parses it as a division expression and fails
+# with "No such variable: y". Just spell out the variable names.
 #
 # The mask inherits XY from the raw config (0.347 µm/px); DOWNSCALE_XY
 # (if enabled) would have already halved XY to 0.694 µm/px in the input
