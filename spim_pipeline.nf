@@ -1183,6 +1183,7 @@ process DOWNSCALE_XY {
     path metadata_json
     val scale_factor
     val reslice_isotropic
+    path bin_dir            // entire bin/ so _tiff_io.py is importable
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_dscale_Channel*.tif"), emit: downscaled
@@ -3312,7 +3313,7 @@ workflow {
             // preserve whatever Z geometry the external files already carry.
             if (run_standalone_downscaling) {
                 log.info "Applying DOWNSCALE_XY (factor=${effective_scaling}) on user-supplied preprocessed files; Z reslice skipped"
-                DOWNSCALE_XY(segmentation_input, shared_metadata, effective_scaling, false)
+                DOWNSCALE_XY(segmentation_input, shared_metadata, effective_scaling, false, bin_dir_ch)
                 segmentation_input = DOWNSCALE_XY.out.downscaled
             }
         } else if (run_standalone_downscaling) {
@@ -3320,7 +3321,7 @@ workflow {
             if (isotropic_reslice) {
                 log.info "  (also isotropic Z reslice, in the same DOWNSCALE_XY task)"
             }
-            DOWNSCALE_XY(processing_input, shared_metadata, effective_scaling, isotropic_reslice)
+            DOWNSCALE_XY(processing_input, shared_metadata, effective_scaling, isotropic_reslice, bin_dir_ch)
             segmentation_input = DOWNSCALE_XY.out.downscaled
         } else if (isotropic_reslice) {
             log.info "Preprocessing SKIPPED — applying lightweight isotropic Z reslicing only (preprocessing.isotropic_reslice=true)"
@@ -3399,7 +3400,8 @@ workflow {
                 DEPTH_CORRECTION.out.corrected,
                 shared_metadata,
                 effective_scaling,
-                true  // do_iso=true: reslice Z to match the new (halved) XY
+                true,  // do_iso=true: reslice Z to match the new (halved) XY
+                bin_dir_ch
             )
             segmentation_input = DOWNSCALE_XY.out.downscaled
         } else {
