@@ -1266,11 +1266,15 @@ y_res = y_pixel_in / scale
 print(f"After XY rescale: {out.shape}  X/Y pixel size -> {x_res:.4f} x {y_res:.4f} µm")
 
 # Optional isotropic Z reslice in the same task, matching RESLICE_ISOTROPIC.
-# When invoked AFTER the PREPROCESS chain, ISOTROPIC has already made Z
-# isotropic on the way in, so this branch is normally skipped (the .nf
-# passes reslice_isotropic=false). It still fires for the standalone-
-# downscale path when the user has preprocessing.enabled=false but
-# downscaling.enabled=true AND preprocessing.isotropic_reslice=true.
+# Since the chain reorder (commit on top of Option B, 2026-09-09) put
+# DOWNSCALE_XY at the END of the full preprocessing chain
+# (PLANAR -> DEPTH -> DOWNSCALE_XY), this branch is what makes the final
+# stack isotropic at the new (halved) XY voxel size — i.e. the standard
+# case when downscaling.enabled=true AND preprocessing.enabled=true. With
+# do_iso=true the output is isotropic at x_res (the new XY µm/px).
+# It also fires for the standalone-downscale path when the user has
+# preprocessing.enabled=false but downscaling.enabled=true AND
+# preprocessing.isotropic_reslice=true.
 if do_iso:
     zoom_z = z_pixel_in / x_res
     if abs(zoom_z - 1.0) < 1e-3:
@@ -1283,13 +1287,10 @@ if do_iso:
     out_z_um = x_res  # isotropic → Z spacing matches the new XY
 else:
     # No Z reslice this pass: keep the input's Z spacing unchanged. This
-    # is the critical fix — previously this script wrote the raw-input
-    # Z spacing (2.0 µm) from shared_metadata.json into the output, even
-    # when the input was the post-ISOTROPIC stack with Z=0.374 µm. That
-    # mismatch silently broke every downstream voxel-size calculation
-    # (CELLPOSE_SEGMENT mask-metadata math, viewer overlay alignment,
-    # tracking coordinates) — see repo memory "DOWNSCALE_XY writes
-    # wrong Z spacing" 2026-09-09.
+    # branch only fires for the
+    # skip_preprocessing-with-user-supplied-preprocessed-files path,
+    # where the external preprocessed files may already carry any Z
+    # geometry and we don't want to overwrite it.
     out_z_um = z_pixel_in
 
 if out.dtype != np.uint16:
@@ -3203,15 +3204,40 @@ workflow {
         }
 
     } else {
-        // ---- Normal preprocessing: PLANAR -> DEPTH -> ISOTROPIC ----
+        // ---- Normal preprocessing ----
         //
-        // Lean modular chain (ported from AIAF-32). Each step is its own
+        // Chain design (commit e0c9d0a, 2026-09-09, "Option B" reorder):
+        //
+        //   PLANAR -> DEPTH -> [DOWNSCALE_XY(do_iso=true) | ISOTROPIC]
+        //
+        // The original chain ran PLANAR -> DEPTH -> ISOTROPIC -> DOWNSCALE_XY,
+        // which produced an anisotropic final stack (e.g. 0.694 x 0.694 x
+        // 0.374 um) and forced every viewer-overlay / tracking math to deal
+        // with three different voxel sizes. Reordered so the chain ENDS at
+        // isotropic voxels:
+        //
+        //   - When downscaling.enabled=true: DOWNSCALE_XY runs LAST with
+        //     do_iso=true, doing both the XY rescale AND the Z-reslice to
+        //     the new (smaller) XY voxel size in a single task. ISOTROPIC
+        //     is NOT needed — DOWNSCALE_XY already produces a fully
+        //     isotropic stack.
+        //   - When downscaling.enabled=false: ISOTROPIC runs LAST, doing
+        //     Z-reslice to the raw XY voxel size. DOWNSCALE_XY is not
+        //     called.
+        //
+        // Both branches produce an isotropic final stack. PLANAR and DEPTH
+        // are lean modular steps (ported from AIAF-32). Each is its own
         // Nextflow process so:
-        //   1. resources can be tuned per step (planar is XY-heavy, depth is Z-light)
-        //   2. any single step can be re-run with `nextflow run -resume` after a
-        //      parameter change
-        //   3. intermediate TIFFs (planar / depth) are published and useful for QA
-        log.info "Preprocessing chain: planar -> depth -> isotropic"
+        //   1. resources can be tuned per step (planar is XY-heavy,
+        //      depth is Z-light)
+        //   2. any single step can be re-run with `nextflow run -resume`
+        //      after a parameter change
+        //   3. intermediate TIFFs (planar / depth) are published and useful
+        //      for QA
+        log.info "Preprocessing chain: planar -> depth -> " +
+                 (downscaling_enabled && effective_scaling < 1.0d
+                     ? "downscale_xy (XY + Z isotropic)"
+                     : "isotropic (Z only)")
         // Stage the entire bin/ directory as a single input so the per-step
         // scripts (and their _tiff_io.py dependency) are all available in
         // the task workdir when the script's first line is `from _tiff_io
@@ -3234,37 +3260,31 @@ workflow {
             bin_dir_ch
         )
 
-        // Step 3: isotropic Z resampling, consumes depth output. The result is
-        // named *_processed.tif to keep the downstream CELLPOSE_SEGMENT input
-        // contract identical to the old monolithic pipeline.
-        ISOTROPIC(
-            DEPTH_CORRECTION.out.corrected,
-            shared_metadata,
-            bin_dir_ch
-        )
-
-        segmentation_input = ISOTROPIC.out.processed
+        // Step 3: final geometric step. DOWNSCALE_XY (when downscaling is
+        // enabled) does both the XY halving AND the isotropic Z reslice in
+        // one task. Otherwise ISOTROPIC does only the Z reslice to the
+        // raw XY voxel size. The chain ENDS at isotropic voxels in both
+        // cases.
+        if (downscaling_enabled && effective_scaling < 1.0d) {
+            log.info "Downscale XY (factor=${effective_scaling}) + isotropic Z reslice to the new XY voxel size"
+            DOWNSCALE_XY(
+                DEPTH_CORRECTION.out.corrected,
+                shared_metadata,
+                effective_scaling,
+                true  // do_iso=true: reslice Z to match the new (halved) XY
+            )
+            segmentation_input = DOWNSCALE_XY.out.downscaled
+        } else {
+            log.info "Isotropic Z reslice to the raw XY voxel size"
+            ISOTROPIC(
+                DEPTH_CORRECTION.out.corrected,
+                shared_metadata,
+                bin_dir_ch
+            )
+            segmentation_input = ISOTROPIC.out.processed
+        }
 
     } // end skip_preprocessing else
-
-    // 2c. OPTIONAL: XY downscale on the preprocessed output, BEFORE segmentation.
-    //
-    // When all options are enabled (downscaling.enabled=true AND preprocessing
-    // enabled) the user expects the full chain to be:
-    //   PLANAR -> DEPTH -> ISOTROPIC -> DOWNSCALE_XY -> CELLPOSE -> ultrack
-    // This matches what DOWNSCALE_XY already does on the standalone-downscale
-    // path. Z stays isotropic (skipped here because ISOTROPIC already enforced
-    // it on the way in).
-    if (!skip_preprocessing && downscaling_enabled && effective_scaling < 1.0d) {
-        log.info "XY downscale ENABLED on preprocessed output — factor=${effective_scaling}"
-        DOWNSCALE_XY(
-            segmentation_input,
-            shared_metadata,
-            effective_scaling,
-            false  // Z already isotropic, no second reslice needed
-        )
-        segmentation_input = DOWNSCALE_XY.out.downscaled
-    }
 
     // 3. Segment each timepoint with Cellpose
     if (!skip_segmentation) {
