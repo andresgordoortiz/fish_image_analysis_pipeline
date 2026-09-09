@@ -1318,17 +1318,16 @@ with tifffile.TiffFile(out_name) as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: do NOT write "${...}" inside a Python f-string. The Groovy
-# GString interpolation runs BEFORE bash sees the heredoc and SHOULD
-# substitute ${timepoint} to its value, but on at least one recent
-# run (2026-09-09, work/7c/8f19e6ab...) the literal "${timepoint}"
-# survived to the rendered .command.sh, then Python's f-string parser
-# saw "{int(${timepoint})}" and crashed with "EOL while scanning
-# string literal". Workaround: extract the timepoint value as a
-# regular Python literal via a Groovy GString assignment outside any
-# f-string. t_formatted is a 4-digit zero-padded string (e.g. "0009"),
-# which we parse to int for the TimePoint tag value.
-_tp_int = int('${t_formatted}')
+# NOTE: do NOT write "${...}" inside a Python f-string, AND do NOT
+# rely on Groovy GString interpolation of ${t_formatted} inside
+# Python single-quoted strings either (the latter is unreliable when
+# the heredoc is processed by certain Nextflow versions — see repo
+# memory 2026-09-09). Instead, extract the timepoint value as a
+# regular Python integer via a Groovy expression OUTSIDE any
+# Python string, so the literal "${...}" never reaches Python.
+# t_formatted is e.g. "0009"; we parse it to int for the TimePoint
+# tag value (0-padded as a string, but the tag itself is numeric).
+_tp_int = ${timepoint}
 extra_tags = (
     f"\nTimePoint={_tp_int}"
     f"\nWasROICropped={str(metadata.get('was_roi_cropped', False)).lower()}"
@@ -2176,11 +2175,13 @@ with tifffile.TiffFile("t${t_formatted}_segmented.tif") as tf:
             if 'ImageDescription' in page.tags else '')
     if isinstance(desc, bytes):
         desc = desc.decode('latin-1', errors='replace')
-# NOTE: do NOT write "${...}" inside a Python f-string. See DOWNSCALE_XY
-# heredoc for the full story (2026-09-09 work/7c/8f19e6ab crash). Same
-# workaround: extract t_formatted as a regular Python string via a
-# Groovy GString assignment outside any f-string.
-_tp_int = int('${t_formatted}')
+# NOTE: do NOT write "${...}" inside a Python f-string, AND do NOT
+# rely on Groovy GString interpolation of ${t_formatted} inside
+# Python single-quoted strings either (see DOWNSCALE_XY heredoc
+# comment, repo memory 2026-09-09). Use ${timepoint} directly on a
+# plain assignment outside any string so the literal "${...}" never
+# reaches Python.
+_tp_int = ${timepoint}
 extra_tags = (
     f"\nTimePoint={_tp_int}"
     f"\nLabelImage=True"
