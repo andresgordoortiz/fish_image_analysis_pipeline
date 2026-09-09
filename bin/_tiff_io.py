@@ -257,8 +257,8 @@ def read_tiff(path: Path | str) -> Volume:
                     f"Z-spacing and XY pixel-size calculations WILL BE WRONG. "
                     f"Re-check that this TIFF was written via "
                     f"tifffile.imwrite(..., imagej=True, bigtiff=True, "
-                    f"metadata={'spacing': ..., 'unit': 'um', "
-                    f"'axes': 'ZYX'}, resolution=(<1/x_um>, <1/y_um>)) or "
+                    f"metadata={{'spacing': ..., 'unit': 'um', "
+                    f"'axes': 'ZYX'}}, resolution=(<1/x_um>, <1/y_um>)) or "
                     f"set --target_um / --x_um / --y_um / --z_um on the CLI "
                     f"for the script that called read_tiff().",
                     flush=True,
