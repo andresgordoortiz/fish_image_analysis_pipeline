@@ -2468,10 +2468,10 @@ PYTHON_CONFIG
         # symlink them into the workdir root. merge_hyperstack.py then sees
         # them via its existing `Path('.').glob(...)` and the merge runs.
         #
-        # `set +e` is toggled around the glob/find calls because `ls $pat`
-        # and `find` can both return non-zero when nothing matches, and
-        # `set -euo pipefail` would otherwise kill the script before we get
-        # a chance to fall back.
+        # `set +e` is toggled around the glob/find calls because both `ls`
+        # (on a non-matching glob) and `find` (on no match) return non-zero,
+        # and `set -euo pipefail` would otherwise kill the script before we
+        # get a chance to fall back.
         # ------------------------------------------------------------------
         set +e
         local n_root
