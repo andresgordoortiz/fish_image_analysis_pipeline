@@ -1526,6 +1526,15 @@ tifffile.imwrite(
     out,
     imagej=True,
     resolution=(1.0/x_res, 1.0/y_res),
+    # IMPORTANT: compression='zlib' so the Compression TIFF tag (259)
+    # is 8 for every per-timepoint TIFF. Without this, tifffile defaults
+    # to no compression (Compression=1), and Fiji's Merge Channels /
+    # Concatenate dialogs refuse to combine files with different
+    # compression codes (misleading 'different bit depth' error).
+    # Verified on 2026-09-09: dscale + segmented had Compression=8
+    # (zlib via bin/_tiff_io.write_tiff default), but raw_iso had
+    # Compression=1 because the heredoc didn't pass compression=.
+    compression='zlib',
     metadata={
         'spacing': z_pixel_in if not do_iso else x_res,
         'unit': 'um',
@@ -2369,12 +2378,15 @@ process MERGE_HYPERSTACKS {
     // Create properly escaped JSON string for Python heredoc
     def config_json_str = groovy.json.JsonOutput.toJson(config)
     def merge_script_name = merge_script.name
-    // MERGE_STAGE_LAYOUT=v2 : stage_n() now accepts loose files at the work-dir
-    // root (the layout produced when Nextflow stages a LIST of files into a
-    // `path` input). Older cached runs used only the named-subdir layout and
-    // silently produced empty merge outputs. Bumping this version in the
-    // script body invalidates the Nextflow cache so -resume re-runs merge.
-    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v6-direct-from-cwd"
+    // MERGE_STAGE_LAYOUT=v7 : merge script now RECURSIVELY searches the workdir
+    // and symlinks any matching per-timepoint files into the workdir root.
+    // This handles BOTH the original loose-root layout AND the named-subdir
+    // layout that Nextflow 23.04+ uses for list-of-file `path` inputs with
+    // many files (e.g. 476 timepoints) — see the 2026-09-10 bug where the
+    // merge silently "skipped" all three data types and tracking never ran.
+    // Bumping this version invalidates the Nextflow cache so -resume re-runs
+    // merge with the corrected logic.
+    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v7-recursive-symlink"
     """
     #!/usr/bin/env bash
     set -euo pipefail
@@ -2434,18 +2446,71 @@ PYTHON_CONFIG
     run_merge() {
         local dt="\$1"
 
-        # Skip if no files for this data type exist in the work-dir.
-        local pattern="t*_\${dt}.tif"
-        if [ "\$dt" = "raw_iso" ]; then pattern="t*_raw_iso_*.tif"; fi
-        # Use ls + grep to count matches; works the same way on every shell
-        # without needing find/glob coordination. Suppress errors via 2>/dev/null.
-        local n=\$(ls \$pattern 2>/dev/null | wc -l | tr -d ' ')
-        if [ "\$n" -eq 0 ]; then
-            echo "⏭  Skipping \${dt} — no files matching '\${pattern}' in work-dir"
-            return 0
+        # Determine the per-timepoint glob for this data type.
+        local pattern
+        if [ "\$dt" = "raw_iso" ]; then
+            pattern="t*_raw_iso_*.tif"
+        else
+            pattern="t*_\${dt}.tif"
         fi
+
+        # ------------------------------------------------------------------
+        # Collect per-timepoint files. Nextflow's staging strategy for a
+        # `path` input that receives a LIST of files depends on the version:
+        #   - Older Nextflow: stages files LOOSE at the workdir root.
+        #   - Nextflow 23.04+ with many files (>= ~100): stages files into a
+        #     NAMED SUBDIR whose name is derived from the input qualifier
+        #     (e.g. processed/, segmented/, raw_iso/). merge_hyperstack.py
+        #     only globs the workdir root, so the merge silently skips.
+        #
+        # Workaround: count files at the root first; if 0, recursively
+        # search the entire workdir for matching per-timepoint files and
+        # symlink them into the workdir root. merge_hyperstack.py then sees
+        # them via its existing `Path('.').glob(...)` and the merge runs.
+        #
+        # `set +e` is toggled around the glob/find calls because `ls $pat`
+        # and `find` can both return non-zero when nothing matches, and
+        # `set -euo pipefail` would otherwise kill the script before we get
+        # a chance to fall back.
+        # ------------------------------------------------------------------
+        set +e
+        local n_root
+        n_root=\$(ls \$pattern 2>/dev/null | wc -l | tr -d ' ')
+        set -e
+        n_root="\${n_root:-0}"
+
+        if [ "\$n_root" -eq 0 ]; then
+            # Fallback: search recursively. `find` returns 1 on no match,
+            # which would trip `set -e`; pipe the result through cat to
+            # normalise the exit code.
+            set +e
+            local found
+            found=\$(find . -name "\$pattern" -type f 2>/dev/null | sort)
+            set -e
+
+            if [ -z "\$found" ]; then
+                echo "⏭  Skipping \${dt} — no files matching '\${pattern}' in work-dir"
+                return 0
+            fi
+
+            local n_found
+            n_found=\$(echo "\$found" | wc -l | tr -d ' ')
+            echo "  [merge:\${dt}] no files at workdir root; symlinking \${n_found} file(s) from subdirs"
+
+            while IFS= read -r src; do
+                [ -z "\$src" ] && continue
+                local bn
+                bn=\$(basename "\$src")
+                if [ ! -e "\$bn" ]; then
+                    ln -sf "\$src" "\$bn"
+                fi
+            done <<< "\$found"
+
+            n_root=\$n_found
+        fi
+
         echo ""
-        echo "--- Merging \${dt} (\${n} files) ---"
+        echo "--- Merging \${dt} (\${n_root} files) ---"
 
         export NXF_TASK_CPUS=\${NXF_TASK_CPUS:-1}
         python3 "${merge_script_name}" "${metadata_json}" config_temp.json "\$dt" \
