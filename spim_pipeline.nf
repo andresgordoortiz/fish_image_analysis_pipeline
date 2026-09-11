@@ -2457,8 +2457,14 @@ PYTHON_CONFIG
         # two naming conventions interchangeably — what matters is that we
         # collect all per-timepoint frames so the 4D_hyperstack_processed.tif
         # is produced and PREP_ULTRACK has something to schedule against.
-        # A space-separated `$patterns` list lets `ls $patterns` and the
-        # fallback `find` loop match either convention in a single pass.
+        # 'patterns' is a bash variable below (space-separated list of globs)
+        # so 'ls' + the fallback 'find' loop match either convention in a
+        # single pass.
+        # IMPORTANT: never write a bare dollar-sign + identifier, or a
+        # backtick-quoted form of any bash variable, in a Groovy triple-
+        # quote heredoc body — Groovy treats them as GString interpolations
+        # and throws a parse error ('No such variable: ...') because those
+        # names only exist inside the bash script, not in the Groovy scope.
         local patterns
         if [ "\$dt" = "raw_iso" ]; then
             patterns="t*_raw_iso_*.tif"
