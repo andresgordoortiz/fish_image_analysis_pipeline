@@ -2378,15 +2378,17 @@ process MERGE_HYPERSTACKS {
     // Create properly escaped JSON string for Python heredoc
     def config_json_str = groovy.json.JsonOutput.toJson(config)
     def merge_script_name = merge_script.name
-    // MERGE_STAGE_LAYOUT=v7 : merge script now RECURSIVELY searches the workdir
-    // and symlinks any matching per-timepoint files into the workdir root.
-    // This handles BOTH the original loose-root layout AND the named-subdir
-    // layout that Nextflow 23.04+ uses for list-of-file `path` inputs with
-    // many files (e.g. 476 timepoints) — see the 2026-09-10 bug where the
-    // merge silently "skipped" all three data types and tracking never ran.
-    // Bumping this version invalidates the Nextflow cache so -resume re-runs
-    // merge with the corrected logic.
-    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v7-recursive-symlink"
+    // MERGE_STAGE_LAYOUT=v8 : merge script + bash wrapper now accept BOTH
+    // 't*_processed.tif' (ISOTROPIC, downscaling.enabled=false) AND
+    // 't*_dscale_Channel*.tif' (DOWNSCALE_XY, downscaling.enabled=true) as
+    // valid 'processed' file patterns. v7 only handled the named-subdir
+    // staging problem but kept the old single-pattern glob, so any run with
+    // downscaling.enabled=true saw 0 'processed' files and the merge
+    // silently skipped — MERGE_HYPERSTACKS completed successfully with an
+    // empty processed_tif emit, and PREP_ULTRACK (which subscribes to that
+    // channel) was never scheduled. Tracking silently never ran. Bumping
+    // the version invalidates the Nextflow cache so -resume re-runs merge.
+    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v8-processed-dscale-pattern"
     """
     #!/usr/bin/env bash
     set -euo pipefail
@@ -2446,55 +2448,84 @@ PYTHON_CONFIG
     run_merge() {
         local dt="\$1"
 
-        # Determine the per-timepoint glob for this data type.
-        local pattern
+        # Determine the per-timepoint glob(s) for this data type.
+        # 'processed' has TWO valid naming conventions depending on the
+        # final preproc step in the chain:
+        #   - t*_processed.tif        (ISOTROPIC, when downscaling.enabled=false)
+        #   - t*_dscale_Channel*.tif  (DOWNSCALE_XY, when downscaling.enabled=true)
+        # Downstream consumers (merge_hyperstack.py, PREP_ULTRACK) treat the
+        # two naming conventions interchangeably — what matters is that we
+        # collect all per-timepoint frames so the 4D_hyperstack_processed.tif
+        # is produced and PREP_ULTRACK has something to schedule against.
+        # A space-separated `$patterns` list lets `ls $patterns` and the
+        # fallback `find` loop match either convention in a single pass.
+        local patterns
         if [ "\$dt" = "raw_iso" ]; then
-            pattern="t*_raw_iso_*.tif"
+            patterns="t*_raw_iso_*.tif"
+        elif [ "\$dt" = "processed" ]; then
+            patterns="t*_processed.tif t*_dscale_Channel*.tif"
         else
-            pattern="t*_\${dt}.tif"
+            patterns="t*_\${dt}.tif"
         fi
 
         # ------------------------------------------------------------------
-        # Collect per-timepoint files. Nextflow's staging strategy for a
-        # `path` input that receives a LIST of files depends on the version:
-        #   - Older Nextflow: stages files LOOSE at the workdir root.
-        #   - Nextflow 23.04+ with many files (>= ~100): stages files into a
-        #     NAMED SUBDIR whose name is derived from the input qualifier
-        #     (e.g. processed/, segmented/, raw_iso/). merge_hyperstack.py
-        #     only globs the workdir root, so the merge silently skips.
+        # Collect per-timepoint files. Two issues to handle:
+        #   1) Nextflow 23.04+ stages large lists of files into NAMED
+        #      SUBDIRS (e.g. processed/, segmented/, raw_iso/) instead of
+        #      loose at the workdir root. merge_hyperstack.py only globs
+        #      the root, so without a recursive symlink the merge skips.
+        #   2) 'processed' accepts two patterns (see above); we must count
+        #      files matching ANY of them.
         #
-        # Workaround: count files at the root first; if 0, recursively
-        # search the entire workdir for matching per-timepoint files and
-        # symlink them into the workdir root. merge_hyperstack.py then sees
-        # them via its existing `Path('.').glob(...)` and the merge runs.
+        # Strategy: count files at the workdir root across ALL patterns
+        # for this data type. If 0, recursively search the workdir for
+        # any matching pattern and symlink matches into the root.
         #
         # `set +e` is toggled around the glob/find calls because both `ls`
         # (on a non-matching glob) and `find` (on no match) return non-zero,
-        # and `set -euo pipefail` would otherwise kill the script before we
-        # get a chance to fall back.
+        # and `set -euo pipefail` would otherwise kill the script before
+        # we get a chance to fall back.
         # ------------------------------------------------------------------
         set +e
-        local n_root
-        n_root=\$(ls \$pattern 2>/dev/null | wc -l | tr -d ' ')
+        local n_root=0
+        local pat
+        for pat in \$patterns; do
+            local matches
+            matches=\$(ls "\$pat" 2>/dev/null)
+            if [ -n "\$matches" ]; then
+                local n
+                n=\$(printf '%s\n' "\$matches" | wc -l | tr -d ' ')
+                n_root=\$((n_root + n))
+            fi
+        done
         set -e
         n_root="\${n_root:-0}"
 
         if [ "\$n_root" -eq 0 ]; then
-            # Fallback: search recursively. `find` returns 1 on no match,
-            # which would trip `set -e`; pipe the result through cat to
-            # normalise the exit code.
+            # Fallback: search recursively across all patterns.
             set +e
-            local found
-            found=\$(find . -name "\$pattern" -type f 2>/dev/null | sort)
+            local found=""
+            for pat in \$patterns; do
+                local pat_matches
+                pat_matches=\$(find . -name "\$pat" -type f 2>/dev/null | sort)
+                if [ -n "\$pat_matches" ]; then
+                    if [ -z "\$found" ]; then
+                        found="\$pat_matches"
+                    else
+                        found="\$found
+\$pat_matches"
+                    fi
+                fi
+            done
             set -e
 
             if [ -z "\$found" ]; then
-                echo "⏭  Skipping \${dt} — no files matching '\${pattern}' in work-dir"
+                echo "⏭  Skipping \${dt} — no files matching any of: \${patterns}"
                 return 0
             fi
 
             local n_found
-            n_found=\$(echo "\$found" | wc -l | tr -d ' ')
+            n_found=\$(printf '%s' "\$found" | grep -c .)
             echo "  [merge:\${dt}] no files at workdir root; symlinking \${n_found} file(s) from subdirs"
 
             while IFS= read -r src; do
@@ -2504,7 +2535,7 @@ PYTHON_CONFIG
                 if [ ! -e "\$bn" ]; then
                     ln -sf "\$src" "\$bn"
                 fi
-            done <<< "\$found"
+            done <<< "\$(printf '%s' "\$found")"
 
             n_root=\$n_found
         fi

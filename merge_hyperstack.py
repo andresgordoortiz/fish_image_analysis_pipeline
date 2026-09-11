@@ -311,18 +311,30 @@ def main():
     out_cfg = config.get("output", {})
     output_formats = parse_output_formats(out_cfg)
 
-    # Find files based on data type
+    # Find files based on data type. The 'processed' data type accepts BOTH
+    # naming conventions because the final preproc step depends on whether
+    # downscaling is enabled:
+    #   - downscaling.enabled=false  -> ISOTROPIC emits t####_processed.tif
+    #   - downscaling.enabled=true   -> DOWNSCALE_XY emits t####_dscale_Channel*.tif
+    # The downstream hyperstack (4D_hyperstack_processed.tif) and tracking
+    # prep (PREP_ULTRACK) consume either form interchangeably; what matters
+    # is that we collect all per-timepoint frames. Without this dual-pattern
+    # handling, runs with downscaling.enabled=true see 0 'processed' files
+    # here AND in the MERGE_HYPERSTACKS bash wrapper, so the merge silently
+    # skips and PREP_ULTRACK never schedules (regression introduced when the
+    # planar->depth->[isotropic|downscale_xy] chain was added; tracked in
+    # the onComplete warning block of spim_pipeline.nf).
     if data_type == "processed":
-        file_pattern = "t*_processed.tif"
+        file_patterns = ["t*_processed.tif", "t*_dscale_Channel*.tif"]
         label = "processed"
     elif data_type == "segmented":
-        file_pattern = "t*_segmented.tif"
+        file_patterns = ["t*_segmented.tif"]
         label = "segmented"
     elif data_type == "raw_iso":
         # Raw, downscaled, isotropic input exported by EXPORT_RAW_ISOTROPIC.
         # Same geometric ops as the preprocessed chain (so the voxel sizes
         # are computed identically below) but on the UNCORRECTED signal.
-        file_pattern = "t*_raw_iso_Channel*.tif"
+        file_patterns = ["t*_raw_iso_Channel*.tif"]
         label = "raw_iso"
     else:
         sys.exit(
@@ -330,7 +342,16 @@ def main():
             f"Use 'processed', 'segmented', or 'raw_iso'."
         )
 
-    seg_files = sorted(Path(".").glob(file_pattern))
+    # Collect files matching ANY of the patterns (de-duplicated, sorted by
+    # filename so timepoint order is deterministic).
+    seen = set()
+    seg_files = []
+    for pat in file_patterns:
+        for f in Path(".").glob(pat):
+            if f.name not in seen:
+                seen.add(f.name)
+                seg_files.append(f)
+    seg_files = sorted(seg_files, key=lambda f: f.name)
     if not seg_files:
         # Fallback: try any .tif/.tiff file (e.g. raw input when preprocessing is skipped)
         fallback = sorted(
