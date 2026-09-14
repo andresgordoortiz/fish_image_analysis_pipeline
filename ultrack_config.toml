@@ -3,9 +3,15 @@ n_workers = 16
 working_dir = "./ultrack_work"
 database = "sqlite"
 
+# Voxel size is isotropic after downscaling + preprocessing:
+#   raw XY = 0.347 µm → downscaled by 0.5 → 0.694 µm/px
+#   raw Z  = 2.0 µm  → resliced to target_um = 0.374 µm/px
+# So a 6 µm-diameter nucleus occupies ~9 px in XY (area ≈ 64 px²)
+# and ~16 px in Z. Linking distance is in *isotropic pixels*.
+
 [segmentation]
-min_area = 2
-max_area = 10000
+min_area = 10             # was 2 — 10 px² drops noise speckles but keeps small fragments
+max_area = 800            # was 10000 — single nucleus ≈ 64 px²; cap merged blobs at ~12× a nucleus
 n_workers = 16
 min_frontier = 0.0
 threshold = 0.0
@@ -14,9 +20,9 @@ ws_hierarchy = "area"
 anisotropy_penalization = 0.0
 
 [linking]
-max_distance = 10.0
+max_distance = 4.0        # was 10.0 — nucleus radius ≈ 4.5 px; 4 px covers 2 frames of drift
 n_workers = 16
-max_neighbors = 5
+max_neighbors = 4         # was 5 — tighter distance ⇒ fewer candidates needed
 distance_weight = 0.0
 z_score_threshold = 5.0
 
@@ -26,8 +32,8 @@ disappear_weight = -0.001
 division_weight = -0.001
 n_threads = -1
 overlap_size = 1
-solution_gap = 0.001
-time_limit = 36000
+solution_gap = 0.05        # was 0.001 — 5 % MIP gap; tracking doesn't need 0.1 %
+time_limit = 21600         # was 36000 (10 h) — cap to 6 h so it stays inside the SLURM time limit
 method = 0
 link_function = "power"
 power = 4

@@ -293,7 +293,7 @@ if (!config.tracking.containsKey('prep')) {
 if (!config.tracking.prep.containsKey('fg_sigma'))        { config.tracking.prep.fg_sigma = 5.0 }
 if (!config.tracking.prep.containsKey('raw_sigma'))       { config.tracking.prep.raw_sigma = 1.0 }
 if (!config.tracking.prep.containsKey('boundary_width'))  { config.tracking.prep.boundary_width = 1 }
-if (!config.tracking.prep.containsKey('min_area'))        { config.tracking.prep.min_area = 10 }
+if (!config.tracking.prep.containsKey('min_area'))        { config.tracking.prep.min_area = 10 }  # default 10 — matches ultrack_config.toml [segmentation].min_area at the isotropic, XY-downscaled voxel size
 def skip_tracking = config.tracking?.enabled != true
 
 // Debug-preprocessing (per-stage nuclei tracking) was tied to the
