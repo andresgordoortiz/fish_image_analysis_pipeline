@@ -387,8 +387,27 @@ def main():
         # Raw export uses its own XY scale factor (raw_export.factor) — NOT the
         # preprocessing image_scaling. Falls back to downscaling.factor / 1.0.
         scaling = config.get("raw_export", {}).get("factor", 1.0)
+    elif skip_preproc:
+        scaling = 1.0
     else:
-        scaling = 1.0 if skip_preproc else config.get("preprocessing", {}).get("image_scaling", 1.0)
+        # Canonical knob is the top-level downscaling.factor (added 2026-08-13,
+        # see repo memory spim_pipeline_nf_notes.md). preprocessing.image_scaling
+        # is kept as a legacy fallback for users who still have it in their
+        # config and rely on the OLD monolithic pipeline where image_scaling
+        # was the only knob. The two values MUST be consistent (downscaling.
+        # factor is what the modular chain actually applies to the data;
+        # image_scaling was meant to mirror it but the adapter that would
+        # have populated it in config.preprocessing was never wired up in
+        # spim_pipeline.nf, so the script silently fell back to 1.0 and the
+        # metadata JSON lied about the post-downscale voxel size — see the
+        # 2026-09-15 bug: processed/segmented metadata reported x=y=0.347 µm
+        # while the actual TIFF content was at x=y=0.694 µm).
+        scaling = (
+            config.get("downscaling", {}).get("factor")
+            or config.get("preprocessing", {}).get("image_scaling", 1.0)
+        )
+        if scaling is None or scaling <= 0:
+            scaling = 1.0
 
     # Metadata stores the ORIGINAL (pre-processing) resolution in microns
     vox_x = meta.get("x_resolution_um", 1.0) / scaling
