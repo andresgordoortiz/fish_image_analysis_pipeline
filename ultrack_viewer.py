@@ -2406,10 +2406,6 @@ class CrossSectionViewer:
         )
         _set_enabled(getattr(self, "display_pct_slider", None), has_spots)
         _set_enabled(getattr(self, "point_size_slider", None), has_spots)
-        # Export filtered tracks is inherently spots-only.
-        _set_enabled(
-            getattr(self, "btn_export_filtered", None), has_tracks
-        )
         # All colour modes are per-spot — disable when no spots.
         for btn in getattr(self, "_color_buttons", []) or []:
             _set_enabled(btn, has_spots)
@@ -6573,14 +6569,21 @@ class EmbryoViewer:
         btn_color_tracked.changed.connect(lambda: self._recolor("tracked"))
 
         # ── Export & Video ──
+        # Single self-contained export that captures orientation,
+        # sphere/depth, ROI, ingression, colour mode **and** the
+        # current track-filter thresholds as non-destructive flags
+        # (``FILTERED_OUT`` / ``FILTER_REASON``) on every spot row.
         btn_export = PushButton(text="Export Enriched CSV")
+        btn_export.tooltip = (
+            "Write a self-contained bundle to analysis_output/:\n"
+            "  • oriented_spots.csv — every spot with depth, ingression,\n"
+            "    ROI, colour mode and FILTERED_OUT / FILTER_REASON flags\n"
+            "  • oriented_tracks.csv — same, tracked nuclei only\n"
+            "  • track_summary.csv — per-track metrics + filter verdict\n"
+            "  • sphere/roi/ingression/landmarks CSVs\n"
+            "  • analysis_metadata.json — all thresholds & counts"
+        )
         btn_export.changed.connect(self._export)
-        # Export tracks/spots tagged with the current min-length +
-        # max-speed filter state.  Dropped rows stay in the file but
-        # get a ``FILTERED_OUT`` flag + ``FILTER_REASON`` so downstream
-        # tools can audit the threshold choice.
-        btn_export_filtered = PushButton(text="Export Filtered Tracks (flagged)")
-        btn_export_filtered.changed.connect(self._export_filtered)
         self.lbl_export = Label(value="")
         self.render_scale_slider = FloatSlider(
             value=2.0, min=1.0, max=4.0, step=0.5,
@@ -6695,7 +6698,6 @@ class EmbryoViewer:
                 btn_color_tracked,
                 Label(value="── Export & Video ──"),
                 btn_export,
-                btn_export_filtered,
                 self.render_scale_slider,
                 self.duration_slider,
                 btn_record_video,
@@ -8556,6 +8558,16 @@ class EmbryoViewer:
     def _export(self):
         """Export comprehensive analysis output for downstream R pipeline.
 
+        Produces a single self-contained bundle under ``analysis_output/``
+        that captures **everything** the user has done in this session:
+
+          * Orientation / sphere / depth / ingression / ROI / colour mode
+          * Current track-filter thresholds (``min_track_length`` and
+            ``max_speed``) applied as **non-destructive flags**
+            (``FILTERED_OUT``, ``FILTER_REASON``) on every spot and on
+            the per-track summary — so downstream tools can audit the
+            thresholds without losing rows.
+
         Runs the heavy CSV writes in a background thread to avoid freezing
         the UI on large datasets (millions of rows).
         """
@@ -8591,6 +8603,9 @@ class EmbryoViewer:
         display_pct = self._display_pct
         max_tracks = self._max_tracks
         color_mode = self._current_color_mode
+        # Track-filter thresholds — also non-destructive flags.
+        min_length = int(self._min_track_length)
+        max_speed = float(self._max_speed)
 
         # Snapshot gastrulation landmarks (margin + ingression)
         margin_lm = self.margin_landmark.copy() if self.margin_landmark is not None else None
@@ -8600,11 +8615,153 @@ class EmbryoViewer:
         self._pending_export_err = None
         self._pending_export_files = None
 
-        def _bg():
+        # Bind every closure variable as a default arg of ``_bg`` so the
+        # worker thread owns local copies and can safely rebind them
+        # without tripping Python's
+        # ``UnboundLocalError: local variable 'spots_df' referenced
+        # before assignment`` rule.
+        def _bg(
+            spots_df=spots_df,
+            sphere=sphere,
+            roi=roi,
+            roi_restricted=roi_restricted,
+            oriented=oriented,
+            track_frame_min=track_frame_min,
+            track_frame_max=track_frame_max,
+            display_pct=display_pct,
+            max_tracks=max_tracks,
+            color_mode=color_mode,
+            min_length=min_length,
+            max_speed=max_speed,
+            thresh_val=thresh_val,
+            min_f_val=min_f_val,
+            inward_frac_val=inward_frac_val,
+            margin_lm=margin_lm,
+            ingression_lm=ingression_lm,
+        ):
             try:
                 files_written = []
 
-                # 1. Enriched spots CSV (all computed columns)
+                # 0. Compute FILTERED_OUT / FILTER_REASON for every spot
+                #    from the current track-filter thresholds.  This is
+                #    the merged equivalent of the old
+                #    ``_export_filtered`` action — non-destructive: rows
+                #    stay in the file, dropped tracks are just flagged.
+                filter_meta: dict = {"enabled": False}
+                if "TRACK_ID" in spots_df.columns:
+                    df_tr = spots_df.dropna(subset=["TRACK_ID"]).copy()
+                    if not df_tr.empty:
+                        df_sorted = df_tr.sort_values(
+                            ["TRACK_ID", "FRAME"]
+                        ).reset_index(drop=True)
+                        track_len = df_sorted.groupby("TRACK_ID")[
+                            "FRAME"
+                        ].transform("count")
+
+                        # Per-track max speed from raw coordinates
+                        sp = self._compute_track_speed(df_sorted)
+                        track_max_speed = (
+                            pd.Series(sp)
+                            .groupby(
+                                df_sorted["TRACK_ID"].values, sort=False
+                            )
+                            .max()
+                        )
+
+                        length_pass = (track_len >= min_length).values
+                        if np.isfinite(max_speed):
+                            speed_pass = (
+                                df_sorted["TRACK_ID"]
+                                .map(track_max_speed)
+                                .le(max_speed)
+                                .values
+                            )
+                        else:
+                            speed_pass = np.ones(len(df_sorted), dtype=bool)
+
+                        keep_mask = length_pass & speed_pass
+                        reason = np.empty(len(df_sorted), dtype=object)
+                        reason[:] = ""
+                        fail_len = ~length_pass & ~speed_pass
+                        fail_spd = length_pass & ~speed_pass
+                        fail_both = ~length_pass & ~speed_pass
+                        reason[fail_len] = "min_length"
+                        reason[fail_spd] = "max_speed"
+                        reason[fail_both] = "both"
+
+                        # Attach flags back to the tracked slice, then
+                        # merge into the full spots frame (untracked
+                        # rows get FILTERED_OUT=False / "").
+                        df_sorted["FILTERED_OUT"] = ~keep_mask
+                        df_sorted["FILTER_REASON"] = reason
+                        # Preserve row alignment by joining on the
+                        # tracked-row index.
+                        spots_df["_orig_idx"] = np.arange(len(spots_df))
+                        # Map each spots row back to its tracked-slice
+                        # index (NaN for untracked rows).
+                        tr_orig_idx = df_tr.sort_values(
+                            ["TRACK_ID", "FRAME"]
+                        ).index.values
+                        spots_df["_tr_idx"] = -1
+                        spots_df.loc[
+                            spots_df.index.intersection(tr_orig_idx),
+                            "_tr_idx",
+                        ] = np.arange(len(tr_orig_idx))
+                        tracked_idx_mask = spots_df["_tr_idx"] >= 0
+                        spots_df.loc[tracked_idx_mask, "FILTERED_OUT"] = (
+                            df_sorted["FILTERED_OUT"].values[
+                                spots_df.loc[tracked_idx_mask, "_tr_idx"].values
+                            ]
+                        )
+                        spots_df.loc[tracked_idx_mask, "FILTER_REASON"] = (
+                            df_sorted["FILTER_REASON"].values[
+                                spots_df.loc[tracked_idx_mask, "_tr_idx"].values
+                            ]
+                        )
+                        spots_df["FILTERED_OUT"] = (
+                            spots_df["FILTERED_OUT"].fillna(False).astype(bool)
+                        )
+                        spots_df["FILTER_REASON"] = spots_df["FILTER_REASON"].fillna(
+                            ""
+                        )
+                        spots_df = spots_df.drop(
+                            columns=["_orig_idx", "_tr_idx"]
+                        )
+
+                        # Put the new flags at the front for easy grepping
+                        front = [
+                            "FILTERED_OUT",
+                            "FILTER_REASON",
+                            "TRACK_ID",
+                            "FRAME",
+                        ]
+                        cols = front + [
+                            c for c in spots_df.columns if c not in front
+                        ]
+                        spots_df = spots_df[cols]
+
+                        filter_meta = {
+                            "enabled": True,
+                            "min_track_length": int(min_length),
+                            "max_speed_um_per_frame": (
+                                float(max_speed)
+                                if np.isfinite(max_speed)
+                                else None
+                            ),
+                            "n_spots_total": int(len(df_sorted)),
+                            "n_spots_kept": int(keep_mask.sum()),
+                            "n_spots_filtered": int((~keep_mask).sum()),
+                            "n_tracks_total": int(
+                                df_sorted["TRACK_ID"].nunique()
+                            ),
+                            "n_tracks_filtered": int(
+                                df_sorted.loc[
+                                    df_sorted["FILTERED_OUT"], "TRACK_ID"
+                                ].nunique()
+                            ),
+                        }
+
+                # 1. Enriched spots CSV (all computed columns + flags)
                 spots_df.to_csv(out_dir / "oriented_spots.csv", index=False)
                 files_written.append("oriented_spots.csv")
 
@@ -8722,7 +8879,9 @@ class EmbryoViewer:
                     lm_df.to_csv(out_dir / "gastrulation_landmarks.csv", index=False)
                     files_written.append("gastrulation_landmarks.csv")
 
-                # 6. Per-track summary CSV
+                # 6. Per-track summary CSV — now also carries the
+                #    filter verdict + reason so users can see at a
+                #    glance how many tracks dropped on each criterion.
                 if "TRACK_ID" in spots_df.columns:
                     track_cols = [
                         "TRACK_MEDIAN_RADIAL_VEL",
@@ -8736,27 +8895,34 @@ class EmbryoViewer:
                         "INGRESSION_SCORE",
                     ]
                     avail_cols = [c for c in track_cols if c in spots_df.columns]
+                    grp = spots_df.dropna(subset=["TRACK_ID"]).groupby("TRACK_ID")
+                    track_summary = grp.agg(
+                        n_spots=("FRAME", "count"),
+                        frame_start=("FRAME", "min"),
+                        frame_end=("FRAME", "max"),
+                        mean_x=("POSITION_X", "mean"),
+                        mean_y=("POSITION_Y", "mean"),
+                        mean_z=("POSITION_Z", "mean"),
+                    )
                     if avail_cols:
-                        grp = spots_df.dropna(subset=["TRACK_ID"]).groupby("TRACK_ID")
-                        track_summary = grp.agg(
-                            n_spots=("FRAME", "count"),
-                            frame_start=("FRAME", "min"),
-                            frame_end=("FRAME", "max"),
-                            mean_x=("POSITION_X", "mean"),
-                            mean_y=("POSITION_Y", "mean"),
-                            mean_z=("POSITION_Z", "mean"),
-                        )
                         first_per_track = grp[avail_cols].first()
                         track_summary = track_summary.join(first_per_track)
-                        for sc in ["SPHERICAL_DEPTH", "THETA_DEG", "PHI_DEG"]:
-                            if sc in spots_df.columns:
-                                track_summary[f"mean_{sc}"] = grp[sc].mean()
-                        if "IN_ROI" in spots_df.columns:
-                            track_summary["IN_ROI"] = grp["IN_ROI"].any()
-                        track_summary.to_csv(out_dir / "track_summary.csv")
-                        files_written.append("track_summary.csv")
+                    for sc in ["SPHERICAL_DEPTH", "THETA_DEG", "PHI_DEG"]:
+                        if sc in spots_df.columns:
+                            track_summary[f"mean_{sc}"] = grp[sc].mean()
+                    if "IN_ROI" in spots_df.columns:
+                        track_summary["IN_ROI"] = grp["IN_ROI"].any()
+                    if filter_meta.get("enabled"):
+                        track_summary["FILTERED_OUT"] = grp["FILTERED_OUT"].any()
+                        track_summary["FILTER_REASON"] = grp[
+                            "FILTER_REASON"
+                        ].first()
+                    track_summary.to_csv(out_dir / "track_summary.csv")
+                    files_written.append("track_summary.csv")
 
-                # 7. Analysis metadata (JSON)
+                # 7. Analysis metadata (JSON) — captures orientation,
+                #    sphere, ROI, colour mode, time window **and** the
+                #    current track-filter thresholds + counts.
                 meta = {
                     "oriented": oriented,
                     "sphere_fitted": sphere is not None,
@@ -8789,6 +8955,8 @@ class EmbryoViewer:
                     meta["sphere_radius"] = float(sphere["radius"])
                 if roi is not None:
                     meta["roi_bounds"] = {k: float(v) for k, v in roi.items()}
+                if filter_meta.get("enabled"):
+                    meta["track_filter"] = filter_meta
                 with open(out_dir / "analysis_metadata.json", "w") as f:
                     json.dump(meta, f, indent=2, default=str)
                 files_written.append("analysis_metadata.json")
@@ -8809,220 +8977,26 @@ class EmbryoViewer:
                 self.viewer.status = f"Export failed: {self._pending_export_err}"
                 return
             files = self._pending_export_files or []
-            self.lbl_export.value = f"Exported {len(files)} files to {out_dir}/"
-            self.viewer.status = f"Exported: {', '.join(files)}"
-
-        QTimer.singleShot(500, _poll)
-
-    def _export_filtered(self):
-        """Export a filtered CSV that FLAGS dropped tracks instead of removing them.
-
-        Produces three CSVs (parallel to the regular export) under
-        ``analysis_output/``:
-
-          * ``oriented_filtered_spots.csv``  — every spot with two new
-            columns: ``FILTERED_OUT`` (bool) and ``FILTER_REASON``
-            ("" | "min_length" | "max_speed" | "both").
-          * ``oriented_filtered_tracks.csv`` — same shape, but only the
-            rows belonging to filtered-out tracks.  Dropped tracks are
-            included verbatim so downstream tooling can audit them.
-          * ``oriented_filtered_summary.csv`` — per-track summary that
-            always includes ``FILTERED_OUT`` + ``FILTER_REASON`` so
-            users can see at a glance how many tracks dropped on each
-            criterion.
-
-        Runs in a background thread so the GUI stays responsive.
-        """
-        from qtpy.QtCore import QTimer
-
-        if self.spots is None:
-            self.viewer.status = "Load spots first!"
-            return
-
-        # Snapshot filter state and data on the GUI thread so the
-        # background thread can run free.
-        out_dir = Path("analysis_output")
-        out_dir.mkdir(exist_ok=True)
-
-        self.lbl_export.value = "Exporting filtered CSV (please wait)..."
-        self.viewer.status = "Exporting filtered tracks in background..."
-
-        spots_df = self.spots.copy()
-        min_length = int(self._min_track_length)
-        max_speed = float(self._max_speed)
-        # Per-track stats already cached by the GUI — compute fresh in
-        # the worker thread to keep the snapshot small.  We deliberately
-        # do NOT capture self._per_track_stats here because the worker
-        # may run on a different pandas/sort version.
-
-        self._pending_filtered_err = None
-        self._pending_filtered_files = None
-
-        def _bg():
-            try:
-                files_written = []
-
-                # 1. Per-track length + per-track max speed
-                if "TRACK_ID" not in spots_df.columns:
-                    raise ValueError(
-                        "No TRACK_ID column — cannot apply track filters."
-                    )
-
-                df = spots_df.dropna(subset=["TRACK_ID"]).copy()
-                if df.empty:
-                    raise ValueError("No tracked rows to filter.")
-
-                df_sorted = df.sort_values(["TRACK_ID", "FRAME"]).reset_index(
-                    drop=True
-                )
-                track_len = (
-                    df_sorted.groupby("TRACK_ID")["FRAME"].transform("count")
-                )
-
-                sp = self._compute_track_speed(df_sorted)
-                track_max_speed = (
-                    pd.Series(sp)
-                    .groupby(df_sorted["TRACK_ID"].values, sort=False)
-                    .max()
-                )
-                track_max_speed = track_max_speed.reindex(
-                    df_sorted["TRACK_ID"].unique()
-                )
-
-                # 2. Per-track filter verdict + reason
-                unique_tids = df_sorted["TRACK_ID"].unique()
-                length_pass = track_len >= min_length
-                if np.isfinite(max_speed):
-                    speed_pass = (
-                        df_sorted["TRACK_ID"].map(track_max_speed)
-                        .le(max_speed)
-                        .values
-                    )
-                else:
-                    speed_pass = np.ones(len(df_sorted), dtype=bool)
-
-                keep_mask = length_pass & speed_pass
-                # Per-row reason (only for dropped rows; kept rows = "")
-                reason = np.empty(len(df_sorted), dtype=object)
-                reason[:] = ""
-                fail_len = ~length_pass.values & ~speed_pass
-                fail_spd = length_pass.values & ~speed_pass
-                fail_both = ~length_pass.values & ~speed_pass
-                reason[fail_len] = "min_length"
-                reason[fail_spd] = "max_speed"
-                reason[fail_both] = "both"
-
-                df_sorted = df_sorted.copy()
-                df_sorted["FILTERED_OUT"] = ~keep_mask.values
-                df_sorted["FILTER_REASON"] = reason
-                # Put the new flags at the front for easy grepping
-                front = ["FILTERED_OUT", "FILTER_REASON", "TRACK_ID", "FRAME"]
-                cols = front + [c for c in df_sorted.columns if c not in front]
-                df_sorted = df_sorted[cols]
-
-                # 3. Full annotated spots CSV (every spot, flagged)
-                df_sorted.to_csv(
-                    out_dir / "oriented_filtered_spots.csv", index=False
-                )
-                files_written.append("oriented_filtered_spots.csv")
-
-                # 4. Filtered-out-only tracks (kept verbatim for audit)
-                df_sorted[df_sorted["FILTERED_OUT"]].to_csv(
-                    out_dir / "oriented_filtered_tracks.csv", index=False
-                )
-                files_written.append("oriented_filtered_tracks.csv")
-
-                # 5. Per-track summary with verdict + reason
-                grp = df_sorted.groupby("TRACK_ID")
-                track_summary = grp.agg(
-                    n_spots=("FRAME", "count"),
-                    frame_start=("FRAME", "min"),
-                    frame_end=("FRAME", "max"),
-                    mean_x=("POSITION_X", "mean"),
-                    mean_y=("POSITION_Y", "mean"),
-                    mean_z=("POSITION_Z", "mean"),
-                    FILTERED_OUT=("FILTERED_OUT", "first"),
-                    FILTER_REASON=("FILTER_REASON", "first"),
-                )
-                # Add per-track max_speed from our pre-computed series
-                track_summary["max_speed_um_per_frame"] = track_max_speed
-                track_summary.to_csv(
-                    out_dir / "oriented_filtered_summary.csv"
-                )
-                files_written.append("oriented_filtered_summary.csv")
-
-                # 6. Brief JSON metadata so the R pipeline can audit
-                # the threshold choices without re-parsing CSVs.
-                n_drop = int((~keep_mask).sum())
-                n_kept = int(keep_mask.sum())
-                meta = {
-                    "filter": {
-                        "min_track_length": int(min_length),
-                        "max_speed_um_per_frame": (
-                            float(max_speed)
-                            if np.isfinite(max_speed)
-                            else None
-                        ),
-                    },
-                    "n_spots_total": int(len(df_sorted)),
-                    "n_spots_kept": n_kept,
-                    "n_spots_filtered": n_drop,
-                    "n_tracks_total": int(len(unique_tids)),
-                    "n_tracks_filtered": int(
-                        df_sorted.loc[
-                            df_sorted["FILTERED_OUT"], "TRACK_ID"
-                        ].nunique()
-                    ),
-                    "csv_files": files_written,
-                }
-                with open(
-                    out_dir / "filter_metadata.json", "w"
-                ) as f:
-                    json.dump(meta, f, indent=2, default=str)
-                files_written.append("filter_metadata.json")
-
-                self._pending_filtered_files = files_written
-            except Exception as e:
-                self._pending_filtered_err = str(e)
-
-        t = threading.Thread(target=_bg, daemon=True)
-        t.start()
-
-        def _poll():
-            if t.is_alive():
-                QTimer.singleShot(500, _poll)
-                return
-            if self._pending_filtered_err:
-                self.lbl_export.value = (
-                    f"Filtered export error: {self._pending_filtered_err}"
-                )
-                self.viewer.status = (
-                    f"Filtered export failed: {self._pending_filtered_err}"
-                )
-                return
-            files = self._pending_filtered_files or []
-            n_drop = None
+            # Append kept/filtered counts when available so the user
+            # sees the filter outcome in the status label too.
+            extra = ""
             try:
                 import json as _json
                 meta = _json.loads(
-                    (out_dir / "filter_metadata.json").read_text()
+                    (out_dir / "analysis_metadata.json").read_text()
                 )
-                n_drop = meta.get("n_spots_filtered")
-                n_kept = meta.get("n_spots_kept")
+                tf = meta.get("track_filter") or {}
+                if tf.get("enabled"):
+                    extra = (
+                        f" (kept {tf.get('n_spots_kept', 0):,}, "
+                        f"filtered {tf.get('n_spots_filtered', 0):,})"
+                    )
             except Exception:
                 pass
-            if n_drop is not None and n_kept is not None:
-                self.lbl_export.value = (
-                    f"Exported {len(files)} filtered files (kept "
-                    f"{n_kept:,}, filtered {n_drop:,})"
-                )
-            else:
-                self.lbl_export.value = (
-                    f"Exported {len(files)} filtered files to {out_dir}/"
-                )
-            self.viewer.status = (
-                f"Filtered export: {', '.join(files)}"
+            self.lbl_export.value = (
+                f"Exported {len(files)} files to {out_dir}/{extra}"
             )
+            self.viewer.status = f"Exported: {', '.join(files)}"
 
         QTimer.singleShot(500, _poll)
 
