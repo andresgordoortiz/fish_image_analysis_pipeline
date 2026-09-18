@@ -29,6 +29,13 @@ params.debug_nuclei_script = './debug_nuclei_tracking.py'
 params.debug_report_script = './debug_nuclei_report.py'
 params.help = false
 
+// Debug/dev bypass: skip preprocessing + segmentation + merge and resume
+// directly at PREP_ULTRACK using pre-made 4D_hyperstack_*.tif files.
+// Pass BOTH --preprocessed <path> AND --segmented <path> on the
+// command line. Tracking.enabled in config.json is required.
+params.preprocessed = null
+params.segmented = null
+
 if (params.help) {
     log.info """
     SPIM 4D Image Processing Pipeline
@@ -299,6 +306,36 @@ if (!config.tracking.prep.containsKey('boundary_width'))  { config.tracking.prep
 if (!config.tracking.prep.containsKey('min_area'))        { config.tracking.prep.min_area = 10 }
 def skip_tracking = config.tracking?.enabled != true
 
+// --preprocessed / --segmented developer bypass: skip preprocessing,
+// segmentation AND merge; resume directly at PREP_ULTRACK with the
+// user-supplied 4D_hyperstack_*.tif files. Enables rerunning only the
+// tracking stage after a previous pipeline failure, without re-running
+// the expensive preprocessing + cellpose + merge stages. Tracking MUST
+// be enabled (else there is nothing else to do) and both file paths
+// MUST point at existing files.
+def user_preprocessed = params.preprocessed
+def user_segmented    = params.segmented
+def bypass_hyperstacks = (user_preprocessed != null) && (user_segmented != null)
+if (bypass_hyperstacks) {
+    if (skip_tracking) {
+        log.error "--preprocessed/--segmented bypass requires tracking.enabled=true in config.json (nothing else to do)"
+        exit 1
+    }
+    def _pp = file(user_preprocessed)
+    def _sg = file(user_segmented)
+    if (!_pp.exists()) {
+        log.error "BYPASS: preprocessed hyperstack not found: ${user_preprocessed}"
+        exit 1
+    }
+    if (!_sg.exists()) {
+        log.error "BYPASS: segmented hyperstack not found: ${user_segmented}"
+        exit 1
+    }
+    log.info "BYPASS MODE: --preprocessed=${user_preprocessed}"
+    log.info "BYPASS MODE: --segmented=${user_segmented}"
+    log.info "BYPASS MODE: preprocessing/segmentation/merge SKIPPED; resuming at PREP_ULTRACK"
+}
+
 // Debug-preprocessing (per-stage nuclei tracking) was tied to the
 // intermediate TIFs emitted by the old monolithic PREPROCESS_DECONVOLVE /
 // PREPROCESS_SELFNET. The new modular pipeline has no intermediates to
@@ -332,8 +369,9 @@ if (!skip_tracking) {
         log.error "Tracking requires segmentation (segmentation.enabled=true)"
         exit 1
     }
-    if (skip_merge) {
-        log.error "Tracking requires merge (output.skip_merge=false) to produce hyperstacks"
+    if (skip_merge && !bypass_hyperstacks) {
+        log.error "Tracking requires merge (output.skip_merge=false) to produce hyperstacks " +
+                  "(unless --preprocessed/--segmented bypass is used)"
         exit 1
     }
     // ultrack prep uses tifffile, so TIFF format is required (not BDV-only)
@@ -3580,27 +3618,31 @@ workflow {
 
     } // end skip_preprocessing else
 
-    // 3. Segment each timepoint with Cellpose
-    if (!skip_segmentation) {
+    // 3. Segment each timepoint with Cellpose (skipped in BYPASS mode)
+    if (!skip_segmentation || bypass_hyperstacks) {
         // effective_scaling comes from the top-level downscaling.{enabled,factor}
         // block (defined near skip_preprocessing). It is reused by CELLPOSE_SEGMENT
         // below to write correct voxel sizes into the segmentation mask metadata.
 
-        CELLPOSE_SEGMENT(
-            segmentation_input,
-            shared_metadata,
-            config.segmentation,
-            effective_scaling,
-            bin_dir_ch
-        )
-
-        // 4. OPTIONAL: Downscale segmented labels using Fiji headless (nearest-neighbor)
-        if (downscale_labels < 1.0) {
-            log.info "Label downscaling enabled: factor=${downscale_labels} (Fiji nearest-neighbor, no interpolation)"
-            DOWNSCALE_SEGMENTATION(
-                CELLPOSE_SEGMENT.out.segmented,
-                downscale_labels
+        if (!bypass_hyperstacks) {
+            CELLPOSE_SEGMENT(
+                segmentation_input,
+                shared_metadata,
+                config.segmentation,
+                effective_scaling,
+                bin_dir_ch
             )
+
+            // 4. OPTIONAL: Downscale segmented labels using Fiji headless (nearest-neighbor)
+            if (downscale_labels < 1.0) {
+                log.info "Label downscaling enabled: factor=${downscale_labels} (Fiji nearest-neighbor, no interpolation)"
+                DOWNSCALE_SEGMENTATION(
+                    CELLPOSE_SEGMENT.out.segmented,
+                    downscale_labels
+                )
+            }
+        } else {
+            log.info "BYPASS: skipping CELLPOSE_SEGMENT (using --segmented ${user_segmented})"
         }
 
         // 5. OPTIONAL: Merge timepoints into 4D hyperstacks
@@ -3610,7 +3652,7 @@ workflow {
         // are skipped inside the task. This avoids the DSL2
         // "process already used" error that would occur if we called
         // the old per-data-type MERGE_TO_HYPERSTACK multiple times.
-        if (!skip_merge) {
+        if (!skip_merge && !bypass_hyperstacks) {
             // Build the processed file list (the chain's "processed" output).
             // Process input is `path` which requires a non-empty value →
             // wrap each empty channel with `ifEmpty` that stages a
@@ -3645,7 +3687,11 @@ workflow {
                 raw_iso_ch
             )
         } else {
-            log.info "Hyperstack merging SKIPPED (skip_merge=true)"
+            if (bypass_hyperstacks) {
+                log.info "BYPASS: skipping MERGE_HYPERSTACKS (using --preprocessed/--segmented hyperstacks directly)"
+            } else {
+                log.info "Hyperstack merging SKIPPED (skip_merge=true)"
+            }
         }
 
         // 6. OPTIONAL: ultrack tracking (requires merge to produce hyperstacks)
@@ -3655,8 +3701,21 @@ workflow {
             // The TIFF hyperstack is required for ultrack prep (uses tifffile).
             // Filenames contain the data type: 4D_hyperstack_processed.tif,
             // 4D_hyperstack_segmented.tif.
-            processed_hs = MERGE_HYPERSTACKS.out.processed_tif
-            segmented_hs = MERGE_HYPERSTACKS.out.segmented_tif
+            //
+            // In BYPASS mode, source the hyperstacks directly from the
+            // --preprocessed/--segmented paths; otherwise pull them from
+            // MERGE_HYPERSTACKS (which has just been scheduled above).
+            def processed_hs
+            def segmented_hs
+            if (bypass_hyperstacks) {
+                log.info "BYPASS: tracking will read processed_hs  = ${user_preprocessed}"
+                log.info "BYPASS: tracking will read segmented_hs = ${user_segmented}"
+                processed_hs = Channel.fromPath(user_preprocessed, checkIfExists: true)
+                segmented_hs = Channel.fromPath(user_segmented,   checkIfExists: true)
+            } else {
+                processed_hs = MERGE_HYPERSTACKS.out.processed_tif
+                segmented_hs = MERGE_HYPERSTACKS.out.segmented_tif
+            }
 
             prep_ultrack_script_ch = Channel.fromPath(params.prep_ultrack_script, checkIfExists: true)
 
@@ -3702,9 +3761,11 @@ workflow {
             log.info "Ultrack tracking SKIPPED (tracking.enabled=false)"
         }
 
-        // 7. OPTIONAL: Benchmark pipeline outputs
+        // 7. OPTIONAL: Benchmark pipeline outputs (skipped in BYPASS mode —
+        //    no per-timepoint preprocessed/segmented outputs were produced
+        //    this run, so BENCHMARK's inputs would be empty anyway).
         def run_benchmark = config.benchmark?.enabled ?: false
-        if (run_benchmark) {
+        if (run_benchmark && !bypass_hyperstacks) {
             log.info "Benchmarking enabled - will compute quality metrics"
 
             benchmark_script_ch = Channel.fromPath(params.benchmark_script, checkIfExists: true)
@@ -3737,7 +3798,11 @@ workflow {
                 benchmark_script_ch.collect()
             )
         } else {
-            log.info "Benchmarking disabled"
+            if (run_benchmark && bypass_hyperstacks) {
+                log.info "BYPASS: skipping BENCHMARK (no segmentation/preprocessing outputs to score)"
+            } else {
+                log.info "Benchmarking disabled"
+            }
         }
     } else {
         log.info "Segmentation SKIPPED (segmentation.enabled=false)"
