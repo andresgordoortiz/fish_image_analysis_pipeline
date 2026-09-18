@@ -2388,9 +2388,33 @@ process MERGE_HYPERSTACKS {
 
     // Fan-out: publishDir runs once per emitted output path. Same as
     // before; each (data_type, output) tuple routes to the right dir.
-    publishDir "${params.output_dir}/01_preprocessed",      mode: 'copy', pattern: "4D_hyperstack_processed*"
-    publishDir "${params.output_dir}/01b_raw_isotropic",    mode: 'copy', pattern: "4D_hyperstack_raw_iso*"
-    publishDir "${params.output_dir}/02_segmented",         mode: 'copy', pattern: "4D_hyperstack_segmented*"
+    //
+    // MODE='move' (not 'copy'): the work-dir lives on /scratch-cbe
+    // (cluster scratch, one filesystem) and the publish-dir is on
+    // /groups/pinheiro (long-term storage, a different filesystem).
+    // `cp` across this boundary on the IMP cluster was SILENTLY
+    // truncating files in 4-GiB chunks for the 448-TP run (worked at
+    // 201,863,077,888 bytes / ~8.93 × 4 GiB; the source on scratch was
+    // 240,218,374,432 bytes — i.e. truncated to 84% of the real
+    // content). Symptom: `4D_hyperstack_processed.tif` and
+    // `4D_hyperstack_segmented.tif` had different sizes even though
+    // `merge_hyperstack.py` wrote byte-identical outputs. 'move' is
+    // atomic, free, and the destination file is guaranteed to be
+    // byte-identical to what `merge_hyperstack.py` wrote.
+    //
+    // -resume caveat: after a successful merge, re-running with
+    // -resume will NOT re-run MERGE_HYPERSTACKS (the work-dir file is
+    // gone). That's the desired behaviour for downstream consumers
+    // (PREP_ULTRACK, BENCHMARK) because they read the published file
+    // via the channel emit, not the work-dir path. If MERGE itself
+    // fails (e.g. insufficient disk), the work-dir file stays put
+    // because publishDir 'move' only runs on task success — re-run
+    // the pipeline and the failed merge will re-execute.
+    //
+    // 700 GB saved per run (3 × ~223 GB of cross-FS copies).
+    publishDir "${params.output_dir}/01_preprocessed",      mode: 'move', pattern: "4D_hyperstack_processed*"
+    publishDir "${params.output_dir}/01b_raw_isotropic",    mode: 'move', pattern: "4D_hyperstack_raw_iso*"
+    publishDir "${params.output_dir}/02_segmented",         mode: 'move', pattern: "4D_hyperstack_segmented*"
 
     input:
     path metadata_json
