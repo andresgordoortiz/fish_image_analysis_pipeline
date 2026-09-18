@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --no-requeue
-#SBATCH --mem 8GB
+# Orchestrator SLURM allocation. Nextflow holds ~2,245 task records ×
+# ~15 KB/record ≈ 34 MB on-heap for 448-TP runs (trivial), but the cgroup
+# also has to cover: JVM native (off-heap metaspace + thread stacks,
+# ~1-2 GB), subprocess stdio pipes, the apptainer launcher sidecars, and
+# the trace/timeline/report HTML serialization at the end. 12 GB gives
+# the JVM (-Xmx6g) ~6 GB of headroom for everything else, which is what
+# the 448-TP run actually needed. 8 GB was the OOM culprit.
+#SBATCH --mem 12GB
 #SBATCH -p c
 #SBATCH --qos c_medium
 #SBATCH --time 2-00:00:00
@@ -117,7 +124,12 @@ export SINGULARITY_TMPDIR="$OUTPUT_DIR/singularity_tmp"
 export APPTAINER_TMPDIR="$OUTPUT_DIR/singularity_tmp"
 export NXF_TEMP="$OUTPUT_DIR/.nextflow_temp"
 export NXF_OPTS="-Xss4M"
-export NXF_JVM_ARGS="-Xms2g -Xmx5g"
+# Nextflow JVM heap. With ~2,245 task records × ~15 KB/record the on-heap
+# task state is ~34 MB; 6 GB is comfortably enough to keep all trace,
+# timeline and report generation off the off-heap path. Pair with
+# --mem 12GB above (heap < cgroup cap, with ~6 GB headroom for native
+# + subprocess + serialization buffers).
+export NXF_JVM_ARGS="-Xms2g -Xmx6g"
 mkdir -p "$SINGULARITY_TMPDIR" "$NXF_TEMP"
 
 # Gurobi multi-user floating license (shared, lives next to the containers).
