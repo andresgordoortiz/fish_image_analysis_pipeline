@@ -3469,7 +3469,16 @@ workflow {
         log.info "Raw export disabled (set raw_export.enabled=true in config.json to enable)"
     }
 
-    if (skip_preprocessing) {
+    // In BYPASS mode (--preprocessed/--segmented CLI flags) we treat the
+    // whole preprocessing chain as skipped: PLANAR/DEPTH/ISOTROPIC/DOWNSCALE_XY
+    // never run, so their SLURM slots are not consumed and their per-timepoint
+    // outputs are never produced (and thus never needed downstream). The
+    // matching CELLPOSE_SEGMENT/MERGE_HYPERSTACKS gates further down cooperate
+    // to feed PREP_ULTRACK with the user-supplied 4D_hyperstack_*.tif files
+    // instead. Segmentation falls through to the default branch below, which
+    // assigns segmentation_input from the unmodified raw inputs — that's
+    // fine because CELLPOSE_SEGMENT won't consume it.
+    if (skip_preprocessing || bypass_hyperstacks) {
         // ---- Skip preprocessing ----
         if (preprocessed_dir) {
             // Load already-processed TIFs from preprocessed_dir
