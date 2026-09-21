@@ -10,7 +10,7 @@
 #SBATCH --mem 12GB
 #SBATCH -p c
 #SBATCH --qos c_medium
-#SBATCH --time 2-00:00:00
+#SBATCH --time 3-00:00:00
 
 # SPIM Pipeline Submission Script
 # All configuration is in config.json - edit that file, not this one!
