@@ -9,7 +9,6 @@
 # the 448-TP run actually needed. 8 GB was the OOM culprit.
 #SBATCH --mem 12GB
 #SBATCH -p c
-#SBATCH --qos c_medium
 #SBATCH --time 3-00:00:00
 
 # SPIM Pipeline Submission Script
