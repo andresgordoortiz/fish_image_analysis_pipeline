@@ -2675,11 +2675,18 @@ PYTHON_CONFIG
 
         export NXF_TASK_CPUS=\${NXF_TASK_CPUS:-1}
         # 4th positional arg: output directory. The merge script will
-        # write 4D_hyperstack_${dt}.tif + _metadata.json directly to
-        # this directory. Combined with the publishDir mode: 'symlink'
-        # directive above, the workdir ends up with a symlink pointing
-        # at the real destination file, and downstream consumers can
-        # dereference it.
+        # write 4D_hyperstack_<data-type>.tif + _metadata.json directly
+        # to this directory. Combined with the publishDir mode:
+        # 'symlink' directive above, the workdir ends up with a symlink
+        # pointing at the real destination file, and downstream
+        # consumers can dereference it.
+        # NOTE: bash variable references in this script block MUST be
+        # escaped as \$var or \${var} so the Groovy parser doesn't try
+        # to interpolate them at script-build time. The \${dt} form
+        # below in run_merge() IS a GString to Groovy and was the
+        # root cause of the "token recognition error" on first launch
+        # — Groovy resolved "dt" against the script-block scope, found
+        # nothing, and crashed.
         python3 "${merge_script_name}" "${metadata_json}" config_temp.json "\$dt" "\$out_dir" \
             || { echo "ERROR: merge failed for \${dt}"; return 1; }
 
@@ -2743,10 +2750,20 @@ PYTHON_CONFIG
     echo ""
     echo "Cleaning up staged per-timepoint TIFFs in workdir (no longer needed)..."
     n_removed=0
+    # Four separate find calls — chain them rather than using the
+    # grouped `-name A -o -name B` form (which needs escaped parens,
+    # and those escapes confuse the Nextflow Groovy parser inside
+    # the `"""..."""` script heredoc). The parens-free form is also
+    # easier to read in the bash log.
     while IFS= read -r f; do
         [ -z "\$f" ] && continue
         rm -f -- "\$f" && n_removed=\$((n_removed + 1))
-    done < <(find . \( -type f \( -name 't*_processed.tif' -o -name 't*_dscale_Channel*.tif' -o -name 't*_segmented.tif' -o -name 't*_raw_iso_Channel*.tif' \) \) 2>/dev/null)
+    done < <(
+        find . -type f -name 't*_processed.tif'         2>/dev/null
+        find . -type f -name 't*_dscale_Channel*.tif'  2>/dev/null
+        find . -type f -name 't*_segmented.tif'         2>/dev/null
+        find . -type f -name 't*_raw_iso_Channel*.tif'  2>/dev/null
+    )
     echo "✓ Removed \${n_removed} staged per-timepoint TIFF(s)"
     echo ""
     echo "Workdir contents after merge + cleanup:"
