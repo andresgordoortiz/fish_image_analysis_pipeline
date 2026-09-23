@@ -2490,20 +2490,20 @@ process MERGE_HYPERSTACKS {
     # paths (i.e. the publishDir destination, not the workdir). Combined
     # with publishDir mode: 'symlink' below, the workdir will end up
     # with an absolute symlink pointing at the destination file — the
-    # `path` output emit then resolves to a valid (symlink-resolved)
+    # 'path' output emit then resolves to a valid (symlink-resolved)
     # file, and downstream consumers (PREP_ULTRACK) can dereference it
     # transparently.
     #
     # Why direct-to-destination instead of workdir-then-publishDir:
-    # `mode: 'copy'` triggers cross-FS truncation (see comment block
-    # above); `mode: 'move'` deletes the source and breaks channel
-    # emits per the Nextflow docs; `mode: 'link'` (hardlink) doesn't
+    # 'mode: 'copy'' triggers cross-FS truncation (see comment block
+    # above); 'mode: 'move'' deletes the source and breaks channel
+    # emits per the Nextflow docs; 'mode: 'link'' (hardlink) doesn't
     # work across filesystems. Direct-to-destination sidesteps all
     # three.
     #
-    # `params.output_dir` is resolved to an absolute path near the top
-    # of spim_pipeline.nf (line ~135: `params.output_dir =
-    # file(...).toAbsolutePath().toString()`), so these expansions
+    # 'params.output_dir' is resolved to an absolute path near the top
+    # of spim_pipeline.nf (line ~135: 'params.output_dir =
+    # file(...).toAbsolutePath().toString()'), so these expansions
     # produce absolute destinations regardless of where Nextflow
     # launched the workdir evaluation.
     # ----------------------------------------------------------------------
@@ -2602,9 +2602,9 @@ PYTHON_CONFIG
         # for this data type. If 0, recursively search the workdir for
         # any matching pattern and symlink matches into the root.
         #
-        # `set +e` is toggled around the glob/find calls because both `ls`
-        # (on a non-matching glob) and `find` (on no match) return non-zero,
-        # and `set -euo pipefail` would otherwise kill the script before
+        # 'set +e' is toggled around the glob/find calls because both 'ls'
+        # (on a non-matching glob) and 'find' (on no match) return non-zero,
+        # and 'set -euo pipefail' would otherwise kill the script before
         # we get a chance to fall back.
         # ------------------------------------------------------------------
         set +e
@@ -2633,8 +2633,21 @@ PYTHON_CONFIG
                     if [ -z "\$found" ]; then
                         found="\$pat_matches"
                     else
-                        found="\$found
-\$pat_matches"
+                        # Multi-line bash string with embedded newline.
+                        # The backslash-dollar escapes are CRITICAL - Groovy
+                        # parses this entire script block as a GString, and
+                        # an unescaped bash variable reference would be
+                        # interpreted as a Groovy variable interpolation.
+                        # Bash variables found and pat_matches are NOT
+                        # defined in the Groovy scope (they are local bash
+                        # vars), so the parser would crash with
+                        # "No such variable: found".
+                        # Use literal backslash-n for the embedded newline -
+                        # bash inside a double-quoted string treats the two
+                        # characters backslash+n as a real newline (POSIX
+                        # behavior); Groovy treats the backslash-dollar
+                        # pair as a literal dollar that bash then resolves.
+                        found="\$found\n\$pat_matches"
                     fi
                 fi
             done
@@ -2744,17 +2757,17 @@ PYTHON_CONFIG
     #   2) makes it obvious to anyone inspecting the workdir post-merge
     #      that the inputs are no longer needed (no false impression that
     #      "the merge didn't run because the inputs are still here").
-    # Uses `find` to also catch any t*_*.tif Nextflow may have placed in
-    # the per-input subdirs (`processed/`, `segmented/`, `raw_iso/`) on
-    # 23.04+ (v6 staging layout) — `rm` alone misses those.
+    # Uses 'find' to also catch any t*_*.tif Nextflow may have placed in
+    # the per-input subdirs ('processed/', 'segmented/', 'raw_iso/') on
+    # 23.04+ (v6 staging layout) — 'rm' alone misses those.
     # ----------------------------------------------------------------------
     echo ""
     echo "Cleaning up staged per-timepoint TIFFs in workdir (no longer needed)..."
     n_removed=0
     # Four separate find calls — chain them rather than using the
-    # grouped `-name A -o -name B` form (which needs escaped parens,
+    # grouped '-name A -o -name B' form (which needs escaped parens,
     # and those escapes confuse the Nextflow Groovy parser inside
-    # the `"""..."""` script heredoc). The parens-free form is also
+    # the triple-quoted script heredoc). The parens-free form is also
     # easier to read in the bash log.
     while IFS= read -r f; do
         [ -z "\$f" ] && continue
