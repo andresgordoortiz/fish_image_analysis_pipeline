@@ -31,6 +31,22 @@ Statistics.csv
 # Use this if you want to ignore any folder named "non-trackable"
 **/non-trackable/
 
+# --- Nextflow ---
+# Runtime artifacts (binary cache, run history, log files). These are
+# regenerated on every run and can be very large (.nextflow/ alone is
+# ~140 MB after a few runs). Add new ones as nextflow versions add them.
+.nextflow/
+.nextflow.log
+.nextflow.log.*
+trace-*.txt
+# User-supplied pre-made 4D hyperstacks (only relevant for the
+# --preprocessed/--segmented developer bypass; never committed)
+4D_hyperstack_*.tif
+4D_hyperstack_*.h5
+4D_hyperstack_*.xml
+# Pipeline work dir (per-run task workdirs; same reason as .nextflow/)
+work/
+
 # --- System & IDE ---
 .DS_Store
 Thumbs.db
