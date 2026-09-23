@@ -2217,8 +2217,9 @@ with open('${metadata_json}', 'r') as f:
     metadata = json.load(f)
 
 # Canonical voxel sizes from the user's config.json (passed in as
-# GString interpolations of the script-scope doubles metadata_voxel_x/y/z
-# defined near the top of spim_pipeline.nf). The CELL's input TIFF's
+# GString interpolations of the script-scope doubles metadata_voxel_x,
+# metadata_voxel_y, and metadata_voxel_z defined near the top of
+# spim_pipeline.nf). The CELL's input TIFF's
 # ImageJ block is untrustworthy (lightsheet acquisition software
 # commonly writes spacing=1.0 + 96-dpi defaults that are not real
 # measurements), so we use the canonical config values instead.
