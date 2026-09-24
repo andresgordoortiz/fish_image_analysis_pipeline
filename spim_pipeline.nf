@@ -3761,6 +3761,19 @@ workflow {
         log.info "Raw export disabled (set raw_export.enabled=true in config.json to enable)"
     }
 
+    // Stage the entire bin/ directory as a single input so the per-step
+    // scripts (and their _tiff_io.py dependency) are all available in
+    // the task workdir when the script's first line is `from _tiff_io
+    // import ...`. Using path() (not file()) preserves the directory
+    // name 'bin/' which the script invocation ``python3 bin/<script>.py``
+    // relies on for the relative import.
+    //
+    // Declared BEFORE the skip_preprocessing branch so it is in scope for
+    // both the normal-preprocessing chain (PLANAR/DEPTH/[DOWNSCALE_XY|ISOTROPIC])
+    // and the standalone DOWNSCALE_XY calls made when skip_preprocessing=true
+    // but downscaling.enabled=true.
+    bin_dir_ch = Channel.fromPath("${projectDir}/bin", type: 'dir', checkIfExists: true).collect()
+
     // In BYPASS mode (--preprocessed/--segmented CLI flags) we treat the
     // whole preprocessing chain as skipped: PLANAR/DEPTH/ISOTROPIC/DOWNSCALE_XY
     // never run, so their SLURM slots are not consumed and their per-timepoint
@@ -3870,13 +3883,9 @@ workflow {
                  (downscaling_enabled && effective_scaling < 1.0d
                      ? "downscale_xy (XY + Z isotropic)"
                      : "isotropic (Z only)")
-        // Stage the entire bin/ directory as a single input so the per-step
-        // scripts (and their _tiff_io.py dependency) are all available in
-        // the task workdir when the script's first line is `from _tiff_io
-        // import ...`. Using path() (not file()) preserves the directory
-        // name 'bin/' which the script invocation ``python3 bin/<script>.py``
-        // relies on for the relative import.
-        bin_dir_ch = Channel.fromPath("${projectDir}/bin", type: 'dir', checkIfExists: true).collect()
+        // bin_dir_ch was staged before the skip_preprocessing branch (see
+        // top of this block) so it's available to the skip-preprocessing
+        // standalone-DOWNSCALE_XY path too.
 
         // Step 1: planar (XY) shading correction
         PLANAR_CORRECTION(
