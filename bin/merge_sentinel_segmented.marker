@@ -1,0 +1,14 @@
+# Sentinel file for MERGE_HYPERSTACKS input channeling.
+#
+# When the upstream `segmented_files` channel is empty (e.g.
+# `segmentation.enabled=false`), the workflow `ifEmpty { ... }` fallback
+# stages this file instead. It's a placeholder: the bash merge loop
+# globs `t*_segmented.tif` so this .marker is ignored, and the segmented
+# merge is "skipped" with a ⏭  message in the task log.
+#
+# Basename MUST be unique across the five placeholders (this one, the
+# processed sentinel, the raw_iso sentinel, and the real merge_script
+# input which is `./merge_hyperstack.py`). Sharing a basename with
+# `merge_hyperstack.py` causes Nextflow's "multiple input files for the
+# following file name" staging collision, which fires before the bash
+# layer can skip anything.

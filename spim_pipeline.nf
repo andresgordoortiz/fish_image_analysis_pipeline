@@ -4008,31 +4008,47 @@ workflow {
         // the old per-data-type MERGE_TO_HYPERSTACK multiple times.
         if (!skip_merge && !bypass_hyperstacks) {
             // Build the processed file list (the chain's "processed" output).
-            // Process input is `path` which requires a non-empty value →
-            // wrap each empty channel with `ifEmpty` that stages a
-            // placeholder file the bash script detects and skips.
+            // Process input is `path` which requires a non-empty value.
+            // When the upstream channel is empty we substitute a
+            // data-type-specific sentinel under `bin/` so the stage-in
+            // contract is satisfied (one file per `path` input slot).
+            // The bash merge loop's glob (t*_<dt>.tif) does not match the
+            // sentinel basename, so the per-type merge is silently skipped
+            // with the existing "⏭  Skipping <dt>" log line.
+            //
+            // CRITICAL: each sentinel MUST have a basename distinct from
+            // `merge_hyperstack.py` (the real `merge_script` input). The
+            // previous design reused `merge_hyperstack.py` for ALL three
+            // placeholders, which collided with that input at stage-in
+            // whenever any channel was empty (e.g. preprocessing=false
+            // + downscaling=false + raw_export=false -> 2 placeholders +
+            // 1 real input = 3 files named `merge_hyperstack.py` in the
+            // workdir -> Nextflow aborts with "Process input file name
+            // collision" before the bash body can run).
             processed_ch = segmentation_input
                 .map { timepoint, f -> f }
                 .collect()
-                .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] }
+                .ifEmpty { [file("${workflow.projectDir}/bin/merge_sentinel_processed.marker")] }
 
             // Build the segmented file list (only meaningful if segmentation ran)
             segmented_ch = (skip_segmentation
-                ? Channel.value(file("${workflow.projectDir}/merge_hyperstack.py"))
+                ? Channel.value(file("${workflow.projectDir}/bin/merge_sentinel_segmented.marker"))
                 : CELLPOSE_SEGMENT.out.segmented
                     .map { timepoint, f -> f }
                     .collect()
-                    .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] })
+                    .ifEmpty { [file("${workflow.projectDir}/bin/merge_sentinel_segmented.marker")] })
 
             // Build the raw_iso file list (only meaningful if raw_export ran)
             raw_iso_ch = (raw_export_enabled && raw_iso_input != null
                 ? raw_iso_input.map { timepoint, f -> f }
                     .collect()
-                    .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] }
-                : Channel.value(file("${workflow.projectDir}/merge_hyperstack.py")))
+                    .ifEmpty { [file("${workflow.projectDir}/bin/merge_sentinel_raw_iso.marker")] }
+                : Channel.value(file("${workflow.projectDir}/bin/merge_sentinel_raw_iso.marker")))
 
             log.info "Hyperstack merging enabled"
 
+            // (see comment block at top of this `if (!skip_merge && !bypass_hyperstacks)`
+            // block for the rationale behind the sentinel basenames.)
             MERGE_HYPERSTACKS(
                 shared_metadata,
                 Channel.fromPath(params.merge_script, checkIfExists: true).first(),
@@ -4165,21 +4181,25 @@ workflow {
         if (!skip_merge) {
             log.info "Hyperstack merging enabled (processed only, no segmentation)"
 
+            // Sentinels: see comment at top of the equivalent `if (!skip_merge
+            // && !bypass_hyperstacks)` block for why these placeholders use
+            // dedicated per-data-type sentinels rather than re-using the
+            // real `merge_hyperstack.py` (basename collision at stage-in).
             processed_ch = segmentation_input
                 .map { timepoint, f -> f }
                 .collect()
-                .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] }
+                .ifEmpty { [file("${workflow.projectDir}/bin/merge_sentinel_processed.marker")] }
             raw_iso_ch = (raw_export_enabled && raw_iso_input != null
                 ? raw_iso_input.map { timepoint, f -> f }
                     .collect()
-                    .ifEmpty { [file("${workflow.projectDir}/merge_hyperstack.py")] }
-                : Channel.value(file("${workflow.projectDir}/merge_hyperstack.py")))
+                    .ifEmpty { [file("${workflow.projectDir}/bin/merge_sentinel_raw_iso.marker")] }
+                : Channel.value(file("${workflow.projectDir}/bin/merge_sentinel_raw_iso.marker")))
 
             MERGE_HYPERSTACKS(
                 shared_metadata,
                 Channel.fromPath(params.merge_script, checkIfExists: true).first(),
                 processed_ch,
-                Channel.value(file("${workflow.projectDir}/merge_hyperstack.py")),
+                Channel.value(file("${workflow.projectDir}/bin/merge_sentinel_segmented.marker")),
                 raw_iso_ch
             )
         }
