@@ -1,28 +1,28 @@
 {
-  "_readme": "SPIM 4D pipeline config. Most users only need to edit input.directory, output.directory, and toggle the *_enabled flags. Paths can be absolute or relative to the repo dir. Input accepts a folder of per-timepoint TIFFs (t0001_*.tif, t0002_*.tif, ...) or a single hyperstack file (.czi, .tif, .tiff).",
+  "_readme": "4D Nuclei tracking pipeline config. Most users only need to edit input.directory, output.directory, and toggle the *_enabled flags. Paths can be absolute or relative to the repo dir. Input accepts a folder of per-timepoint TIFFs (t0001_*.tif, t0002_*.tif, ...) or a single hyperstack file (.czi, .tif, .tiff).",
   "pipeline": {
     "_comment": "Informational only.",
-    "name": "SPIM 4D Image Processing Pipeline",
+    "name": "4D Nuclei Pipeline",
     "version": "1.0.0",
     "author": "Andr\u00e9s Gordo & Guilherme Ventura",
     "institute": "IMP Vienna"
   },
   "input": {
     "_comment_directory": "Folder = per-timepoint TIFFs named t0001_*.tif, ... File = single hyperstack (.czi, .tif, .tiff).",
-    "directory": "./subset/",
+    "directory": "/absolute/path/to/your/input",
     "_comment_channel": "1-based channel index. Ignored for folder inputs (channel is in the filename).",
     "channel": 2,
     "_comment_max_timepoints": "Optional. Only process the first N timepoints. null = use all.",
     "max_timepoints": null
   },
   "output": {
-    "_comment_directory": "Where to write results. Will be created if it does not exist.",
-    "directory": "./subset_results/",
+    "_comment_directory": "Where to write results. Will be created if it does not exist. Name as you wish.",
+    "directory": "./results_pipeline/",
     "_comment_format": "Final merged 4D stack format: 'tiff' or 'bdv' (HDF5+XML).",
     "format": "tiff",
     "_comment_correct_y": "Flip Y axis to fix microscope orientation.",
     "correct_y": false,
-    "_comment_skip_merge": "Skip the final 4D merge. Recommended for large data; you only need per-timepoint TIFFs for the viewer.",
+    "_comment_skip_merge": "Skip the final 4D merge. Only available if you are not tracking",
     "skip_merge": false
   },
   "seqera_tower": {
@@ -44,7 +44,7 @@
   },
   "downscaling": {
     "_comment": "Optional pre-pipeline XY downscaling. Applied BEFORE segmentation regardless of whether preprocessing runs. 1.0 = no downscale. <1.0 trades resolution for speed/RAM.",
-    "enabled": true,
+    "enabled": false,
     "factor": 0.33
   },
   "raw_export": {
@@ -57,7 +57,7 @@
   },
   "preprocessing": {
     "_comment": "Modular preprocessing \u2014 three independent NumPy/SciPy steps (CPU only), ported from AIAF-32. Produces an isotropic, shading-corrected, depth-flattened stack ready for segmentation. Each step has sane defaults; override here only when you know why.",
-    "enabled": true,
+    "enabled": false,
     "_comment_planar": "XY shading correction. Estimates a smooth flat-field from the mean-Z projection and divides every slice by it. Larger sigma_xy = smoother field.",
     "planar": {
       "sigma_xy": 64.0
@@ -85,7 +85,6 @@
     "enabled": true,
     "_comment_model": "Path to a Cellpose model folder or a built-in name ('cyto3', 'nuclei', ...).",
     "model": "/groups/pinheiro/user/guilherme.ventura/for_analysis/SPIM/things_from_Thomas/cellpose/models/cpsam_Gui_tracking_20250801",
-    "_comment_diameter": "Single source of truth for the expected nucleus diameter (px). BOTH the main segmentation and the per-stage simulation read this value (spim_pipeline.nf line ~257 falls back to it).",
     "diameter": 30,
     "flow_threshold": 0.8,
     "cellprob_threshold": 0.0,
@@ -104,7 +103,7 @@
   },
   "benchmark": {
     "_comment": "Writes a small CSV/JSON with per-timepoint timing and memory stats.",
-    "enabled": true
+    "enabled": false
   },
   "tracking": {
     "_comment": "Cell tracking with ultrack. Set enabled=true to run the full chain (prep -> segment -> link -> solve -> export). Needs segmentation enabled too.",
