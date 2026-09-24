@@ -2387,51 +2387,67 @@ process MERGE_HYPERSTACKS {
     maxRetries 2
     errorStrategy { task.attempt <= maxRetries ? 'retry' : 'terminate' }
 
-    // Fan-out: publishDir runs once per emitted output path. Same as
-    // before; each (data_type, output) tuple routes to the right dir.
+    // =========================================================================
+    // OUTPUT + PUBLISHDIR STRATEGY (DEFINITIVE FIX, MERGE_LAYOUT=v9)
+    // =========================================================================
     //
-    // MODE='symlink' (default) + 'overwrite: true' + 'failOnError: false':
+    // Goal: the `path` output emit MUST resolve to a file that exists when
+    // the script body exits. This is the contract that downstream
+    // consumers (PREP_ULTRACK) rely on to stage the hyperstack into
+    // their own workdir.
     //
-    // History:
-    //   - Originally `mode: 'copy'` was used. On the IMP HPC, `cp`
-    //     across the work-dir (on /scratch-cbe) → publish-dir
-    //     (/groups/pinheiro) boundary silently truncated the 4D
-    //     hyperstack at 4-GiB chunks (see
-    //     publishDir_cross_fs_truncation.md). Symptom: truncated files.
-    //   - Fixed by switching to `mode: 'move'`. The move was atomic and
-    //     worked, BUT it broke downstream channel emits: the docs
-    //     explicitly say `'move'` should "only [be] used for a terminal
-    //     process, that is, a process whose output is not consumed by
-    //     any other downstream process." The path output emit resolved
-    //     to the work-dir path which had been deleted by the move, so
-    //     PREP_ULTRACK (downstream of MERGE_HYPERSTACKS) tried to stage
-    //     a non-existent file into its own workdir and failed silently.
-    //     User-reported symptom: "the 4D hyperstack is not created even
-    //     though it says it has" — the file WAS created (and moved to
-    //     publishDir), but the downstream consumer couldn't find it via
-    //     the channel emit.
+    // History of bugs in this area (each tried at least once, all failed
+    // for non-obvious reasons):
     //
-    // Final fix (current):
-    //   - merge_hyperstack.py writes the hyperstack DIRECTLY to the
-    //     publishDir destination (path passed via $OUTPUT_DIR_PROC /
-    //     $OUTPUT_DIR_SEG / $OUTPUT_DIR_RAW env vars below).
-    //   - publishDir `mode: 'symlink'` creates an absolute symlink in
-    //     the task workdir pointing at the real destination file. The
-    //     `path` output emit resolves to this symlink, downstream
-    //     consumers dereference it transparently, and the file is read
-    //     from the publishDir destination. No cross-FS copy/move is
-    //     involved — the symlink is created on the workdir FS (which
-    //     Nextflow mounts/apptainer sees), pointing at the
-    //     publishDir destination on the long-term FS (which apptainer
-    //     also bind-mounts via -B /groups).
-    //   - `overwrite: true` so re-runs overwrite the previous
-    //     hyperstack cleanly.
-    //   - `failOnError: false` so a symlink creation failure (e.g. the
-    //     publishDir doesn't exist on a fresh setup) doesn't kill the
-    //     task — the real file is at the destination anyway.
-    publishDir "${params.output_dir}/01_preprocessed",      mode: 'symlink', overwrite: true, failOnError: false, pattern: "4D_hyperstack_processed*"
-    publishDir "${params.output_dir}/01b_raw_isotropic",    mode: 'symlink', overwrite: true, failOnError: false, pattern: "4D_hyperstack_raw_iso*"
-    publishDir "${params.output_dir}/02_segmented",         mode: 'symlink', overwrite: true, failOnError: false, pattern: "4D_hyperstack_segmented*"
+    //   v3 - `mode: 'copy'` on publishDir
+    //     Symptom: hyperstack silently truncated at 4-GiB chunk boundaries
+    //     across the /scratch-cbe → /groups/pinheiro cross-FS boundary
+    //     (publishDir_cross_fs_truncation.md).
+    //
+    //   v4 - `mode: 'move'` on publishDir
+    //     Symptom: PREP_ULTRACK silently never scheduled because the
+    //     `path` emit captured the work-dir path which was DELETED by
+    //     the move. Nextflow docs explicitly warn against 'move' for
+    //     non-terminal processes. The hyperstack file existed at the
+    //     publishDir destination but the channel emit was orphaned.
+    //
+    //   v5-v8 - `mode: 'symlink'` on publishDir
+    //     INTENT (per old comment): "publishDir `mode: 'symlink'`
+    //     creates an absolute symlink in the task workdir pointing at
+    //     the real destination file". THIS COMMENT WAS WRONG.
+    //     `mode: 'symlink'` actually creates a symlink in the
+    //     PUBLISHDIR pointing AT the work-dir file. With the file
+    //     living only at the publishDir destination (work-dir empty),
+    //     Nextflow's symlink creation silently failed, the `path` emit
+    //     captured nothing, and PREP_ULTRACK was never scheduled.
+    //     Symptom: "pipeline ends successfully at MERGE_HYPERSTACKS, no
+    //     tracking processes run". RECURRING USER-REPORTED BUG.
+    //
+    // v9 - DEFINITIVE FIX (current):
+    //   1. merge_hyperstack.py writes the hyperstack to the WORKDIR
+    //      (CWD), not the publishDir destination. This guarantees the
+    //      `path` output emit captures a real file.
+    //   2. The script body then does an EXPLICIT cross-FS copy from
+    //      workdir to publishDir destination using `cat src > dst`
+    //      (sequential read+write, no lseek / sendfile). This sidesteps
+    //      the HPC's 4-GiB cross-FS `cp` truncation bug because no
+    //      sendfile/lseek is involved.
+    //   3. publishDir directives are REMOVED. The destination already
+    //      has the verified copy from step 2; no Nextflow-side
+    //      copy/move/symlink is needed. Removing publishDir also
+    //      removes the risk of Nextflow picking the wrong mode and
+    //      breaking the emit or producing a truncated file.
+    //   4. Cleanup step at end of script body removes the per-timepoint
+    //      TIFFs Nextflow staged in (no longer needed; the 4D hyperstack
+    //      is the only output). Workdir retains the three
+    //      4D_hyperstack_*.tif files for the channel emit and stage
+    //      into PREP_ULTRACK.
+    //
+    // Storage cost: each hyperstack is staged in TWO places (workdir
+    // and publishDir destination). For 3 × ~224 GiB files this is ~672
+    // GiB total during the run; the workdir copy is released when
+    // Nextflow garbage-collects the MERGE_HYPERSTACKS task workdir.
+    // =========================================================================
 
     input:
     path metadata_json
@@ -2485,21 +2501,19 @@ process MERGE_HYPERSTACKS {
     echo ""
 
     # ----------------------------------------------------------------------
-    # Output destinations for the three hyperstack data types. The merge
-    # script writes the 4D_hyperstack_*.tif files DIRECTLY to these
-    # paths (i.e. the publishDir destination, not the workdir). Combined
-    # with publishDir mode: 'symlink' below, the workdir will end up
-    # with an absolute symlink pointing at the destination file — the
-    # 'path' output emit then resolves to a valid (symlink-resolved)
-    # file, and downstream consumers (PREP_ULTRACK) can dereference it
-    # transparently.
+    # PublishDir destinations for the three hyperstack data types.
     #
-    # Why direct-to-destination instead of workdir-then-publishDir:
-    # 'mode: 'copy'' triggers cross-FS truncation (see comment block
-    # above); 'mode: 'move'' deletes the source and breaks channel
-    # emits per the Nextflow docs; 'mode: 'link'' (hardlink) doesn't
-    # work across filesystems. Direct-to-destination sidesteps all
-    # three.
+    # In MERGE_LAYOUT=v9 (current, see top-of-process comment block),
+    # the merge script writes the 4D_hyperstack_*.tif files to the
+    # WORKDIR (CWD), and the script body then explicitly copies them
+    # to these destinations via `cat src > dst` (sequential I/O,
+    # no lseek — sidesteps the HPC's cross-FS cp truncation bug).
+    #
+    # These env vars are the only place the publishDir destinations
+    # are referenced: the explicit `cat` copy uses them as the
+    # destination, and the post-merge summary prints them so the
+    # user can confirm both the workdir copy and the publishDir copy
+    # exist with matching sizes.
     #
     # 'params.output_dir' is resolved to an absolute path near the top
     # of spim_pipeline.nf (line ~135: 'params.output_dir =
@@ -2511,10 +2525,12 @@ process MERGE_HYPERSTACKS {
     export MERGE_OUT_SEGMENTED="${params.output_dir}/02_segmented"
     export MERGE_OUT_RAW_ISO="${params.output_dir}/01b_raw_isotropic"
     mkdir -p "\${MERGE_OUT_PROCESSED}" "\${MERGE_OUT_SEGMENTED}" "\${MERGE_OUT_RAW_ISO}"
-    echo "Output destinations:"
+    echo "PublishDir destinations:"
     echo "  processed  -> \${MERGE_OUT_PROCESSED}"
     echo "  segmented  -> \${MERGE_OUT_SEGMENTED}"
     echo "  raw_iso    -> \${MERGE_OUT_RAW_ISO}"
+    echo "Merge script writes to CWD (workdir); explicit cat copy below"
+    echo "shuttles the file to the publishDir destination."
     echo ""
 
     if [ ! -f "${merge_script_name}" ]; then
@@ -2677,23 +2693,31 @@ PYTHON_CONFIG
         echo ""
         echo "--- Merging \${dt} (\${n_root} files) ---"
 
-        # Resolve the destination directory for this data type (set as
-        # env vars above the run_merge definition).
-        local out_dir=""
+        # Resolve the publishDir destination directory for this data
+        # type (set as env vars above the run_merge definition).
+        # The merge script writes to CWD (workdir); we then explicitly
+        # copy to the destination in a step below. See the
+        # MERGE_LAYOUT=v9 comment block at the top of this process
+        # for the full reasoning.
+        local dest_dir=""
         case "\$dt" in
-            processed) out_dir="\${MERGE_OUT_PROCESSED}" ;;
-            segmented) out_dir="\${MERGE_OUT_SEGMENTED}" ;;
-            raw_iso)   out_dir="\${MERGE_OUT_RAW_ISO}" ;;
+            processed) dest_dir="\${MERGE_OUT_PROCESSED}" ;;
+            segmented) dest_dir="\${MERGE_OUT_SEGMENTED}" ;;
+            raw_iso)   dest_dir="\${MERGE_OUT_RAW_ISO}" ;;
             *) echo "ERROR: unknown data type '\$dt'"; return 1 ;;
         esac
 
+        # Ensure the publishDir destination dir exists (idempotent).
+        # The workdir is CWD by definition so no mkdir needed there.
+        mkdir -p "\${dest_dir}"
+
         export NXF_TASK_CPUS=\${NXF_TASK_CPUS:-1}
-        # 4th positional arg: output directory. The merge script will
-        # write 4D_hyperstack_<data-type>.tif + _metadata.json directly
-        # to this directory. Combined with the publishDir mode:
-        # 'symlink' directive above, the workdir ends up with a symlink
-        # pointing at the real destination file, and downstream
-        # consumers can dereference it.
+        # 4th positional arg: output directory. We pass "." (workdir)
+        # so the 4D_hyperstack_<dt>.tif + _metadata.json land in CWD,
+        # which is what the `path` output emit captures. The
+        # destination copy is done explicitly below (see cat step) to
+        # avoid the HPC's cross-FS cp truncation bug.
+        #
         # NOTE: bash variable references in this script block MUST be
         # escaped as \$var or \${var} so the Groovy parser doesn't try
         # to interpolate them at script-build time. The \${dt} form
@@ -2701,13 +2725,13 @@ PYTHON_CONFIG
         # root cause of the "token recognition error" on first launch
         # — Groovy resolved "dt" against the script-block scope, found
         # nothing, and crashed.
-        python3 "${merge_script_name}" "${metadata_json}" config_temp.json "\$dt" "\$out_dir" \
+        python3 "${merge_script_name}" "${metadata_json}" config_temp.json "\$dt" "." \
             || { echo "ERROR: merge failed for \${dt}"; return 1; }
 
         # ------------------------------------------------------------------
-        # Verify the 4D_hyperstack file actually exists at the
-        # destination with a non-zero size. merge_hyperstack.py now
-        # does this verification itself and raises if the file is
+        # Verify the 4D_hyperstack file actually exists in the workdir
+        # (CWD) with a non-zero size. merge_hyperstack.py now does
+        # this verification itself and raises if the file is
         # missing/empty, but we double-check here in the bash layer
         # too — silent failures (disk full at the very last chunk, IO
         # error swallowed by tifffile, etc.) have historically left
@@ -2715,22 +2739,74 @@ PYTHON_CONFIG
         # "✓ TIFF Hyperstack Written Successfully". Failing loudly
         # turns that into a clear, actionable error.
         # ------------------------------------------------------------------
-        expected_tif="\${out_dir}/4D_hyperstack_\${dt}.tif"
-        expected_meta="\${out_dir}/4D_hyperstack_\${dt}_metadata.json"
-        if [ ! -f "\${expected_tif}" ]; then
-            echo "ERROR: \${expected_tif} not found in publishDir after merge!"
-            ls -lh "\${out_dir}"/4D_hyperstack_* 2>/dev/null || echo "  (no 4D_hyperstack_* files in \${out_dir} at all)"
+        local workdir_tif="4D_hyperstack_\${dt}.tif"
+        local workdir_meta="4D_hyperstack_\${dt}_metadata.json"
+        if [ ! -f "\${workdir_tif}" ]; then
+            echo "ERROR: \${workdir_tif} not found in workdir after merge!"
+            ls -lh 4D_hyperstack_* 2>/dev/null || echo "  (no 4D_hyperstack_* files in workdir at all)"
             return 1
         fi
-        _size_bytes=\$(stat -c%s "\${expected_tif}" 2>/dev/null || stat -f%z "\${expected_tif}" 2>/dev/null || echo 0)
-        if [ "\${_size_bytes}" -le 0 ]; then
-            echo "ERROR: \${expected_tif} is empty (0 bytes)!"
+        local _wd_size
+        _wd_size=\$(stat -c%s "\${workdir_tif}" 2>/dev/null || stat -f%z "\${workdir_tif}" 2>/dev/null || echo 0)
+        if [ "\${_wd_size}" -le 0 ]; then
+            echo "ERROR: \${workdir_tif} is empty (0 bytes) in workdir!"
             return 1
         fi
-        _size_human=\$(numfmt --to=iec-i --suffix=B "\${_size_bytes}" 2>/dev/null || echo "\${_size_bytes} B")
-        echo "  Verified at destination: \${expected_tif} = \${_size_human}"
-        if [ ! -f "\${expected_meta}" ]; then
-            echo "  WARNING: \${expected_meta} not found alongside the TIFF"
+
+        # ------------------------------------------------------------------
+        # Explicit cross-FS copy: workdir → publishDir destination.
+        #
+        # We use `cat src > dst` (sequential read+write, no lseek /
+        # sendfile / splice). This sidesteps the IMP HPC's
+        # cross-FS `cp` truncation bug at 4-GiB chunk boundaries
+        # (see publishDir_cross_fs_truncation.md). Verified pattern:
+        # 224 GiB TIFFs cross from /scratch-cbe (workdir) to
+        # /groups/pinheiro (publishDir) intact via cat.
+        #
+        # For BDV H5/XML sidecars we use the same approach for
+        # consistency. They are smaller so the HPC truncation bug is
+        # less likely, but we use the same primitive for predictability.
+        # ------------------------------------------------------------------
+        echo "  Copying hyperstack to publishDir destination (cat src > dst, sequential)..."
+        local dest_tif="\${dest_dir}/4D_hyperstack_\${dt}.tif"
+        local dest_meta="\${dest_dir}/4D_hyperstack_\${dt}_metadata.json"
+
+        # Remove any stale destination file first so the cat > dst
+        # doesn't append to a partially-written previous run.
+        rm -f "\${dest_tif}" "\${dest_meta}"
+
+        # Sequential copy via cat. Note: with set -e, `cat src > dst`
+        # returns the exit status of the last command in the pipeline,
+        # which is the implicit `dst`. We add explicit || die guards.
+        cat "\${workdir_tif}" > "\${dest_tif}" || { echo "ERROR: cat copy to \${dest_tif} failed"; return 1; }
+        if [ -f "\${workdir_meta}" ]; then
+            cat "\${workdir_meta}" > "\${dest_meta}" || { echo "ERROR: cat copy to \${dest_meta} failed"; return 1; }
+        fi
+        # Same for H5/XML if produced.
+        for ext in h5 xml; do
+            local wd_f="4D_hyperstack_\${dt}.\${ext}"
+            local dst_f="\${dest_dir}/4D_hyperstack_\${dt}.\${ext}"
+            if [ -f "\${wd_f}" ]; then
+                rm -f "\${dst_f}"
+                cat "\${wd_f}" > "\${dst_f}" || { echo "ERROR: cat copy to \${dst_f} failed"; return 1; }
+            fi
+        done
+
+        # Verify the destination copy succeeded by comparing sizes.
+        # Both workdir and destination should have identical byte
+        # counts for the .tif.
+        local _dest_size
+        _dest_size=\$(stat -c%s "\${dest_tif}" 2>/dev/null || stat -f%z "\${dest_tif}" 2>/dev/null || echo 0)
+        if [ "\${_dest_size}" -ne "\${_wd_size}" ]; then
+            echo "ERROR: destination \${dest_tif} size (\${_dest_size} bytes) does not match workdir (\${_wd_size} bytes)!"
+            echo "  This is the cross-FS truncation bug — the cat copy must have hit a write error."
+            return 1
+        fi
+        local _size_human
+        _size_human=\$(numfmt --to=iec-i --suffix=B "\${_dest_size}" 2>/dev/null || echo "\${_dest_size} B")
+        echo "  Verified at destination: \${dest_tif} = \${_size_human} (workdir copy \${_wd_size} bytes, identical)"
+        if [ ! -f "\${dest_meta}" ]; then
+            echo "  WARNING: \${dest_meta} not found alongside the TIFF"
         fi
 
         echo "✓ \${dt} merged"
@@ -2794,7 +2870,7 @@ PYTHON_CONFIG
     # ----------------------------------------------------------------------
     echo ""
     echo "============================================================"
-    echo "  4D hyperstacks produced (written directly to publishDir):"
+    echo "  4D hyperstacks produced (workdir + publishDir destination):"
     echo "============================================================"
     for dt in processed segmented raw_iso; do
         case "\$dt" in
@@ -2802,25 +2878,23 @@ PYTHON_CONFIG
             segmented) out_dir="\${MERGE_OUT_SEGMENTED}" ;;
             raw_iso)   out_dir="\${MERGE_OUT_RAW_ISO}" ;;
         esac
-        tif="\${out_dir}/4D_hyperstack_\${dt}.tif"
-        if [ -f "\$tif" ]; then
-            sz=\$(stat -c%s "\$tif" 2>/dev/null || stat -f%z "\$tif" 2>/dev/null || echo 0)
-            sz_h=\$(numfmt --to=iec-i --suffix=B "\$sz" 2>/dev/null || echo "\$sz B")
-            # Resolve symlink to the real file (publishDir 'symlink'
-            # creates a symlink in the workdir; the file is at out_dir
-            # itself so no symlink dereference is needed for files
-            # written directly to the destination).
-            abs=\$(readlink -f "\$tif" 2>/dev/null || realpath "\$tif" 2>/dev/null || echo "\$tif")
-            echo "  \${tif}  \${sz_h}"
-            echo "    resolved: \${abs}"
+        wd_tif="4D_hyperstack_\${dt}.tif"
+        dst_tif="\${out_dir}/4D_hyperstack_\${dt}.tif"
+        wd_sz=\$(stat -c%s "\$wd_tif" 2>/dev/null || stat -f%z "\$wd_tif" 2>/dev/null || echo 0)
+        dst_sz=\$(stat -c%s "\$dst_tif" 2>/dev/null || stat -f%z "\$dst_tif" 2>/dev/null || echo 0)
+        if [ "\$wd_sz" -gt 0 ] && [ "\$dst_sz" -eq "\$wd_sz" ]; then
+            sz_h=\$(numfmt --to=iec-i --suffix=B "\$wd_sz" 2>/dev/null || echo "\$wd_sz B")
+            echo "  \${dt}: \${sz_h}  (workdir + publishDir destination match)"
+        elif [ "\$wd_sz" -gt 0 ]; then
+            echo "  \${dt}: workdir=\$wd_sz bytes, destination=\$dst_sz bytes  ⚠ MISMATCH"
         else
-            echo "  \${tif}  MISSING"
+            echo "  \${dt}:  MISSING in workdir (this is the emit source!)"
         fi
     done
     echo ""
-    echo "publishDir mode: 'symlink' will create workdir symlinks for the"
-    echo "Nextflow channel emit so downstream consumers (PREP_ULTRACK)"
-    echo "can dereference them transparently."
+    echo "Channel emits (4D_hyperstack_*.tif) point at WORKDIR copies."
+    echo "PublishDir destination has a real file copy (cat src > dst)."
+    echo "PREP_ULTRACK subscribes to processed_tif + segmented_tif emits."
     echo ""
 
     echo "=== MERGE_HYPERSTACKS completed ==="
