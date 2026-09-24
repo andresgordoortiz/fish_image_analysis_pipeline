@@ -2928,7 +2928,7 @@ PYTHON_CONFIG
             else
                 link_kind="symlink (workdir inode \$wd_inode, dest inode \$dst_inode)"
             fi
-            echo "  \${dt}: \${sz_h}  ${link_kind}"
+            echo "  \${dt}: \${sz_h}  \${link_kind}"
         elif [ "\$dst_sz" -gt 0 ]; then
             echo "  \${dt}: destination=\$dst_sz bytes, workdir MISSING  ⚠ NO WORKDIR LINK"
         else
