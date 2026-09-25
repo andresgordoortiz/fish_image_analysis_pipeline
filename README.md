@@ -40,12 +40,25 @@ cd spim_preprocessing
 
 ### 1.3 Prepare your data
 
-The pipeline accepts **either** of these two inputs (set `input.directory` in `config.json`):
+The pipeline accepts any of the following inputs (set `input.directory` in `config.json`, plus `input.channel` for multi-channel files):
 
-- A **folder of per-timepoint TIFFs** named `t0001_*.tif`, `t0002_*.tif`, ...
-- A **single hyperstack file** (`.czi`, `.tif`, `.tiff` with multiple Z/T)
+| Input shape | Example filenames | How to point at it |
+| --- | --- | --- |
+| Folder of per-timepoint TIFFs | `t0000_Channel 1.tif`, `t0001_Channel 1.tif`, ... | `input.directory` = path to the folder |
+| Single Zeiss hyperstack | `movie.czi` | `input.directory` = the `.czi` itself, or its parent folder (auto-detected) |
+| Single 4D/5D ImageJ / OME-TIFF | `full_stack.tif` | `input.directory` = the `.tif`/`.tiff` itself |
+| **Single Imaris (or generic 5D HDF5) dataset** | `seboxGFP-H2ACherry_-02-8bit.ims` | `input.directory` = the `.ims`/`.h5`/`.hdf5` itself |
+| **Folder of per-timepoint / per-channel HDF5** (Bio-Formats "split into timepoints" export) | `seboxGFP-H2ACherry_-02-8bit--C00--T00000.h5`, `...--C00--T00001.h5`, `...--C01--T00000.h5`, ... | `input.directory` = the folder holding the `--C##--T#####.h5` files; `input.channel` picks which channel to track |
 
-If your data is large, keep the original copy somewhere safe and copy/symlink just the timepoint TIFFs into your scratch folder to save space.
+A few notes for the new Imaris / HDF5 paths:
+
+- **Single file (`.ims`, `DataSet.h5`, ...)** is split into per-timepoint `t####_Channel <c>.tif` by the built-in `SPLIT_INPUT_FILE` step. Voxel sizes are auto-detected from the embedded `PhysicalSize{X,Y,Z}` metadata (when `voxel_size.auto_detect = true`); otherwise they fall back to `voxel_size.{x,y,z}_um` in your `config.json`.
+- **Folder of `--C##--T#####.h5` files** is auto-picked-up by the workflow glob (`extractTimepoint` regex has a dedicated `--T#####` pattern), so no manual filename rewriting is needed. The Python readers reach the array inside each `.h5` with `h5py`, no extra conversion step. **This mode bypasses `SPLIT_INPUT_FILE` entirely** — each `.h5` already corresponds to one (timepoint, channel) pair.
+- One Imaris channel can end earlier than the other (e.g. one embryo leaving the field of view at T00120). The pipeline emits a `WARNING: timepoints [...] have no C## .h5 file — will be skipped` line and continues.
+- Channels are 1-indexed in `config.json`: `channel: 1` picks `C00` (0-indexed in the filename), `channel: 2` picks `C01`, etc.
+- Both Imaris paths write a small sidecar `voxel_size.json` into `00_split_input/` so `EXTRACT_METADATA` reads the real physical pixel sizes instead of falling back to bogus TIFF defaults.
+
+If your data is large, keep the original copy somewhere safe and copy/symlink just the relevant files into your scratch folder to save space.
 
 ### 1.4 Edit `config.json`
 

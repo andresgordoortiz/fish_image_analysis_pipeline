@@ -120,8 +120,9 @@ if (!_input_path_file.exists()) {
 }
 if (!_input_path_file.isDirectory()) {
     def fname = _input_path_file.getName().toLowerCase()
-    if (!(fname.endsWith('.czi') || fname.endsWith('.tif') || fname.endsWith('.tiff'))) {
-        log.error "input.directory points at a file but it is not .czi/.tif/.tiff: ${_raw_input_dir}"
+    if (!(fname.endsWith('.czi') || fname.endsWith('.tif') || fname.endsWith('.tiff')
+          || fname.endsWith('.ims') || fname.endsWith('.h5') || fname.endsWith('.hdf5'))) {
+        log.error "input.directory points at a file but it is not .czi/.tif/.tiff/.ims/.h5/.hdf5: ${_raw_input_dir}"
         exit 1
     }
     log.info "input.directory points at a single file — using its parent directory as the input dir"
@@ -458,6 +459,9 @@ process SPLIT_INPUT_FILE {
     publishDir "${params.output_dir}/00_split_input",
         mode: 'copy',
         pattern: "t*_Channel*.tif"
+    publishDir "${params.output_dir}/00_split_input",
+        mode: 'copy',
+        pattern: "voxel_size.json"  // only produced for .ims/.h5 paths
     publishDir "${params.output_dir}/logs/split_input",
         mode: 'copy',
         pattern: "*.log"
@@ -471,6 +475,7 @@ process SPLIT_INPUT_FILE {
     output:
     path "t*_Channel*.tif", emit: timepoints
     path "split_input.log", emit: log
+    path "voxel_size.json", emit: voxel_sidecar, optional: true
 
     script:
     def filename = input_file.name
@@ -512,8 +517,10 @@ process SPLIT_INPUT_FILE {
     python3 << 'PYTHON_SPLIT_SCRIPT'
 import sys
 import os
+import json
 import numpy as np
 import tifffile
+import h5py
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -529,6 +536,11 @@ except Exception:
 print(f"Input file: {input_file}")
 print(f"Channel config (0=auto): {_channel_cfg}")
 print(f"Worker threads:          {n_workers}")
+
+# Path to a per-task sidecar JSON that EXTRACT_METADATA consults as the
+# primary source for voxel sizes when the input was an Imaris / per-TP .h5
+# file (which does NOT carry TIFF tags). Skipped on the .tif / .czi paths.
+voxel_emit_path = Path('voxel_size.json')
 
 
 def resolve_channel(n_channels_in_file, cfg):
@@ -563,16 +575,27 @@ def _to_uint16(arr):
     return arr.astype(np.uint16, copy=False)
 
 
-def save_timepoint(stack3d, t_idx, channel):
-    '''Save a 3D ZYX stack as t####_Channel <c>.tif (ImageJ hyperstack).'''
+def save_timepoint(stack3d, t_idx, channel, voxel_xy_um=None, voxel_z_um=None):
+    '''Save a 3D ZYX stack as t####_Channel <c>.tif (ImageJ hyperstack).
+
+    If voxel_xy_um / voxel_z_um are supplied (micrometres) we patch them into
+    the ImageJ metadata so downstream EXTRACT_METADATA can recover real
+    voxel sizes instead of the bogus 1.0 defaults the lightsheet software
+    usually writes. Resolution is encoded as the standard
+    (pixels-per-micron) reciprocal, which is what the rest of the pipeline
+    reads in `read_tiff_voxel_size`.
+    '''
     out_name = f"t{t_idx:04d}_Channel {channel}.tif"
     stack3d = _to_uint16(stack3d)
-    tifffile.imwrite(
-        out_name,
-        stack3d,
-        imagej=True,
-        metadata={'axes': 'ZYX'},
-    )
+    kwargs = dict(imagej=True, metadata={'axes': 'ZYX'})
+    if voxel_xy_um and voxel_xy_um > 0:
+        # Resolution stored as a (numerator, denominator) tuple of pixels-per-um
+        res = (1.0 / voxel_xy_um, 1.0)
+        kwargs['resolution'] = (res, res)  # X, Y
+        if voxel_z_um and voxel_z_um > 0:
+            kwargs['metadata']['spacing'] = float(voxel_z_um)
+            kwargs['metadata']['unit'] = 'um'
+    tifffile.imwrite(out_name, stack3d, **kwargs)
     print(f"  -> {out_name}  shape={stack3d.shape} dtype={stack3d.dtype}", flush=True)
 
 
@@ -772,11 +795,430 @@ def split_tiff(path):
                 save_timepoint(stack, t, channel)
 
 
+def _discover_ims_layout(h5):
+    '''Locate the Imaris "ResolutionLevel 0" array dataset inside an HDF5/Imaris
+    file. Returns (root_path, axes_str, shape, dtype, n_channels, n_timepoints)
+    or raises a helpful error explaining the supported layout.
+
+    Imaris .ims / HDF5 layout (verified on Bitplane Imaris 9.x / 10.x):
+
+        /DataSet/ResolutionLevel 0/TimePoint <t>/Channel <c>/Data
+
+        shape = (1, 1, Z, Y, X)    dtype = uint8 / uint16 / float32
+        axes  = 'TCZYX'           attrs  = 'ResolutionLevel' attributes
+        /DataSet/Info/DatasetInfoXml holds the canonical metadata but it is
+        stored as a binary blob (~1 MB of XML); we don't need to parse it
+        for raw-array extraction.
+
+    We also accept a few common variants:
+        - Dataset attribute 'aicsimage' / 'bioformats' metadata
+        - 4D arrays 'TCYX' (no Z -- rejected, we need a Z stack)
+        - 'CZYX' orderings (no T -- treated as single timepoint t=0)
+    '''
+    # 1. Prefer the canonical Imaris ResolutionLevel 0 path. Walk candidate roots.
+    candidates = []
+    if 'DataSet' in h5:
+        ds = h5['DataSet']
+        if 'ResolutionLevel 0' in ds:
+            candidates.append(ds['ResolutionLevel 0'])
+        # Fallback inside DataSet: any immediate subgroup whose name starts with ResolutionLevel
+        for k in ds.keys():
+            if isinstance(ds[k], h5py.Group) and k not in candidates and (
+                    k.startswith('ResolutionLevel') or k.startswith('Resolution Level')):
+                candidates.append(ds[k])
+
+    # 2. Outside Imaris layout: top-level 5D 'DataSet/ImageData' (ilastik / python-vol) or
+    #    top-level 'Data' (legacy BioFormats exporter). Use them as a last resort.
+    if not candidates:
+        for k in ('DataSet/ImageData', 'Data', 'data', 'image'):
+            if k in h5 and isinstance(h5[k], h5py.Dataset):
+                candidates.append(k)
+    if not candidates:
+        raise RuntimeError(
+            "Could not find an Imaris / HDF5 image dataset inside this file. "
+            "Expected something like '/DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Data'. "
+            "If this file was written by an exporter other than Imaris/BioFormats, "
+            "convert it once (e.g. with `python -m bfconvert in.ims out_t%d.tif`) "
+            "and re-point `input.directory` at the resulting TIFF folder."
+        )
+
+    # Pick the first viable candidate.
+    chosen = None
+    for c in candidates:
+        # c can be either a Group (Imaris) or a Dataset (raw)
+        if isinstance(c, h5py.Dataset):
+            chosen = ('flat', c)
+            break
+        # Group: enumerate (T, C)
+        sub_keys = list(c.keys())
+        tp_keys = [k for k in sub_keys if k.lower().startswith(('timepoint', 'time point', 't'))]
+        if tp_keys:
+            chosen = ('imaris', c)
+            break
+    if chosen is None:
+        raise RuntimeError(
+            "HDF5 file has DataSet/ResolutionLevel* children but none look like "
+            "TimePoint <t>/Channel <c>/Data. Refusing to guess further."
+        )
+
+    mode, root = chosen
+
+    if mode == 'flat':
+        ds = root
+        arr = ds[...] if ds.shape[0] <= 32 else None  # don't blow up on huge arrays
+        if arr is None:
+            raise RuntimeError(
+                f"Flat dataset too large to materialise in one shot "
+                f"(shape={ds.shape}). Use the per-timepoint .h5 folder mode "
+                f"instead (point `input.directory` at the folder that "
+                f"contains the *--C##--T#####.h5 files)."
+            )
+        ndim = arr.ndim
+        if ndim not in (4, 5):
+            raise RuntimeError(f"Expected 4D/5D HDF5 array, got shape {arr.shape}")
+        # Common axes are TCZYX (5D) or CZYX (4D). We only accept that order.
+        if ndim == 5:
+            nT, nC, nZ, nY, nX = arr.shape
+        else:
+            nT = 1
+            nC, nZ, nY, nX = arr.shape
+        return dict(mode='flat', root=ds, nT=nT, nC=nC, nZ=nZ, nY=nY, nX=nX,
+                    axes=['T', 'C', 'Z', 'Y', 'X'])
+
+    # mode == 'imaris': walk TimePoint/<t>/Channel/<c>/Data
+    tp_keys = sorted(root.keys(),
+                     key=lambda k: int(''.join(ch for ch in k if ch.isdigit()) or 0))
+    nT = len(tp_keys)
+    first_tp = root[tp_keys[0]]
+    ch_keys = sorted([k for k in first_tp.keys() if k.lower().startswith(('channel', 'c'))],
+                     key=lambda k: int(''.join(ch for ch in k if ch.isdigit()) or 0))
+    nC = len(ch_keys)
+    first_ch = first_tp[ch_keys[0]]
+    if 'Data' not in first_ch:
+        raise RuntimeError(
+            f"Imaris layout: expected '/DataSet/ResolutionLevel 0/TimePoint <t>/Channel <c>/Data' "
+            f"but found children {list(first_ch.keys())} under {first_ch.name}"
+        )
+    sample = first_ch['Data']
+    arr_sample = sample[...]
+    if arr_sample.ndim not in (3, 5):
+        raise RuntimeError(
+            f"Imaris per-channel shape {arr_sample.shape} is not 5D (1,1,Z,Y,X). "
+            f"Imaris 9.x always writes the 5D shape; older 3D exports need to "
+            f"be re-exported first."
+        )
+    if arr_sample.ndim == 5:
+        _, _, nZ, nY, nX = arr_sample.shape
+    else:
+        nZ, nY, nX = arr_sample.shape
+    return dict(mode='imaris', root=root, nT=nT, nC=nC, nZ=nZ, nY=nY, nX=nX,
+                axes=['T', 'C', 'Z', 'Y', 'X'], tp_keys=tp_keys, ch_keys=ch_keys)
+
+
+def _read_ims_voxel_um(h5, layout):
+    '''Pull physical voxel sizes from an Imaris / HDF5 file.
+
+    Resolution order:
+      1. /DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/DataSetInformation/
+         (or upstream attribute 'XResolution_um' style) — only present in a
+         few exporters; not in vanilla Imaris.
+      2. /DataSet/Info/DatasetInfoXml byte blob (always present in Imaris).
+         We grep for 'PhysicalSizeX value=".."', 'PhysicalSizeY value=".."',
+         'PhysicalSizeZ value=".."'. Units default to micrometres on
+         microscope acquisitions; we sanity-check the unit attribute.
+      3. Top-level HDF5 attributes 'physical_pixel_sizes' / 'voxelsize_um'.
+      4. None — caller falls back to config.voxel_size.{x,y,z}_um.
+    '''
+    import re
+
+    def _to_float(s):
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
+    # Path 2: Imaris DatasetInfoXml (XML attribute or element text).
+    if 'DataSet' in h5 and isinstance(h5['DataSet'], h5py.Group) and 'Info' in h5['DataSet']:
+        info_grp = h5['DataSet']['Info']
+        for info_key in ('DatasetInfoXml', 'ImageInfoXml'):
+            if info_key not in info_grp:
+                continue
+            xml_node = info_grp[info_key]
+            # Stored either as a 0-D scalar with .asstr() or as a fixed-length
+            # vlen string. Handle both.
+            xml = None
+            try:
+                if xml_node.dtype.kind == 'O':
+                    xml = ''.join(bytes(x).decode('utf-8', 'replace') for x in xml_node[...])
+                else:
+                    xml = xml_node[...].tobytes().decode('utf-8', 'replace')
+            except Exception:
+                continue
+            if not xml:
+                continue
+            vals = {}
+            for axis in ('X', 'Y', 'Z'):
+                m = re.search(rf'\bPhysicalSize{axis}\b[^>]*?(?:value=|>)" ?([0-9eE+\-.]+) ?"',
+                              xml) or re.search(rf'<PhysicalSize{axis}>([^<]+)</PhysicalSize{axis}>',
+                                                xml)
+                if m:
+                    vals[axis] = _to_float(m.group(1))
+            # Check the unit so we can convert (Imaris is µm by default).
+            unit_m = (re.search(r'<PhysicalSizeUnit>(\w+)</PhysicalSizeUnit>', xml)
+                      or re.search(r'PhysicalSizeUnit="(\w+)"', xml))
+            unit = (unit_m.group(1) if unit_m else 'um').lower()
+            if {'X', 'Y', 'Z'}.issubset(vals.keys()):
+                if unit.startswith('nm'):
+                    f = 1e-3
+                elif unit.startswith('mm'):
+                    f = 1e3
+                elif unit.startswith('pm'):
+                    f = 1e-6
+                else:  # 'um' / 'µm' / 'micron'
+                    f = 1.0
+                return dict(x_um=vals['X'] * f, y_um=vals['Y'] * f, z_um=vals['Z'] * f,
+                            source=f'imaris-DatasetInfoXml ({unit})')
+
+    # Path 3: top-level or DataSet-level attributes.
+    candidates = [h5.attrs]
+    if 'DataSet' in h5 and isinstance(h5['DataSet'], h5py.Group):
+        candidates.append(h5['DataSet'].attrs)
+    # ResolutionLevel 0 is the full-res one; later levels are downsampled.
+    if layout.get('mode') == 'imaris':
+        rl0 = h5['DataSet/ResolutionLevel 0'] if 'DataSet/ResolutionLevel 0' in h5 else None
+        if rl0 is not None:
+            candidates.append(rl0.attrs)
+            tp0_keys = layout.get('tp_keys') or []
+            if tp0_keys:
+                candidates.append(rl0[tp0_keys[0]].attrs)
+    for attrs in candidates:
+        # Several naming conventions exist in the wild.
+        for k_xy in ('physical_pixel_sizes', 'voxelsize_um_xy'):
+            if k_xy in attrs:
+                v = attrs[k_xy]
+                if isinstance(v, (tuple, list)) and len(v) >= 2:
+                    return dict(x_um=float(v[0]), y_um=float(v[1]), z_um=float(attrs.get('voxelsize_um_z', v[0])),
+                                source=f'HDF5 attribute {k_xy}')
+        # 'voxel_size_um' as JSON-encoded {"x": 0.347, "y": 0.347, "z": 2.0}
+        if 'voxel_size_um' in attrs:
+            v = attrs['voxel_size_um']
+            if isinstance(v, bytes):
+                v = v.decode('utf-8', 'replace')
+            try:
+                d = json.loads(v) if isinstance(v, str) else json.loads(bytes(v))
+                if all(k in d for k in ('x', 'y', 'z')):
+                    return dict(x_um=float(d['x']), y_um=float(d['y']), z_um=float(d['z']),
+                                source='HDF5 attribute voxel_size_um')
+            except Exception:
+                pass
+    return None
+
+
+def split_ims(path):
+    '''Stream-split an Imaris .ims (or generic 5D HDF5) one timepoint at a
+    time. Mirrors the czifile "allocate only (Z,Y,X) per t" pattern so peak
+    RAM stays at one timepoint per worker, not the whole hyperstack.
+
+    Accepted Imaris layouts:
+      - /DataSet/ResolutionLevel 0/TimePoint <t>/Channel <c>/Data   (5D shape)
+      - /DataSet/ImageData                                          (flat 5D, TCZYX or CZYX)
+      - /data or /image                                             (generic 5D)
+    '''
+    import h5py
+    import threading
+
+    print(f"Reading HDF5/Imaris metadata (no full-array load): {path}")
+    f = h5py.File(path, 'r')
+    ims_read_lock = threading.Lock()
+    try:
+        layout = _discover_ims_layout(f)
+        print(f"  layout mode: {layout['mode']}   nT={layout['nT']}   nC={layout['nC']}   "
+              f"shape (Z,Y,X) = ({layout['nZ']}, {layout['nY']}, {layout['nX']})")
+
+        channel, ch_idx = resolve_channel(layout['nC'], _channel_cfg)
+        print(f"  Using channel {channel} of {layout['nC']}")
+
+        voxel = _read_ims_voxel_um(f, layout)
+        if voxel:
+            print(f"  Imaris voxel sizes (um): x={voxel['x_um']}  y={voxel['y_um']}  z={voxel['z_um']}   "
+                  f"[{voxel['source']}]")
+        else:
+            print("  WARNING: no Imaris voxel size found; relying on config.voxel_size.{x,y,z}_um.")
+
+        # ---- per-timepoint worker -----------------------------------------
+        # The h5py handle is shared across threads. h5py treats the file as
+        # thread-safe for independent reads (since 3.x) — but we still
+        # serialize per-timepoint reads with a small lock to keep peak RAM
+        # predictable in the common Imaris layout, where concurrent reads
+        # of the same /TimePoint/<t>/Channel/<ch>/Data would each trigger
+        # a full 3D decompress.
+        def fetch_3d(t):
+            '''Return a (Z, Y, X) numpy array for the (t, ch_idx) slice.
+            Decoded data is returned under the lock; tifffile writes happen
+            after the lock is released.'''
+            if layout['mode'] == 'flat':
+                with ims_read_lock:
+                    arr5 = layout['root'][t, ch_idx, ...]  # (Z, Y, X) for the flat 5D case
+                if arr5.ndim == 2:
+                    arr5 = arr5[None, ...]
+                return arr5
+            # imaris layout: copy one (1, 1, Z, Y, X) chunk into RAM under the lock.
+            tp_node = layout['root'][layout['tp_keys'][t]]
+            ch_node = tp_node[layout['ch_keys'][ch_idx]]
+            with ims_read_lock:
+                slab = ch_node['Data'][...]
+            if slab.ndim == 5:
+                _, _, nZ, nY, nX = slab.shape
+            else:
+                nZ, nY, nX = slab.shape
+            return np.asarray(slab).reshape((nZ, nY, nX))
+
+        def process_timepoint(t):
+            stack = fetch_3d(t)
+            save_timepoint(stack, t, channel,
+                           voxel_xy_um=(voxel['x_um'] if voxel else None),
+                           voxel_z_um=(voxel['z_um'] if voxel else None))
+            return t
+
+        print(f"Splitting {layout['nT']} timepoints (channel {channel} of {layout['nC']}) "
+              f"with {n_workers} worker thread(s)...")
+
+        # Serialise by default — the lock serialises reads anyway, and parallel
+        # decompression can blow up the LRU cache on multi-GB acquisitions.
+        workers = min(n_workers, 4) if (voxel is None) else 1
+        if workers == 1:
+            for t in range(layout['nT']):
+                process_timepoint(t)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(process_timepoint, t): t for t in range(layout['nT'])}
+                for fut in as_completed(futs):
+                    fut.result()
+
+        # Mirror the EXTRACT_METADATA auto-detect contract: drop a sidecar
+        # JSON so the EXTRACT_METADATA step doesn't fall back to bogus TIFF
+        # tags when the user specifies `voxel_size.auto_detect = true`.
+        if voxel and voxel_emit_path:
+            voxel_emit_path.write_text(json.dumps(voxel))
+            print(f"  Wrote voxel size sidecar: {voxel_emit_path}")
+    finally:
+        f.close()
+
+
+def split_h5_per_timepoint(directory, channel_cfg):
+    '''Read a directory of per-timepoint / per-channel .h5 files
+    (Bio-Formats "split into timepoints" exporter convention:
+
+        <prefix>--C00--T00000.h5
+        <prefix>--C01--T00000.h5
+        ...
+
+    ) into one t####_Channel <c>.tif per timepoint.
+
+    We accept that the directory layout may include T##### indices for one
+    channel that do not exist for another (an embryo leaving the field of
+    view mid-acquisition). The on-disk truth wins: TPs without files for the
+    requested channel are simply skipped, with a warning.
+
+    This mode does NOT go through SPLIT_INPUT_FILE — the workflow globs the
+    .h5 files directly and feeds them into EXTRACT_METADATA → downstream
+    chain. Implemented here so we can pair the SPLIT_INPUT_FILE
+    single-file mode (.ims / data.h5) with the equivalently robust
+    per-timepoint fallback in one place.
+    '''
+    import h5py
+    import re
+
+    print(f"Reading per-timepoint HDF5 files in: {directory}")
+    pattern = re.compile(r'(?i)--C(\d{2,})--T(\d{4,5})\.h5?$')
+    by_t = {}
+    for p in sorted(Path(directory).iterdir()):
+        m = pattern.search(p.name)
+        if not m:
+            continue
+        c = int(m.group(1))
+        t = int(m.group(2))
+        by_t.setdefault(t, {})[c] = p
+
+    if not by_t:
+        raise RuntimeError(
+            f"No files matching '<prefix>--C##--T#####.h5' found in {directory}. "
+            f"If your data is one big .ims file, point `input.directory` at its "
+            f"parent directory and the pipeline will auto-detect it."
+        )
+
+    n_channels = max((max(cs.keys()) + 1) for cs in by_t.values())
+    channel, ch_idx = resolve_channel(n_channels, channel_cfg)
+    print(f"  Using channel {channel} of {n_channels}   ({len(by_t)} timepoint(s) with data)")
+
+    voxel_xy_um = voxel_z_um = None
+    voxel_source = None
+    # If one of the loaded files is actually a full Imaris dataset, take its
+    # voxel sizes from there; otherwise we let config.voxel_size override.
+    sample_h5 = next(iter(next(iter(by_t.values())).values()))
+    try:
+        with h5py.File(sample_h5, 'r') as h5:
+            layout = _discover_ims_layout(h5)
+            voxel = _read_ims_voxel_um(h5, layout)
+            if voxel:
+                voxel_xy_um = voxel['x_um']
+                voxel_z_um = voxel['z_um']
+                voxel_source = voxel['source']
+    except Exception as e:
+        # Layout discovery is allowed to fail on a per-timepoint file: they
+        # sometimes are a 3D slab for the (T, C) address only, not a 5D
+        # array. Fall through.
+        print(f"  (could not read voxel metadata from sample: {e})")
+
+    missing = [t for t, cs in by_t.items() if ch_idx not in cs]
+    if missing:
+        print(f"  WARNING: timepoints {missing[:5]}{' ...' if len(missing) > 5 else ''} "
+              f"have no C{channel} .h5 file — will be skipped.")
+
+    print(f"  Writing {len(by_t) - len(missing)} per-timepoint TIFF(s)...")
+    for t in sorted(by_t):
+        if ch_idx not in by_t[t]:
+            continue
+        with h5py.File(by_t[t][ch_idx], 'r') as h5:
+            # A per-timepoint file in Bio-Formats split mode is a 3D array
+            # Z,Y,X. Some exporters write 5D (1,1,Z,Y,X); handle both.
+            dsets = []
+            for k in ('Data', 'data', 'image'):
+                if k in h5 and isinstance(h5[k], h5py.Dataset):
+                    dsets.append(h5[k])
+                    break
+            if not dsets:
+                # Fall back to the first Dataset anywhere inside the file.
+                def _visit(name, obj):
+                    if isinstance(obj, h5py.Dataset):
+                        dsets.append(obj)
+                h5.visititems(_visit)
+            if not dsets:
+                print(f"WARNING: no dataset found in {by_t[t][ch_idx].name} — skipping t={t}",
+                      flush=True)
+                continue
+            arr = dsets[0][...]
+            if arr.ndim == 5:
+                arr = arr[0, 0, ...]  # squeeze (1, 1, Z, Y, X)
+            elif arr.ndim == 2:
+                arr = arr[None, ...]
+        save_timepoint(arr, t, channel, voxel_xy_um=voxel_xy_um, voxel_z_um=voxel_z_um)
+
+    if voxel_source and voxel_emit_path:
+        voxel_emit_path.write_text(json.dumps({
+            'x_um': voxel_xy_um, 'y_um': voxel_xy_um,
+            'z_um': voxel_z_um, 'source': f'{voxel_source} (sampled from per-TP file)',
+        }))
+    print("  Per-timepoint .h5 split complete.")
+
+
 try:
     if ext in ('.czi',):
         split_czi(input_file)
     elif ext in ('.tif', '.tiff'):
         split_tiff(input_file)
+    elif ext in ('.ims', '.h5', '.hdf5'):
+        split_ims(input_file)
     else:
         print(f"ERROR: Unsupported file extension: {ext}", file=sys.stderr)
         sys.exit(1)
@@ -1652,6 +2094,7 @@ process EXTRACT_METADATA {
     input:
     tuple val(timepoint), path(image_file)
     val was_cropped
+    path voxel_sidecar, optional: true  // emitted by SPLIT_INPUT_FILE on .ims / .h5 paths
 
     output:
     path "shared_metadata.json", emit: metadata
@@ -1724,6 +2167,25 @@ try:
 
     print(f"File exists, size: {Path(filename).stat().st_size} bytes", file=sys.stderr)
 
+    # Try the sidecar JSON first. SPLIT_INPUT_FILE writes
+    # `voxel_size.json` next to the per-timepoint TIFFs when the input
+    # was an Imaris .ims / HDF5 / per-timepoint .h5 file (which carry
+    # the real physical pixel sizes in their HDF5 metadata but produce
+    # TIFFs that we trust less, see repo-memory "voxel_metadata_handling").
+    # When the sidecar exists we trust it regardless of `auto_detect`,
+    # because a missing hand-set config.voxel_size would otherwise be
+    # silently overwritten with bogus TIFF defaults.
+    sidecar_voxel = {}
+    sidecar_path = Path('voxel_size.json')
+    if sidecar_path.exists():
+        try:
+            with sidecar_path.open('r') as _sf:
+                sidecar_voxel = json.load(_sf)
+            print(f"Read sidecar voxel sizes: {sidecar_voxel}", file=sys.stderr)
+        except Exception as _e:
+            print(f"WARN: voxel_size.json unreadable ({_e}); falling back to TIFF/config",
+                  file=sys.stderr)
+
     # Open TIFF without loading data
     print("Opening TIFF file...", file=sys.stderr)
     with tifffile.TiffFile(filename) as tif:
@@ -1743,40 +2205,57 @@ try:
         if auto_detect:
             print("Using AUTO-DETECT mode for voxel sizes", file=sys.stderr)
 
-            # ImageJ metadata for Z spacing
-            if tif.imagej_metadata:
-                print("Found ImageJ metadata", file=sys.stderr)
-                z_spacing = tif.imagej_metadata.get('spacing', 1.0)
-                unit = tif.imagej_metadata.get('unit', 'micron')
-                axes = tif.imagej_metadata.get('axes', 'ZYX')
-                slices = tif.imagej_metadata.get('slices', n_pages)
-            else:
-                print("No ImageJ metadata, using defaults", file=sys.stderr)
-                z_spacing = 1.0
-                unit = 'micron'
+            # Sidecar (Imaris / HDF5) preferred when present
+            if sidecar_voxel and all(k in sidecar_voxel for k in ('x_um', 'y_um', 'z_um')):
+                x_resolution_um = float(sidecar_voxel['x_um'])
+                y_resolution_um = float(sidecar_voxel['y_um'])
+                z_spacing = float(sidecar_voxel['z_um'])
+                unit = 'um'
                 axes = 'ZYX'
                 slices = n_pages
-
-            # TIFF tags for XY resolution
-            tags = first_page.tags
-            if 'XResolution' in tags:
-                x_num, x_denom = tags['XResolution'].value
-                x_resolution_um = x_denom / x_num if x_num != 0 else 1.0
+                src = sidecar_voxel.get('source', 'voxel_size.json (unknown source)')
+                metadata['voxel_size_source'] = f'sidecar_imaris ({src})'
+                print(f"Using sidecar voxel sizes: x={x_resolution_um}  y={y_resolution_um}  z={z_spacing} µm",
+                      file=sys.stderr)
             else:
-                x_resolution_um = 1.0
-                print("Warning: No XResolution tag found, using 1.0 µm", file=sys.stderr)
+                # ImageJ metadata for Z spacing
+                if tif.imagej_metadata:
+                    print("Found ImageJ metadata", file=sys.stderr)
+                    z_spacing = tif.imagej_metadata.get('spacing', 1.0)
+                    unit = tif.imagej_metadata.get('unit', 'micron')
+                    axes = tif.imagej_metadata.get('axes', 'ZYX')
+                    slices = tif.imagej_metadata.get('slices', n_pages)
+                else:
+                    print("No ImageJ metadata, using defaults", file=sys.stderr)
+                    z_spacing = 1.0
+                    unit = 'micron'
+                    axes = 'ZYX'
+                    slices = n_pages
 
-            if 'YResolution' in tags:
-                y_num, y_denom = tags['YResolution'].value
-                y_resolution_um = y_denom / y_num if y_num != 0 else 1.0
-            else:
-                y_resolution_um = 1.0
-                print("Warning: No YResolution tag found, using 1.0 µm", file=sys.stderr)
+                # TIFF tags for XY resolution
+                tags = first_page.tags
+                if 'XResolution' in tags:
+                    x_num, x_denom = tags['XResolution'].value
+                    x_resolution_um = x_denom / x_num if x_num != 0 else 1.0
+                else:
+                    x_resolution_um = 1.0
+                    print("Warning: No XResolution tag found, using 1.0 µm", file=sys.stderr)
 
-            metadata['voxel_size_source'] = 'auto_detected'
+                if 'YResolution' in tags:
+                    y_num, y_denom = tags['YResolution'].value
+                    y_resolution_um = y_denom / y_num if y_num != 0 else 1.0
+                else:
+                    y_resolution_um = 1.0
+                    print("Warning: No YResolution tag found, using 1.0 µm", file=sys.stderr)
+
+                metadata['voxel_size_source'] = 'auto_detected'
 
         else:
-            print("Using MANUAL mode for voxel sizes", file=sys.stderr)
+            # Manual mode — user-supplied voxel sizes ALWAYS win, even over
+            # the sidecar. The sidecar exists as a convenience when
+            # auto_detect=true; in manual mode the user has already told us
+            # what their microscope is set to and we don't second-guess.
+            print("Using MANUAL mode for voxel sizes (manual overrides sidecar)", file=sys.stderr)
             print(f"  X: {manual_x} µm", file=sys.stderr)
             print(f"  Y: {manual_y} µm", file=sys.stderr)
             print(f"  Z: {manual_z} µm", file=sys.stderr)
@@ -3592,14 +4071,19 @@ workflow {
         matched_files = []  // explicit override -> ignore per-timepoint files
         log.info "Using explicit input.file: ${hyperstack_input}"
     } else if (matched_files.isEmpty()) {
-        // Auto-detect: prefer .czi, then a single hyperstack .tif/.tiff
+        // Auto-detect: prefer .czi, then Imaris .ims / .h5, then a single
+        // hyperstack .tif/.tiff. .ims/.h5/.hdf5 are split via the same
+        // SPLIT_INPUT_FILE step as .czi.
         def czis = []
+        def ims = []
         def tifs = []
-        def cziMatcher  = FileSystems.getDefault().getPathMatcher("glob:*.{czi,CZI}")
-        def tifMatcher  = FileSystems.getDefault().getPathMatcher("glob:*.{tif,tiff,TIF,TIFF}")
+        def cziMatcher    = FileSystems.getDefault().getPathMatcher("glob:*.{czi,CZI}")
+        def imsMatcher    = FileSystems.getDefault().getPathMatcher("glob:*.{ims,IMS,h5,H5,hdf5,HDF5}")
+        def tifMatcher    = FileSystems.getDefault().getPathMatcher("glob:*.{tif,tiff,TIF,TIFF}")
         Files.list(input_dir_path).each { p ->
             def fname = p.getFileName()
-            if (cziMatcher.matches(fname)) czis.add(p.toFile())
+            if (cziMatcher.matches(fname))      czis.add(p.toFile())
+            else if (imsMatcher.matches(fname)) ims.add(p.toFile())
             else if (tifMatcher.matches(fname)) tifs.add(p.toFile())
         }
         if (czis.size() == 1) {
@@ -3607,6 +4091,11 @@ workflow {
             log.info "Auto-detected single CZI input: ${hyperstack_input.name}"
         } else if (czis.size() > 1) {
             error "Multiple .czi files found in ${params.input_dir}. Set input.file in config.json to choose one."
+        } else if (ims.size() == 1) {
+            hyperstack_input = ims[0]
+            log.info "Auto-detected single Imaris/HDF5 input: ${hyperstack_input.name}"
+        } else if (ims.size() > 1) {
+            error "Multiple .ims/.h5 files found in ${params.input_dir}. Set input.file in config.json to choose one. (For per-timepoint .h5 mode the files must match '<prefix>--C##--T#####.h5' to be auto-picked; if they don't, rename or set input.file explicitly.)"
         } else if (tifs.size() == 1) {
             hyperstack_input = tifs[0]
             log.info "Auto-detected single TIFF input (will check for hyperstack axes): ${hyperstack_input.name}"
@@ -3647,15 +4136,20 @@ workflow {
         // ---- Fallback: if no files match the expected naming convention,
         //      collect ALL .tif/.tiff files in the directory and assign
         //      timepoints based on whatever numeric info can be extracted
-        //      from the filenames (or alphabetical order as last resort). ----
+        //      from the filenames (or alphabetical order as last resort).
+        //      Per-timepoint Imaris / Bio-Formats exports named
+        //      "<prefix>--C##--T#####.h5" are now included for free, since
+        //      the workflow treats each .h5 as a single timepoint + channel
+        //      (h5py reads it inside EXTRACT_METADATA / downstream readers).
         def used_fallback = false
         if (matched_files.isEmpty()) {
-            log.warn "No files matching '${glob_pattern}' — falling back to all TIF files in ${params.input_dir}"
+            log.warn "No files matching '${glob_pattern}' — falling back to all TIF/H5 files in ${params.input_dir}"
             def tifMatcher  = FileSystems.getDefault().getPathMatcher("glob:*.tif")
             def tiffMatcher = FileSystems.getDefault().getPathMatcher("glob:*.tiff")
+            def h5Matcher   = FileSystems.getDefault().getPathMatcher("glob:*.{h5,H5,hdf5,HDF5}")
             Files.list(input_dir_path).each { p ->
                 def fname = p.getFileName()
-                if (tifMatcher.matches(fname) || tiffMatcher.matches(fname)) {
+                if (tifMatcher.matches(fname) || tiffMatcher.matches(fname) || h5Matcher.matches(fname)) {
                     matched_files.add(p.toFile())
                 }
             }
@@ -3663,18 +4157,19 @@ workflow {
         }
 
         if (matched_files.isEmpty()) {
-            error "No .tif/.tiff/.czi files found in: ${params.input_dir}"
+            error "No .tif/.tiff/.czi/.ims/.h5/.hdf5 files found in: ${params.input_dir}"
         }
 
-        log.info "Found ${matched_files.size()} files ${used_fallback ? '(fallback – all TIFs)' : 'matching pattern'} in: ${params.input_dir}"
+        log.info "Found ${matched_files.size()} files ${used_fallback ? '(fallback – all TIFs/HDF5s)' : 'matching pattern'} in: ${params.input_dir}"
 
         // --- Helper: extract a numeric timepoint from a filename ---
         // Tries several common patterns in order:
         //   1. t####_Channel  (original convention)
         //   2. t#### or T####  (e.g. t0000.tif, T012_decon.tif)
         //   3. tp#### or TP#### (e.g. tp001.tif)
-        //   4. _####. or -####. (trailing number before extension, e.g. embryo_001.tif)
-        //   5. Any digit run in the filename
+        //   4. <prefix>--T#####.h5 / --C##--T#####.h5   (Imaris / BF per-TP export)
+        //   5. _####. or -####. (trailing number before extension, e.g. embryo_001.tif)
+        //   6. Any digit run in the filename
         // Returns null if nothing numeric is found.
         def extractTimepoint = { String name ->
             def m
@@ -3687,10 +4182,15 @@ workflow {
             // Pattern 3: tp#### or TP####
             m = (name =~ /(?i)tp(\d+)/)
             if (m.find()) return m.group(1).toInteger()
-            // Pattern 4: trailing number before extension  e.g. img_001.tif
-            m = (name =~ /[_\-\s](\d+)\.[tT][iI][fF]{1,2}$/)
+            // Pattern 4: Bio-Formats --T##### / --C##--T##### export suffix.
+            // Bio-Formats uses double-dash separators; the T-index appears
+            // after one or more double-dash tokens (so <prefix>--C##--T##)
+            m = (name =~ /(?i)--[A-Za-z]*T(\d+)/)
             if (m.find()) return m.group(1).toInteger()
-            // Pattern 5: first digit run anywhere in the name
+            // Pattern 5: trailing number before extension  e.g. img_001.tif
+            m = (name =~ /[_\-\s](\d+)\.(?:[tT][iI][fF]{1,2}|[hH]5|[hH][dD][fF]5)$/)
+            if (m.find()) return m.group(1).toInteger()
+            // Pattern 6: first digit run anywhere in the name
             m = (name =~ /(\d+)/)
             if (m.find()) return m.group(1).toInteger()
             return null
@@ -3768,7 +4268,19 @@ workflow {
 
     // 1. Extract/Configure metadata from FIRST timepoint
     first_timepoint = processing_input.first()
-    EXTRACT_METADATA(first_timepoint, was_cropped)
+    // voxel_sidecar is only emitted by SPLIT_INPUT_FILE on the .ims / .h5
+    // path; if we did not take that branch there's no sidecar — `optional: true`
+    // on the EXTRACT_METADATA input means an empty channel is fine, and the
+    // script-internal `Path('voxel_size.json').exists()` check will simply
+    // skip the sidecar lookup.
+    if (params.input_file || hyperstack_input != null) {
+        voxel_sidecar_ch = SPLIT_INPUT_FILE.out.voxel_sidecar
+            .ifEmpty { [] }
+            .collect()
+    } else {
+        voxel_sidecar_ch = Channel.value([])
+    }
+    EXTRACT_METADATA(first_timepoint, was_cropped, voxel_sidecar_ch)
 
     // Share the same metadata with all timepoints
     shared_metadata = EXTRACT_METADATA.out.metadata

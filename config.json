@@ -1,5 +1,5 @@
 {
-  "_readme": "4D Nuclei tracking pipeline config. Most users only need to edit input.directory, output.directory, and toggle the *_enabled flags. Paths can be absolute or relative to the repo dir. Input accepts a folder of per-timepoint TIFFs (t0001_*.tif, t0002_*.tif, ...) or a single hyperstack file (.czi, .tif, .tiff).",
+  "_readme": "4D Nuclei tracking pipeline config. Most users only need to edit input.directory, output.directory, and toggle the *_enabled flags. Paths can be absolute or relative to the repo dir. Input accepts a folder of per-timepoint TIFFs (t0001_*.tif, t0002_*.tif, ...), a folder of per-timepoint / per-channel HDF5 (<prefix>--C##--T#####.h5), or a single hyperstack file (.czi, .tif, .tiff, .ims, .h5, .hdf5).",
   "pipeline": {
     "_comment": "Informational only.",
     "name": "4D Nuclei Pipeline",
@@ -8,9 +8,9 @@
     "institute": "IMP Vienna"
   },
   "input": {
-    "_comment_directory": "Folder = per-timepoint TIFFs named t0001_*.tif, ... File = single hyperstack (.czi, .tif, .tiff).",
+    "_comment_directory": "Accepts either a folder of per-timepoint TIFFs named t0001_*.tif,...; a folder of Bio-Formats per-timepoint HDF5 named <prefix>--C##--T#####.h5; or a single hyperstack file (.czi, .tif, .tiff, .ims, .h5, .hdf5). See README section 1.3.",
     "directory": "/absolute/path/to/your/input",
-    "_comment_channel": "1-based channel index. Ignored for folder inputs (channel is in the filename).",
+    "_comment_channel": "1-based channel index. Ignored for folder inputs (channel is in the filename or --C## suffix).",
     "channel": 2,
     "_comment_max_timepoints": "Optional. Only process the first N timepoints. null = use all.",
     "max_timepoints": null
