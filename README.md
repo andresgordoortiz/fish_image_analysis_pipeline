@@ -7,7 +7,7 @@ A Nextflow pipeline for lightsheet (SPIM) microscopy: modular preprocessing (XY 
 This README has two parts:
 
 1. Run the pipeline on the SLURM **HPC**.
-2. Visualise results with `ultrack_viewer` on the **HIVE** workstation.
+2. Visualise results with `ultrack_viewer` on the **GPU-1** server.
 
 ---
 
@@ -15,8 +15,8 @@ This README has two parts:
 
 ```bash
 # 1. Login: ssh cbe.vbc.ac.at  →  mkdir -p /scratch-cbe/users/$USER && cd /scratch-cbe/users/$USER
-git clone https://github.com/andresgordoortiz/spim_preprocessing.git
-cd spim_preprocessing
+git clone https://github.com/andresgordoortiz/fish_image_analysis_pipeline.git
+cd fish_image_analysis_pipeline
 
 # 2. Edit config.json — at minimum set input.directory, output.directory.
 #    Containers, Gurobi licence, Seqera token: see § 1.5, § 1.6, § 1.4.
@@ -110,7 +110,10 @@ Override order (highest priority first): `config.json` `system.*` key → `$SPIM
 **Get a free WLS Academic licence** (renews every 90 days):
 
 1. Create a Gurobi account with your **institutional email** (academic only — gmail/outlook/yahoo are rejected).
-2. Sign in → **Licenses → Request** → **ACADEMIC → WLS → GENERATE NOW!**.
+2. Sign in → **Licenses → Request** → **ACADEMIC → WLS → GENERATE NOW!**
+
+   ![WLS Academic licence request page](docs/images/gurobi_wls_academic_request.png)
+
 3. Download `gurobi.lic`. Set a calendar reminder to renew before expiry.
 
 **Install on the cluster:**
@@ -192,28 +195,24 @@ Output: `01b_raw_isotropic/<name>_raw_iso_Channel*.tif` (and the merged `4D_hype
 
 ---
 
-## Part 2 · Visualise results with `ultrack_viewer` (HIVE)
+## Part 2 · Visualise results with `ultrack_viewer` (GPU-1)
 
-`ultrack_viewer.py` is a napari GUI for browsing the processed volume, segmentation labels, and tracks side-by-side.
+`ultrack_viewer.py` is a napari GUI for browsing the processed volume, segmentation labels, and tracks side-by-side. Run it on the **GPU-1** server (GPU-2 is currently not configured for this viewer).
 
 ### 2.1 Create the conda env (once)
 
-Open PowerShell on the HIVE and run:
+SSH / RDP into the GPU-1 server and run:
 
-```powershell
-cd path\to\spim_preprocessing
+```bash
+cd path/to/fish_image_analysis_pipeline
 mamba env create -f ultrack_viewer_env.yml
 mamba activate ultrack-viewer
 ```
 
 ### 2.2 Reach your results
 
-- HIVE local disk → `cd <path>`.
-- Still on `/groups/pinheiro/...` → the HIVE sees it as `V:`:
-
-  ```powershell
-  V: ; cd V:\path\to\my_experiment
-  ```
+- Local disk on GPU-1 → `cd <path>`.
+- Still on `/groups/pinheiro/...` → mount or `sshfs` the share, or copy the folder over.
 
 ### 2.3 Launch the viewer
 
@@ -237,9 +236,11 @@ python ultrack_viewer.py `
 
 Both volumes share the same voxel geometry, so `--processed` works against either file. Useful flags:
 
-- `--preload` — whole `segments.zarr` in RAM; much smoother scrubbing. Only if HIVE has enough RAM.
+- `--preload` — whole `segments.zarr` in RAM; much smoother scrubbing. Only if the GPU-1 server has enough RAM.
 - `--load_downsample 2` — keep volume in RAM at half res (8× less RAM, recommended for big datasets).
 - `--downsample 2` — display-only downsample (full-res in RAM).
+
+> **Server note.** The viewer currently runs on **GPU-1 only** — GPU-2 is not configured for it, so do not attempt to launch it from GPU-2.
 
 > Paths with spaces: wrap in double quotes, e.g. `--tracks "03_tracking\results\my tracks.csv"`.
 
