@@ -160,26 +160,75 @@ if [ ! -f "$GRB_LICENSE_FILE" ]; then
     echo "         See README section 'Gurobi licence' for instructions."
 fi
 
-# Check that container was pre-pulled (compute nodes often can't access internet)
+# Container paths. Pull any user-supplied overrides from config.json
+# (same grep+sed pattern as the Tower token and Gurobi licence above).
+# Priority: config.* key (highest) -> CONTAINERS_DIR fallback.
+# See README section "Container images" for how to pre-pull a container.
+USER_CONTAINER_PATH=""
+USER_FIJI_PATH=""
+USER_ULTRACK_PATH=""
+CI_LINE=$(grep -o '"container_image"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_JSON" 2>/dev/null || true)
+if [ -n "$CI_LINE" ]; then
+    USER_CONTAINER_PATH=$(echo "$CI_LINE" | sed 's/.*: *"\([^"]*\)"/\1/')
+fi
+FIJI_LINE=$(grep -o '"fiji_container_image"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_JSON" 2>/dev/null || true)
+if [ -n "$FIJI_LINE" ]; then
+    USER_FIJI_PATH=$(echo "$FIJI_LINE" | sed 's/.*: *"\([^"]*\)"/\1/')
+fi
+ULINE=$(grep -o '"ultrack_container"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_JSON" 2>/dev/null || true)
+if [ -n "$ULINE" ]; then
+    USER_ULTRACK_PATH=$(echo "$ULINE" | sed 's/.*: *"\([^"]*\)"/\1/')
+fi
+
+# Default locations (the maintainer's shared folder).
 CONTAINER_BASENAME="andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img"
-CONTAINER_SIF="$CACHE_DIR/$CONTAINER_BASENAME"
+DEFAULT_CONTAINER_SIF="$CONTAINERS_DIR/$CONTAINER_BASENAME"
+DEFAULT_ULTRACK_SIF="$CONTAINERS_DIR/ultrack.sif"
+
+# Resolve final paths: user-supplied override wins, otherwise shared default.
+if [ -n "$USER_CONTAINER_PATH" ]; then
+    CONTAINER_SIF="$USER_CONTAINER_PATH"
+else
+    CONTAINER_SIF="$DEFAULT_CONTAINER_SIF"
+fi
+if [ -n "$USER_ULTRACK_PATH" ]; then
+    ULTRACK_SIF="$USER_ULTRACK_PATH"
+else
+    ULTRACK_SIF="$DEFAULT_ULTRACK_SIF"
+fi
+
+# Export so nextflow.config can resolve them via System.getenv() at parse time.
+export SPIM_PIPELINE_CONTAINER="$CONTAINER_SIF"
+export SPIM_ULTRACK_CONTAINER="$ULTRACK_SIF"
+if [ -n "$USER_FIJI_PATH" ]; then
+    export SPIM_FIJI_CONTAINER="$USER_FIJI_PATH"
+fi
+
+# Check that the pipeline container exists at the resolved path.
+# Compute nodes usually have no internet, so apptainer cannot pull on demand.
 if [ ! -f "$CONTAINER_SIF" ]; then
     echo ""
-    echo "ERROR: Container image not found in shared containers folder!"
+    echo "ERROR: Container image not found!"
     echo "  Expected: $CONTAINER_SIF"
+    if [ "$CONTAINER_SIF" = "$DEFAULT_CONTAINER_SIF" ]; then
+        echo "  (using the maintainer's shared CONTAINERS_DIR fallback)"
+    else
+        echo "  (this is the path set in config.system.container_image)"
+    fi
     echo ""
-    echo "Ask the maintainer to (re-)populate $CONTAINERS_DIR, or run"
-    echo "  ./setup_container.sh   from the login node to repull."
+    echo "Either pre-pull the container to this path, update config.system.container_image"
+    echo "in your config.json, or ask the maintainer to repopulate $CONTAINERS_DIR"
+    echo "(./setup_container.sh from the login node will repull)."
     echo ""
     exit 1
 fi
 
-ULTRACK_SIF="$CONTAINERS_DIR/ultrack.sif"
 if [ ! -f "$ULTRACK_SIF" ]; then
     echo "WARNING: ultrack container not found at $ULTRACK_SIF (tracking will fail if enabled)"
 fi
 
-echo "Container: $CONTAINER_SIF (cached)"
+echo "Container : $CONTAINER_SIF (cached)"
+echo "Ultrack   : $ULTRACK_SIF"
 
 # Print summary
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)

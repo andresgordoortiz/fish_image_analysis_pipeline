@@ -147,18 +147,34 @@ params.input_dir   = _raw_input_dir
 params.output_dir  = file(sanitizePath(config.output.directory)).toAbsolutePath().toString()
 params.channel     = config.input?.channel ?: 0  // 0 = auto-detect (required when file has only 1 channel)
 params.input_file  = _raw_input_file
-// Container images are ALWAYS taken from nextflow.config (shared long-term
-// folder on the cluster). Any container_image / fiji_container_image /
-// ultrack_container values in config.json are intentionally ignored so every
-// run uses the same pre-pulled images.
-if (config.system?.container_image && config.system.container_image != params.container) {
-    log.warn "Ignoring config.system.container_image (${config.system.container_image}) — using hardcoded ${params.container}"
+// Container image paths. Override order (highest priority first):
+//   1. config.system.container_image, config.system.fiji_container_image,
+//      config.system.ultrack_container (absolute path or URI).
+//   2. $SPIM_PIPELINE_CONTAINER / $SPIM_FIJI_CONTAINER /
+//      $SPIM_ULTRACK_CONTAINER environment variables (exported by
+//      submit_pipeline.sh from the config keys above, or set directly
+//      when invoking 'nextflow run' without the orchestrator).
+//   3. Hardcoded fallback in nextflow.config.
+// The previous version warned and ignored config.json, which forced every
+// user onto the maintainer's shared CONTAINERS_DIR. With the maintainer
+// leaving the lab, that breaks the moment the shared folder disappears.
+if (config.system?.container_image) {
+    log.info "Using pipeline container from config.system.container_image = ${config.system.container_image}"
+    params.container = config.system.container_image
+} else {
+    log.info "Using default pipeline container = ${params.container} (override via config.system.container_image or \$SPIM_PIPELINE_CONTAINER)"
 }
-if (config.system?.fiji_container_image && config.system.fiji_container_image != params.fiji_container) {
-    log.warn "Ignoring config.system.fiji_container_image (${config.system.fiji_container_image}) — using hardcoded ${params.fiji_container}"
+if (config.system?.fiji_container_image) {
+    log.info "Using Fiji container from config.system.fiji_container_image = ${config.system.fiji_container_image}"
+    params.fiji_container = config.system.fiji_container_image
 }
-if (config.tracking?.ultrack_container && config.tracking.ultrack_container != params.ultrack_container) {
-    log.warn "Ignoring config.tracking.ultrack_container (${config.tracking.ultrack_container}) — using hardcoded ${params.ultrack_container}"
+if (config.system?.ultrack_container) {
+    log.info "Using ultrack container from config.system.ultrack_container = ${config.system.ultrack_container}"
+    params.ultrack_container = config.system.ultrack_container
+} else if (config.tracking?.ultrack_container) {
+    // Backwards compatibility: legacy key lived under tracking.*.
+    log.info "Using ultrack container from config.tracking.ultrack_container = ${config.tracking.ultrack_container}"
+    params.ultrack_container = config.tracking.ultrack_container
 }
 
 def input_dir_file = file(params.input_dir)

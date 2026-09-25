@@ -118,8 +118,12 @@
   },
   "system": {
     "_comment": "Container images and resume behaviour. Most users never need to touch this.",
-    "container_image": "library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559",
+    "_comment_container_image": "Absolute path to the pre-pulled Apptainer/Singularity container (.img or .sif) used by every pipeline step. REQUIRED: the .img/.sif must already exist at this path on the cluster — compute nodes usually have no internet. Override this with the location of your own copy. See README 'Container images' for how to pre-pull a container.",
+    "container_image": "/groups/pinheiro/user/andres.gordo/containers_licences/andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img",
+    "_comment_fiji_container_image": "URI or absolute path to the Fiji container (used by CROP_WITH_ROI and any Fiji-based steps). Default is a docker:// URI which Nextflow will try to pull on first use — works only if your compute nodes can reach Docker Hub. Pre-pull a Fiji .sif to a shared path and override this with the absolute path if not.",
     "fiji_container_image": "docker://fiji/fiji:20220415",
+    "_comment_ultrack_container": "Absolute path to the pre-pulled ultrack container. Required if tracking.enabled=true. Override this if you maintain your own copy.",
+    "ultrack_container": "/groups/pinheiro/user/andres.gordo/containers_licences/ultrack.sif",
     "profile": "standard",
     "_comment_resume": "true = reuse finished tasks on re-submission. false = force a clean re-run.",
     "resume": true,

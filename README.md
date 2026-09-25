@@ -97,7 +97,87 @@ Toggles to control what runs (set to `true` / `false`):
 
 **Seqera token (optional but recommended).** Create a free account at [tower.nf](https://tower.nf), go to **Settings → Your tokens**, generate a token, and paste it into `seqera_tower.access_token`. This lets you watch the run live in the browser under **Runs**.
 
-### 1.5 Gurobi licence (required for tracking)
+### 1.5 Container images
+
+Every pipeline step runs inside an Apptainer/Singularity container. The
+pipeline expects three pre-pulled images on a shared filesystem that all
+compute nodes can read:
+
+| Container | Default path | Used by |
+| --- | --- | --- |
+| `container_image` (main pipeline) | `/groups/pinheiro/user/andres.gordo/containers_licences/andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img` | every process (`PLANAR_CORRECTION`, `DEPTH_CORRECTION`, `ISOTROPIC`, `DOWNSCALE_XY`, `CELLPOSE_SEGMENT`, `MERGE_HYPERSTACKS`, `PREP_ULTRACK`, `EXTRACT_METADATA`, `SPLIT_INPUT_FILE`, `RESLICE_ISOTROPIC`, `EXPORT_RAW_ISOTROPIC`, `CROP_WITH_ROI`) |
+| `fiji_container_image` (Fiji) | `docker://fiji/fiji:20220415` | `CROP_WITH_ROI` (and any future Fiji-based step) |
+| `ultrack_container` | `/groups/pinheiro/user/andres.gordo/containers_licences/ultrack.sif` | `PREP_ULTRACK`, `ULTRACK_SEGMENT`, `ULTRACK_LINK`, `ULTRACK_SOLVE`, `ULTRACK_EXPORT` |
+
+#### Why a local copy is required
+
+Cluster compute nodes almost never have internet access, so Apptainer cannot
+pull images on demand — the `.img` / `.sif` has to live on a shared filesystem
+that every node can mount. The defaults above point at the original maintainer's
+shared folder (`/groups/pinheiro/user/andres.gordo/containers_licences/`).
+That folder will become inaccessible the moment the maintainer leaves the
+lab, so every user should plan to maintain their own copy.
+
+#### Point the pipeline at your own copy
+
+The pipeline reads each container path from `config.json` under the `system`
+block (overridable in two more ways for advanced usage):
+
+```json
+{
+  "system": {
+    "container_image":       "/groups/<your-area>/<your-user>/containers/spim_pipeline.sif",
+    "fiji_container_image":  "/groups/<your-area>/<your-user>/containers/fiji.sif",
+    "ultrack_container":     "/groups/<your-area>/<your-user>/containers/ultrack.sif"
+  }
+}
+```
+
+Override order (highest priority first):
+
+| Priority | Source | When to use it |
+| --- | --- | --- |
+| 1 | `system.container_image` / `system.fiji_container_image` / `system.ultrack_container` in `config.json` | **Recommended.** Same file as the rest of your run settings. |
+| 2 | `$SPIM_PIPELINE_CONTAINER` / `$SPIM_FIJI_CONTAINER` / `$SPIM_ULTRACK_CONTAINER` env var | Useful when launching `nextflow run` directly without `submit_pipeline.sh`. |
+| 3 | Hardcoded fallback in `nextflow.config` | The maintainer's shared path — last-resort default, may not exist after handover. |
+
+#### Pre-pull a container to your own folder
+
+Log in to the cluster and pull the image with Apptainer (needs internet on the
+login node only). Use the same URIs the pipeline hardcodes as a fallback so
+your copy is bit-identical:
+
+```bash
+mkdir -p /groups/<your-area>/<your-user>/containers
+cd /groups/<your-area>/<your-user>/containers
+
+# Main pipeline container (used by every step)
+apptainer pull \
+  --name spim_pipeline.sif \
+  library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559
+
+# Fiji (only needed if you use CROP_WITH_ROI)
+apptainer pull --name fiji.sif docker://fiji/fiji:20220415
+
+# Ultrack (only needed if tracking.enabled = true)
+apptainer pull --name ultrack.sif docker://qbiotumber/ultrack:latest
+```
+
+Then update `config.json` as shown above to point at the new paths.
+
+> **Fiji note.** The default `fiji_container_image` is a `docker://` URI, which
+> only works if compute nodes can reach Docker Hub. On air-gapped clusters,
+> pre-pull a `.sif` and override with the absolute path (same pattern as the
+> other two containers above).
+
+`submit_pipeline.sh` checks that the file at each configured path exists
+before launching the pipeline and exits with a clear error if any of them is
+missing. The pipeline itself prints an `INFO` line at launch time telling you
+which path it picked.
+
+---
+
+### 1.6 Gurobi licence (required for tracking)
 
 The cell-tracking step (`ULTRACK_SOLVE`) uses **Gurobi** as its ILP solver, so a
 valid Gurobi licence file must be present on the cluster before any run with
@@ -183,7 +263,7 @@ a `WARNING` and continues — segmentation and 4D merging still run, but
 
 ---
 
-### 1.6 Submit the pipeline
+### 1.7 Submit the pipeline
 
 ```bash
 sbatch submit_pipeline.sh config.json
@@ -198,7 +278,7 @@ That is it. The script:
 
 If `config.json` or your input path contains spaces, just keep them as plain spaces — `submit_pipeline.sh` handles sanitisation.
 
-### 1.7 Monitor the run
+### 1.8 Monitor the run
 
 | Where | What to look at |
 | --- | --- |
@@ -215,7 +295,7 @@ sbatch submit_pipeline.sh config.json
 
 Set `system.resume = false` in `config.json` if you want a clean re-run.
 
-### 1.8 Output structure
+### 1.9 Output structure
 
 After the run completes, your `output.directory` will look like:
 
@@ -242,7 +322,7 @@ my_experiment/
 └── pipeline_<date>.log    # the full Nextflow log
 ```
 
-### 1.8 Move the results to the main server (when done)
+### 1.10 Move the results to the main server (when done)
 
 Once you are happy with the run, copy the output out of scratch and into the main server storage so the team can access it:
 
@@ -254,7 +334,7 @@ rsync -avh --progress \
 
 `/groups/pinheiro/user/` is the main server; it is backed up and shared. **Don't run pipeline jobs from there** — that is what scratch is for. Only move finished results back.
 
-### 1.9 Overlay tracks on the **RAW** signal (`raw_export`)
+### 1.11 Overlay tracks on the **RAW** signal (`raw_export`)
 
 The preprocessed chain (`01_preprocessed/`) applies shading correction
 (planar) + Z intensity correction (depth) + isotropic resampling.
@@ -479,7 +559,7 @@ TIFFs.
 
 **Pipeline fails immediately with "Input path does not exist".** Check the path in `config.json`. Use `ls` from the login node to confirm. Remember: no backslash-escaped spaces in JSON strings.
 
-**Container not found error.** The pre-pulled container lives at `/groups/pinheiro/user/andres.gordo/containers_licences/`. If it is missing, ask Andrés to repopulate it, or run `./setup_container.sh` from the login node (needs internet, ~30 min).
+**Container not found error.** Either the pre-pulled container is missing from `system.container_image` (see [§ 1.5](#15-container-images)), or it has been deleted from the default location. Pre-pull your own copy (the [§ 1.5](#15-container-images) section has the `apptainer pull` commands) and update the path in `config.json`, or run `./setup_container.sh` from the login node to repopulate the maintainer's shared folder (needs internet, ~30 min).
 
 **Tracking fails but everything else works.** Check the Gurobi licence (see [§ 1.5](#15-gurobi-licence-required-for-tracking)) — most often the `.lic` is missing, the path in `system.gurobi_license_path` is wrong, or it has expired (WLS Academic is 90 days). Also confirm `segmentation.enabled = true` (tracking consumes the segmentation labels).
 
