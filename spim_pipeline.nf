@@ -880,8 +880,6 @@ except Exception as e:
 
 print("Split complete.")
 PYTHON_SPLIT_SCRIPT
-        exit 1
-    fi
     """
 }
 
