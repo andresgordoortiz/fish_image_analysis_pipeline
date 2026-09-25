@@ -491,7 +491,12 @@ process SPLIT_INPUT_FILE {
     output:
     path "t*_Channel*.tif", emit: timepoints
     path "split_input.log", emit: log
-    path "voxel_size.json", emit: voxel_sidecar, optional: true
+    // Nextflow 25.04.7: a bare `path "voxel_size.json"` would be a
+    // FileInParam (input-only, can't be optional). Wrap in a glob so
+    // it becomes FileOutParam and supports `optional: true`; the bash
+    // wrapper always produces exactly one `voxel_size.json` even when
+    // no Imaris voxel metadata was recovered (touched empty file).
+    path "voxel_size*.json", emit: voxel_sidecar, optional: true
 
     script:
     def filename = input_file.name
