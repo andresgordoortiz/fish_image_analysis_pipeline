@@ -1565,160 +1565,20 @@ process EXPORT_RAW_ISOTROPIC {
     eval "\$(micromamba shell hook --shell bash)"
     micromamba activate microscopy_env
 
-    python3 << 'PYTHON_EOF'
-import json
-import re as _re
-import numpy as np
-import tifffile
-from skimage.transform import rescale
-
-with open('${metadata_json}', 'r') as f:
-    metadata = json.load(f)
-
-xy_pixel_in = float(metadata['x_resolution_um'])
-z_pixel_in  = float(metadata['imagej']['spacing']) if 'imagej' in metadata else 1.0
-scale = float(${scale_factor_py})
-do_iso = (${reslice_py} == 'True')
-
-# ── Loud diagnostics so workflow-binding mismatches surface in the log ──
-# Note: reslice_py is the rendered Python literal ('True' or 'False'), so
-# we wrap it in repr() instead of single quotes for the diagnostic print.
-print(f"[DIAG] raw_export scale={scale}  do_iso={do_iso}  (reslice_py={${reslice_py}}!r)")
-print(f"[DIAG] metadata x_res={xy_pixel_in}  z_spacing={z_pixel_in}  "
-      f"isotropic→x_res={xy_pixel_in/scale:.4f}  zoom_z={z_pixel_in/(xy_pixel_in/scale):.4f}")
-
-if not (0.0 < scale <= 1.0):
-    raise SystemExit(f"scale_factor must satisfy 0 < scale <= 1, got {scale}")
-
-img = tifffile.imread('${filename}')
-if img.ndim != 3:
-    raise SystemExit(f"Expected 3D ZYX input, got shape {img.shape}")
-print(f"Input  shape: {img.shape}, dtype: {img.dtype}, scale={scale}")
-
-# IMPORTANT: do NOT apply CLAHE/normalisation here — this is RAW export.
-# Only the geometric ops (XY cubic rescale + isotropic Z resample) so the
-# viewer can register tracks against the original signal.
-out = rescale(img, (1.0, scale, scale), order=3,
-              preserve_range=True, anti_aliasing=True)
-x_res = xy_pixel_in / scale
-y_res = float(metadata['y_resolution_um']) / scale
-print(f"After XY rescale: {out.shape}  X/Y pixel size -> {x_res:.4f} x {y_res:.4f} µm")
-
-if do_iso:
-    zoom_z = z_pixel_in / x_res
-    if abs(zoom_z - 1.0) < 1e-3:
-        print("Z already isotropic, skipping.")
-    else:
-        # Use skimage.transform.resize (same as the preprocessed chain)
-        # so the Z expansion matches the preprocessed output exactly.
-        # Pin the output shape so the documented Z expansion is guaranteed
-        # regardless of any rounding ambiguity in the float zoom factor.
-        expected_z = int(round(out.shape[0] * zoom_z))
-        from skimage.transform import resize as sk_resize
-        out = sk_resize(
-            out,
-            (expected_z, out.shape[1], out.shape[2]),
-            order=1,
-            mode="constant",
-            anti_aliasing=False,
-            preserve_range=True,
-        )
-        print(f"Isotropic Z reslice: expected={expected_z} (zoom_z={zoom_z:.4f}, got shape={out.shape})")
-        # Hard sanity check — fail loudly if the volume is wrong so
-        # the bug surfaces in the log instead of silently producing a
-        # mis-aligned volume.
-        assert out.shape[0] == expected_z, (
-            f"Z resample failed: expected {expected_z} planes, got {out.shape[0]}"
-        )
-
-if out.dtype != np.uint16:
-    out = np.clip(out.astype(np.int32), 0, 65535).astype(np.uint16)
-
-# No backslashes — see note in RESLICE_ISOTROPIC above
-channel = '1'
-_idx = '${filename}'.find('_Channel ')
-if _idx >= 0:
-    _rest = '${filename}'[_idx + len('_Channel '):]
-    _digits = ''
-    for _ch in _rest:
-        if _ch.isdigit():
-            _digits += _ch
-        else:
-            break
-    if _digits:
-        channel = _digits
-out_name = f"t${t_formatted}_raw_iso_Channel {channel}.tif"
-
-tifffile.imwrite(
-    out_name,
-    out,
-    imagej=True,
-    resolution=(1.0/x_res, 1.0/y_res),
-    # IMPORTANT: compression='zlib' so the Compression TIFF tag (259)
-    # is 8 for every per-timepoint TIFF. Without this, tifffile defaults
-    # to no compression (Compression=1), and Fiji's Merge Channels /
-    # Concatenate dialogs refuse to combine files with different
-    # compression codes (misleading 'different bit depth' error).
-    # Verified on 2026-09-09: dscale + segmented had Compression=8
-    # (zlib via bin/_tiff_io.write_tiff default), but raw_iso had
-    # Compression=1 because the heredoc didn't pass compression=.
-    compression='zlib',
-    metadata={
-        'spacing': z_pixel_in if not do_iso else x_res,
-        'unit': 'um',
-        'axes': 'ZYX',
-        # IMPORTANT: declare channels=1 so Fiji's Merge Channels and
-        # Concatenate dialogs treat this as a single-channel Z-stack.
-        # Without this, Fiji refuses to combine with other stacks.
-        'channels': 1,
-        # Bypass the XResolution/YResolution ResolutionUnit ambiguity
-        # across tifffile versions (2024.6.18 vs 2026.x write the same
-        # `resolution=(...)` kwarg differently). bin/_tiff_io.read_tiff()
-        # reads these directly from tf.imagej_metadata on the reader side.
-        'x_resolution_um': x_res,
-        'y_resolution_um': y_res,
-    },
-)
-# Stash the per-timepoint bookkeeping tags on top of the ImageJ block
-# that tifffile.imwrite just produced, using the SAME r+ overwrite
-# pattern DOWNSCALE_XY and CELLPOSE_SEGMENT use.
-#
-# IMPORTANT: tifffile.imwrite's `metadata={...}` kwarg lowercases ALL
-# keys when building the ImageDescription text (verified: passing
-# {'TimePoint': 287} produces 'timepoint=287' in the file). That made
-# EXPORT_RAW_ISOTROPIC outputs inconsistent with DOWNSCALE_XY /
-# CELLPOSE_SEGMENT outputs (which use TitleCase via r+ overwrite),
-# breaking Fiji's Concatenate / Merge Channels dialogs with a
-# misleading 'bit depth mismatch' error.
-#
-# Use chr(10) for newlines (no backslash-n literals in heredocs;
-# see repo memory 2026-09-09).
-import os as _os_raw
-_NL_RAW = _os_raw.linesep
-_tp_int_raw = ${timepoint}
-_tp_str_raw = str(_tp_int_raw)
-_was_roi_raw = str(metadata.get('was_roi_cropped', False)).lower()
-_do_iso_str_raw = str(bool(do_iso)).lower()
-_scale_str_raw = str(scale)
-extra_tags_raw = (
-    _NL_RAW + 'TimePoint=' + _tp_str_raw +
-    _NL_RAW + 'WasROICropped=' + _was_roi_raw +
-    _NL_RAW + 'RawExported=True' +
-    _NL_RAW + 'ScalingFactor=' + _scale_str_raw +
-    _NL_RAW + 'IsotropicResliced=' + _do_iso_str_raw +
-    _NL_RAW + 'PipelineStage=raw_export'
-)
-with tifffile.TiffFile(out_name, mode='r+') as tf:
-    page = tf.pages[0]
-    tag = page.tags.get('ImageDescription')
-    if tag is not None:
-        current_desc = (tag.value.decode('latin-1', errors='replace')
-                        if isinstance(tag.value, bytes) else (tag.value or ''))
-        new_desc = current_desc.rstrip(_NL_RAW) + extra_tags_raw + _NL_RAW
-        tag.overwrite(new_desc.encode('latin-1', errors='replace'))
-
-print(f"Wrote {out_name}")
-PYTHON_EOF
+    # The actual scaling logic lives in bin/_raw_iso_io.py (extracted
+    # from an earlier heredoc that embedded literal double-quote
+    # characters in `imagej=True`, `mode="constant"`,
+    # `decode('latin-1', errors='replace')` etc -- those tripped
+    # Groovy's GString parser at the embedded `?"` sequence.
+    # See script_block_gstring_escaping.md rounds 5 and 8.
+    cp "\${workflow.projectDir}/bin/_raw_iso_io.py" _raw_iso_io.py
+    python3 _raw_iso_io.py export \\
+        "${filename}" \\
+        "t${t_formatted}_raw_iso_Channel \$(echo "${filename}" | sed -nE 's/.*_Channel[ ]([0-9]+)\\.tif/\\1/p').tif" \\
+        "${metadata_json}" \\
+        --scale ${scale_factor_py} \\
+        --do-iso ${reslice_py} \\
+        --timepoint ${timepoint}
     """
 }
 
