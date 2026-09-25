@@ -2598,18 +2598,18 @@ process MERGE_HYPERSTACKS {
     path raw_iso_files
 
     output:
-    path "4D_hyperstack_processed.tif",     emit: processed_tif, optional: true
-    path "4D_hyperstack_processed_metadata.json", emit: processed_meta, optional: true
-    path "4D_hyperstack_processed.h5",      emit: processed_h5,  optional: true
-    path "4D_hyperstack_processed.xml",     emit: processed_xml, optional: true
-    path "4D_hyperstack_segmented.tif",     emit: segmented_tif, optional: true
-    path "4D_hyperstack_segmented_metadata.json", emit: segmented_meta, optional: true
-    path "4D_hyperstack_segmented.h5",      emit: segmented_h5,  optional: true
-    path "4D_hyperstack_segmented.xml",     emit: segmented_xml, optional: true
-    path "4D_hyperstack_raw_iso.tif",       emit: raw_iso_tif,   optional: true
-    path "4D_hyperstack_raw_iso_metadata.json", emit: raw_iso_meta, optional: true
-    path "4D_hyperstack_raw_iso.h5",        emit: raw_iso_h5,    optional: true
-    path "4D_hyperstack_raw_iso.xml",       emit: raw_iso_xml,   optional: true
+    path "4D_hyperstack_processed*.tif",            emit: processed_tif, optional: true
+    path "4D_hyperstack_processed*_metadata.json",  emit: processed_meta, optional: true
+    path "4D_hyperstack_processed*.h5",             emit: processed_h5,  optional: true
+    path "4D_hyperstack_processed*.xml",            emit: processed_xml, optional: true
+    path "4D_hyperstack_segmented*.tif",            emit: segmented_tif, optional: true
+    path "4D_hyperstack_segmented*_metadata.json",  emit: segmented_meta, optional: true
+    path "4D_hyperstack_segmented*.h5",             emit: segmented_h5,  optional: true
+    path "4D_hyperstack_segmented*.xml",            emit: segmented_xml, optional: true
+    path "4D_hyperstack_raw_iso*.tif",              emit: raw_iso_tif,   optional: true
+    path "4D_hyperstack_raw_iso*_metadata.json",    emit: raw_iso_meta, optional: true
+    path "4D_hyperstack_raw_iso*.h5",               emit: raw_iso_h5,    optional: true
+    path "4D_hyperstack_raw_iso*.xml",              emit: raw_iso_xml,   optional: true
 
     container params.container
 
@@ -3207,9 +3207,9 @@ process BENCHMARK {
     path benchmark_script
 
     output:
-    path "benchmark_results.csv", emit: csv, optional: true
-    path "benchmark_results.json", emit: json, optional: true
-    path "benchmark.log", emit: log, optional: true
+    path "benchmark_results*.csv", emit: csv, optional: true
+    path "benchmark_results*.json", emit: json, optional: true
+    path "benchmark*.log", emit: log, optional: true
 
     script:
     def n_staged_proc = (processed_staged instanceof List) ? processed_staged.size() : (processed_staged ? 1 : 0)
