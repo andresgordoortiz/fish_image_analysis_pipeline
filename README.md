@@ -1,433 +1,232 @@
 # SPIM 4D Image Processing Pipeline
 
-A Nextflow pipeline for lightsheet (SPIM) microscopy data: modular preprocessing (XY shading + Z intensity correction + isotropic resampling), segmentation with Cellpose, cell tracking with **ultrack**, and merging into 4D stacks you can open in the `ultrack_viewer` GUI.
+A Nextflow pipeline for lightsheet (SPIM) microscopy: modular preprocessing (XY shading + Z intensity + isotropic resampling), Cellpose segmentation, **ultrack** cell tracking, and 4D stacks that load into `ultrack_viewer`.
 
 **Authors:** Andrés Gordo & Guilherme Ventura · **Institute:** IMP Vienna
 
-This README is the step-by-step guide. There are two parts:
+This README has two parts:
 
-1. **Run the pipeline on the HPC** (SLURM cluster, all the heavy work)
-2. **Visualise the results with the ultrack_viewer** (on the HIVE workstation)
+1. Run the pipeline on the SLURM **HPC**.
+2. Visualise results with `ultrack_viewer` on the **HIVE** workstation.
 
 ---
 
-## Part 1 · Run the pipeline on the HPC
-
-### 1.1 Get access to the cluster
-
-1. Ask IT for a **CLIP HPC cluster** account. They can check internal docs at
-   [biocenterat.sharepoint.com/.../HPC-Documentation](https://biocenterat.sharepoint.com/sites/Portal/SitePages/Infrastructure%20Services/Information%20Technology/HPC-Documentation.aspx).
-2. From your laptop, SSH into the login node:
-
-   ```bash
-   ssh cbe.vbc.ac.at
-   # enter your credentials
-   ```
-
-3. **Always work inside `/scratch-cbe/users/<your-user>/`**. Anything on the main server fills it up and slows everyone down. Create your folder if it does not exist:
-
-   ```bash
-   mkdir -p /scratch-cbe/users/$USER
-   cd       /scratch-cbe/users/$USER
-   ```
-
-### 1.2 Clone the repo
+## Quickstart
 
 ```bash
+# 1. Login: ssh cbe.vbc.ac.at  →  mkdir -p /scratch-cbe/users/$USER && cd /scratch-cbe/users/$USER
 git clone https://github.com/andresgordoortiz/spim_preprocessing.git
 cd spim_preprocessing
+
+# 2. Edit config.json — at minimum set input.directory, output.directory.
+#    Containers, Gurobi licence, Seqera token: see § 1.5, § 1.6, § 1.4.
+
+# 3. Submit
+sbatch submit_pipeline.sh config.json
 ```
 
-### 1.3 Prepare your data
-
-The pipeline accepts any of the following inputs (set `input.directory` in `config.json`, plus `input.channel` for multi-channel files):
-
-| Input shape | Example filenames | How to point at it |
-| --- | --- | --- |
-| Folder of per-timepoint TIFFs | `t0000_Channel 1.tif`, `t0001_Channel 1.tif`, ... | `input.directory` = path to the folder |
-| Single Zeiss hyperstack | `movie.czi` | `input.directory` = the `.czi` itself, or its parent folder (auto-detected) |
-| Single 4D/5D ImageJ / OME-TIFF | `full_stack.tif` | `input.directory` = the `.tif`/`.tiff` itself |
-| **Single Imaris (or generic 5D HDF5) dataset** | `seboxGFP-H2ACherry_-02-8bit.ims` | `input.directory` = the `.ims`/`.h5`/`.hdf5` itself |
-| **Folder of per-timepoint / per-channel HDF5** (Bio-Formats "split into timepoints" export) | `seboxGFP-H2ACherry_-02-8bit--C00--T00000.h5`, `...--C00--T00001.h5`, `...--C01--T00000.h5`, ... | `input.directory` = the folder holding the `--C##--T#####.h5` files; `input.channel` picks which channel to track |
-
-A few notes for the new Imaris / HDF5 paths:
-
-- **Single file (`.ims`, `DataSet.h5`, ...)** is split into per-timepoint `t####_Channel <c>.tif` by the built-in `SPLIT_INPUT_FILE` step. Voxel sizes are auto-detected from the embedded `PhysicalSize{X,Y,Z}` metadata (when `voxel_size.auto_detect = true`); otherwise they fall back to `voxel_size.{x,y,z}_um` in your `config.json`.
-- **Folder of `--C##--T#####.h5` files** is auto-picked-up by the workflow glob (`extractTimepoint` regex has a dedicated `--T#####` pattern), so no manual filename rewriting is needed. The Python readers reach the array inside each `.h5` with `h5py`, no extra conversion step. **This mode bypasses `SPLIT_INPUT_FILE` entirely** — each `.h5` already corresponds to one (timepoint, channel) pair.
-- One Imaris channel can end earlier than the other (e.g. one embryo leaving the field of view at T00120). The pipeline emits a `WARNING: timepoints [...] have no C## .h5 file — will be skipped` line and continues.
-- Channels are 1-indexed in `config.json`: `channel: 1` picks `C00` (0-indexed in the filename), `channel: 2` picks `C01`, etc.
-- Both Imaris paths write a small sidecar `voxel_size.json` into `00_split_input/` so `EXTRACT_METADATA` reads the real physical pixel sizes instead of falling back to bogus TIFF defaults.
-
-If your data is large, keep the original copy somewhere safe and copy/symlink just the relevant files into your scratch folder to save space.
-
-### 1.4 Edit `config.json`
-
-Open `config.json` in your favourite editor (`nano`, `vim`, ...). The minimum fields you need to set are:
-
-```json
-{
-  "input":  { "directory": "/scratch-cbe/users/me/data/my_experiment/" },
-  "output": { "directory": "/scratch-cbe/users/me/results/my_experiment/" },
-
-  "seqera_tower": {
-    "enabled": true,
-    "access_token": "paste-your-token-here"
-  }
-}
-```
-
-Toggles to control what runs (set to `true` / `false`):
-
-| Section | What it does |
-| --- | --- |
-| `preprocessing.enabled` | Modular preprocessing (planar + depth correction + isotropic resampling). All CPU. |
-| `roi_cropping.enabled`  | Crop every timepoint to a Fiji `.roi` rectangle |
-| `downscaling.enabled`   | XY downscale applied BEFORE segmentation (uses `downscaling.factor`) |
-| `raw_export.enabled`    | Export the raw input sliced-isotropic + downscaled for `ultrack_viewer.py --processed` (independent of preprocessing) |
-| `segmentation.enabled`  | Cellpose 3D segmentation |
-| `tracking.enabled`      | ultrack cell tracking (needs segmentation on) |
-| `benchmark.enabled`     | Per-timepoint timing/memory report |
-
-**Path tips:**
-
-- Use **plain spaces** in paths, never backslash-escape them (e.g. `"my data"` not `"my\ data"`).
-- Absolute paths are safest: `/scratch-cbe/users/me/data/...`
-- Relative paths are resolved against the repo directory (e.g. `./data/`).
-- For tracking, make sure `voxel_size` is correct (in micrometres). Try not to use the automatic detection, as the metadata is oftentimes wrong.
-
-**Seqera token (optional but recommended).** Create a free account at [tower.nf](https://tower.nf), go to **Settings → Your tokens**, generate a token, and paste it into `seqera_tower.access_token`. This lets you watch the run live in the browser under **Runs**.
-
-### 1.5 Container images
-
-Every pipeline step runs inside an Apptainer/Singularity container. The
-pipeline expects three pre-pulled images on a shared filesystem that all
-compute nodes can read:
-
-| Container | Default path | Used by |
-| --- | --- | --- |
-| `container_image` (main pipeline) | `/groups/pinheiro/user/andres.gordo/containers_licences/andresgordoortiz-spim_imp-python_packages_spim-sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559.img` | every process (`PLANAR_CORRECTION`, `DEPTH_CORRECTION`, `ISOTROPIC`, `DOWNSCALE_XY`, `CELLPOSE_SEGMENT`, `MERGE_HYPERSTACKS`, `PREP_ULTRACK`, `EXTRACT_METADATA`, `SPLIT_INPUT_FILE`, `RESLICE_ISOTROPIC`, `EXPORT_RAW_ISOTROPIC`, `CROP_WITH_ROI`) |
-| `fiji_container_image` (Fiji) | `docker://fiji/fiji:20220415` | `CROP_WITH_ROI` (and any future Fiji-based step) |
-| `ultrack_container` | `/groups/pinheiro/user/andres.gordo/containers_licences/ultrack.sif` | `PREP_ULTRACK`, `ULTRACK_SEGMENT`, `ULTRACK_LINK`, `ULTRACK_SOLVE`, `ULTRACK_EXPORT` |
-
-#### Why a local copy is required
-
-Cluster compute nodes almost never have internet access, so Apptainer cannot
-pull images on demand — the `.img` / `.sif` has to live on a shared filesystem
-that every node can mount. The defaults above point at the original maintainer's
-shared folder (`/groups/pinheiro/user/andres.gordo/containers_licences/`).
-That folder will become inaccessible the moment the maintainer leaves the
-lab, so every user should plan to maintain their own copy.
-
-#### Point the pipeline at your own copy
-
-The pipeline reads each container path from `config.json` under the `system`
-block (overridable in two more ways for advanced usage):
-
-```json
-{
-  "system": {
-    "container_image":       "/groups/<your-area>/<your-user>/containers/spim_pipeline.sif",
-    "fiji_container_image":  "/groups/<your-area>/<your-user>/containers/fiji.sif",
-    "ultrack_container":     "/groups/<your-area>/<your-user>/containers/ultrack.sif"
-  }
-}
-```
-
-Override order (highest priority first):
-
-| Priority | Source | When to use it |
-| --- | --- | --- |
-| 1 | `system.container_image` / `system.fiji_container_image` / `system.ultrack_container` in `config.json` | **Recommended.** Same file as the rest of your run settings. |
-| 2 | `$SPIM_PIPELINE_CONTAINER` / `$SPIM_FIJI_CONTAINER` / `$SPIM_ULTRACK_CONTAINER` env var | Useful when launching `nextflow run` directly without `submit_pipeline.sh`. |
-| 3 | Hardcoded fallback in `nextflow.config` | The maintainer's shared path — last-resort default, may not exist after handover. |
-
-#### Pre-pull a container to your own folder
-
-Log in to the cluster and pull the image with Apptainer (needs internet on the
-login node only). Use the same URIs the pipeline hardcodes as a fallback so
-your copy is bit-identical:
-
-```bash
-mkdir -p /groups/<your-area>/<your-user>/containers
-cd /groups/<your-area>/<your-user>/containers
-
-# Main pipeline container (used by every step)
-apptainer pull \
-  --name spim_pipeline.sif \
-  library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559
-
-# Fiji (only needed if you use CROP_WITH_ROI)
-apptainer pull --name fiji.sif docker://fiji/fiji:20220415
-
-# Ultrack (only needed if tracking.enabled = true)
-apptainer pull --name ultrack.sif docker://qbiotumber/ultrack:latest
-```
-
-Then update `config.json` as shown above to point at the new paths.
-
-> **Fiji note.** The default `fiji_container_image` is a `docker://` URI, which
-> only works if compute nodes can reach Docker Hub. On air-gapped clusters,
-> pre-pull a `.sif` and override with the absolute path (same pattern as the
-> other two containers above).
-
-`submit_pipeline.sh` checks that the file at each configured path exists
-before launching the pipeline and exits with a clear error if any of them is
-missing. The pipeline itself prints an `INFO` line at launch time telling you
-which path it picked.
+Then monitor in your browser at **tower.nf → Runs** (after pasting a free token into `seqera_tower.access_token`).
 
 ---
 
-### 1.6 Gurobi licence (required for tracking)
+## Part 1 · Run on the HPC
 
-The cell-tracking step (`ULTRACK_SOLVE`) uses **Gurobi** as its ILP solver, so a
-valid Gurobi licence file must be present on the cluster before any run with
-`tracking.enabled = true`. Without one, `ULTRACK_SOLVE` will fail and the rest of
-the pipeline will still produce segmentation + 4D hyperstacks — only tracking is
-skipped.
+### 1.1 Cluster access
 
-#### Obtain a free WLS Academic licence
+```bash
+ssh cbe.vbc.ac.at
+mkdir -p /scratch-cbe/users/$USER && cd /scratch-cbe/users/$USER   # always work in scratch
+```
 
-1. Go to [https://www.gurobi.com](https://www.gurobi.com) and create an account
-   using your **institutional email** (`.ac.at`, `.edu`, `.univ-…`, …). Gurobi
-   rejects free academic licences for commercial email providers (gmail, outlook,
-   yahoo, …), so this step is mandatory.
-2. Sign in to the **User Portal** and click **Licenses → Request** in the left
-   sidebar.
-3. Under **ACADEMIC**, click **GENERATE NOW!** on the **WLS Academic** card:
+### 1.2 Prepare data
 
-   ![WLS Academic licence request page](docs/images/gurobi_wls_academic_request.png)
+| Input | Example filenames | `input.directory` |
+| --- | --- | --- |
+| Folder of per-timepoint TIFFs | `t0000_Channel 1.tif`, `t0001_*.tif`, … | the folder |
+| Zeiss hyperstack | `movie.czi` | the `.czi` or its parent folder |
+| 4D/5D OME-TIFF / ImageJ hyperstack | `full_stack.tif` | the `.tif` itself |
+| Imaris or 5D HDF5 | `dataset.ims` / `DataSet.h5` | the file itself |
+| Folder of per-timepoint / per-channel HDF5 (Bio-Formats split) | `prefix--C00--T00000.h5`, `prefix--C00--T00001.h5`, … | the folder; pick channel with `input.channel` |
 
-   WLS Academic is the right tier for this pipeline:
-   - **Free** and renewable indefinitely while you remain at an academic
-     institution.
-   - Valid for **90 days** at a time — set a calendar reminder to renew it from
-     the User Portal (Licenses → your licence → Renew) before it expires, or the
-     pipeline will start failing on `ULTRACK_SOLVE` without an obvious error.
-   - Runs on **multiple machines / containers** — exactly what an HPC + apptainer
-     setup needs.
-   - Requires an internet connection for the very first activation only; once
-     the licence is installed on the cluster, `ULTRACK_SOLVE` works fully offline.
+A `.ims` / single `.h5` is split into per-timepoint TIFFs by `SPLIT_INPUT_FILE`; voxel sizes are auto-detected from `PhysicalSize{X,Y,Z}` metadata. A folder of `--C##--T#####.h5` files bypasses `SPLIT_INPUT_FILE` entirely — each `.h5` already maps to one `(timepoint, channel)` pair. Channels are 1-indexed in `config.json` (`channel: 1` → `C00`).
 
-4. The portal generates and downloads `gurobi.lic`.
+### 1.3 Edit `config.json`
 
-> **Heads up.** The pipeline used to ship with a hardcoded licence at
-> `/groups/pinheiro/user/andres.gordo/containers_licences/gurobi.lic`. That
-> licence is tied to the original maintainer's Gurobi account and will stop
-> working as soon as it expires (or the account is closed). The
-> `system.gurobi_license_path` knob documented below is the supported way to
-> point at your own licence.
+Minimum fields:
 
-#### Install it on the cluster
+```json
+{
+  "input":  { "directory": "/scratch-cbe/users/me/data/" },
+  "output": { "directory": "/scratch-cbe/users/me/results/" },
+  "seqera_tower": { "enabled": true, "access_token": "paste-your-token" }
+}
+```
 
-Copy the file to a stable location on `/groups/…` so it survives reboots, quota
-flushes, and is visible from every compute node the pipeline may schedule on:
+Toggles (`true` / `false`):
+
+| Section | What it runs |
+| --- | --- |
+| `preprocessing.enabled` | Planar + depth + isotropic resampling (CPU) |
+| `roi_cropping.enabled`  | Crop each timepoint to a Fiji `.roi` |
+| `downscaling.enabled`   | XY downscale before segmentation (`downscaling.factor`) |
+| `raw_export.enabled`    | Export raw input sliced-isotropic + downscaled for viewer overlay (`raw_export`) |
+| `segmentation.enabled`  | Cellpose 3D |
+| `tracking.enabled`      | ultrack (needs `segmentation.enabled = true`) |
+| `benchmark.enabled`     | Per-timepoint timing/memory report |
+
+**Path tips:** plain spaces (no `\"` escapes), absolute paths are safest, relative paths resolve against the repo dir. For tracking, set `voxel_size.{x,y,z}_um` explicitly (auto-detect is unreliable on some file formats).
+
+**Seqera token:** free account at [tower.nf](https://tower.nf) → **Settings → Your tokens**.
+
+### 1.4 Container images
+
+Every process runs inside Apptainer. The pipeline needs three pre-pulled images on a shared filesystem (compute nodes have no internet):
+
+| Container | Used by | Default |
+| --- | --- | --- |
+| `system.container_image` | All main processes | `library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb…` |
+| `system.fiji_container_image` | `CROP_WITH_ROI` | `docker://fiji/fiji:20220415` |
+| `system.ultrack_container` | `PREP_ULTRACK` + `ULTRACK_*` | `docker://qbiotumber/ultrack:latest` |
+
+The defaults point at the original maintainer's shared folder (`/groups/pinheiro/user/andres.gordo/containers_licences/`), which becomes inaccessible when they leave. Pre-pull your own copies and override:
+
+```bash
+mkdir -p /groups/<your-area>/<your-user>/containers && cd $_
+apptainer pull --name spim_pipeline.sif library://andresgordoortiz/spim_imp/python_packages_spim:sha256.6ef173bb45b113a36deae4315200cd8f311de2d7108b4b73e8f17a12cffe7559
+apptainer pull --name fiji.sif   docker://fiji/fiji:20220415                    # only if CROP_WITH_ROI
+apptainer pull --name ultrack.sif docker://qbiotumber/ultrack:latest            # only if tracking
+```
+
+Then set the absolute paths in `config.json` under `system.{container_image,fiji_container_image,ultrack_container}`. `submit_pipeline.sh` verifies each file exists before launching.
+
+Override order (highest priority first): `config.json` `system.*` key → `$SPIM_{PIPELINE,FIJI,ULTRACK}_CONTAINER` env var → hardcoded fallback in `nextflow.config`.
+
+> **Fiji note.** The default Fiji URI is `docker://`; on air-gapped clusters pre-pull the `.sif` and override with the absolute path.
+
+### 1.5 Gurobi licence (required for tracking)
+
+`ULTRACK_SOLVE` uses Gurobi; without a valid licence it fails and only tracking is skipped.
+
+**Get a free WLS Academic licence** (renews every 90 days):
+
+1. Create a Gurobi account with your **institutional email** (academic only — gmail/outlook/yahoo are rejected).
+2. Sign in → **Licenses → Request** → **ACADEMIC → WLS → GENERATE NOW!**.
+3. Download `gurobi.lic`. Set a calendar reminder to renew before expiry.
+
+**Install on the cluster:**
 
 ```bash
 mkdir -p /groups/<your-area>/<your-user>/gurobi
-cp ~/Downloads/gurobi.lic /groups/<your-area>/<your-user>/gurobi/
-chmod 644 /groups/<your-area>/<your-user>/gurobi/gurobi.lic
+cp ~/Downloads/gurobi.lic $_/
+chmod 644 $_/gurobi.lic
 ```
 
-#### Point the pipeline at it
+**Point the pipeline at it** — set `system.gurobi_license_path` in `config.json`, or export `$GUROBI_LICENSE_PATH`, or fall back to the path in `nextflow.config`. The path must be absolute and readable from compute nodes (`/groups/`, `/scratch-cbe/`, … work out of the box).
 
-Edit your `config.json` and set `system.gurobi_license_path` to the absolute
-path of the file you just installed:
+If `submit_pipeline.sh` can't find the file it prints a `WARNING` and continues — segmentation + 4D merging still run, but `ULTRACK_SOLVE` will fail.
 
-```json
-{
-  "system": {
-    "gurobi_license_path": "/groups/<your-area>/<your-user>/gurobi/gurobi.lic"
-  }
-}
-```
-
-`submit_pipeline.sh` reads that key, exports it as `$GUROBI_LICENSE_PATH`, and
-`nextflow.config` injects it into every apptainer container via
-`--env GRB_LICENSE_FILE=…`.
-
-Override order (highest priority first):
-
-| Priority | Source | When to use it |
-| --- | --- | --- |
-| 1 | `system.gurobi_license_path` in `config.json` | **Recommended.** Same file as the rest of your run settings. |
-| 2 | `$GUROBI_LICENSE_PATH` environment variable | Useful when you launch `nextflow run` directly without `submit_pipeline.sh`. |
-| 3 | Hardcoded fallback in `nextflow.config` | The maintainer's shared path — useful only as a last-resort default. |
-
-The path must be **absolute** and readable from SLURM compute nodes. Anything
-under `/groups/`, `/users/`, or `/scratch-cbe/` works out of the box because the
-pipeline already bind-mounts those into the container.
-
-If `submit_pipeline.sh` cannot find the file at the configured path it prints
-a `WARNING` and continues — segmentation and 4D merging still run, but
-`ULTRACK_SOLVE` will fail later if you have `tracking.enabled = true`.
-
----
-
-### 1.7 Submit the pipeline
+### 1.6 Submit
 
 ```bash
 sbatch submit_pipeline.sh config.json
 ```
 
-That is it. The script:
+The script loads `nextflow` + `java`, points Apptainer at the pre-cached images, exports your Seqera token, and runs `nextflow run ./spim_pipeline.nf --config_json config.json`. Paths with spaces are handled automatically.
 
-- Loads `nextflow`, `java`, `build-env`
-- Points Singularity/Apptainer at the pre-cached container (`/groups/pinheiro/user/andres.gordo/containers_licences/`)
-- Exports your Seqera token if you set one
-- Runs `nextflow run ./spim_pipeline.nf --config_json config.json`
-
-If `config.json` or your input path contains spaces, just keep them as plain spaces — `submit_pipeline.sh` handles sanitisation.
-
-### 1.8 Monitor the run
+### 1.7 Monitor
 
 | Where | What to look at |
 | --- | --- |
-| `squeue --me`                     | Whether your job is queued / running |
-| `tower.nf` → **Runs**             | Live progress, per-task logs, timeline |
-| `<output_dir>/pipeline_<date>.log` | Full Nextflow log (with `tee`) |
-| `<output_dir>/reports/`           | HTML report, timeline, trace |
+| `squeue --me`              | Queue / run status |
+| `tower.nf` → **Runs**      | Live per-task progress, logs, timeline |
+| `<output_dir>/pipeline_<date>.log` | Full Nextflow log |
+| `<output_dir>/reports/`    | HTML report, timeline, trace |
 
-If something fails, the pipeline auto-retries up to 3 times (see `nextflow.config`). To restart from where it stopped, just re-run:
+The pipeline auto-retries failed tasks up to 3 times. To restart from where it stopped, just re-run `sbatch submit_pipeline.sh config.json` (resume is on by default). For a clean re-run, set `system.resume = false`.
 
-```bash
-sbatch submit_pipeline.sh config.json
-```
-
-Set `system.resume = false` in `config.json` if you want a clean re-run.
-
-### 1.9 Output structure
-
-After the run completes, your `output.directory` will look like:
+### 1.8 Output
 
 ```
 my_experiment/
-├── 00_split_input/        # per-timepoint TIFFs (if you gave a hyperstack)
+├── 00_split_input/        # per-timepoint TIFFs (only for hyperstack inputs)
 ├── 00_cropped/            # only if roi_cropping.enabled
-├── 00b_isotropic/         # only if preprocessing.isotropic_reslice and preprocessing off
-├── 00c_downscaled/        # only if downscaling.enabled and preprocessing off
-├── 01_preprocessed/       # the isotropic, normalised volumes
+├── 00b_isotropic/         # only if preprocessing off + isotropic_reslice on
+├── 00c_downscaled/        # only if downscaling on + preprocessing off
+├── 01_preprocessed/       # isotropic, shading-corrected + depth-flattened
 │   └── *_processed.tif
-├── 01b_raw_isotropic/     # only if raw_export.enabled — RAW signal, sliced isotropic + downscaled
-│   └── *_raw_iso_Channel*.tif        (use this with --processed in the viewer to overlay tracks on raw)
-├── 02_segmented/          # Cellpose label volumes
+├── 01b_raw_isotropic/     # only if raw_export.enabled — raw signal, sliced to match preprocessed geometry
+├── 02_segmented/          # Cellpose labels
 ├── 02_segmented_downscaled/   # only if segmentation.downscale_labels < 1
 ├── 03_tracking/           # only if tracking.enabled
-│   └── results/
-│       ├── tracks.csv
-│       └── segments.zarr
+│   └── results/{tracks.csv, segments.zarr}
 ├── benchmark/             # only if benchmark.enabled
 ├── metadata/              # voxel size + image metadata
 ├── reports/               # Nextflow HTML / trace / timeline
 ├── logs/                  # per-step logs
-└── pipeline_<date>.log    # the full Nextflow log
+└── pipeline_<date>.log
 ```
 
-### 1.10 Move the results to the main server (when done)
-
-Once you are happy with the run, copy the output out of scratch and into the main server storage so the team can access it:
+When the run is done, move it to the main server for sharing:
 
 ```bash
-rsync -avh --progress \
-  /scratch-cbe/users/$USER/results/my_experiment/ \
-  /groups/pinheiro/user/$USER/my_experiment/
+rsync -avh --progress /scratch-cbe/users/$USER/results/my_experiment/ /groups/pinheiro/user/$USER/
 ```
 
-`/groups/pinheiro/user/` is the main server; it is backed up and shared. **Don't run pipeline jobs from there** — that is what scratch is for. Only move finished results back.
+`/groups/pinheiro/user/` is backed up and shared — keep it for finished results, never run jobs from there.
 
-### 1.11 Overlay tracks on the **RAW** signal (`raw_export`)
+### 1.9 Overlay tracks on RAW signal (`raw_export`)
 
-The preprocessed chain (`01_preprocessed/`) applies shading correction
-(planar) + Z intensity correction (depth) + isotropic resampling.
-Each step is a small, independent NumPy/SciPy script under `bin/`
-(ported from the AIAF-32 modular scripts); see
-[Preprocessing details](#preprocessing-details) below.
-That's great for segmentation, but when you want to **interpret** a
-track — confirming whether a cell actually ingressed, judging whether a
-jump is a real movement or a segmentation artefact — you want to see
-the tracks on the **raw** signal, not on the processed one.
-depth flattening — just the
-same `XY cubic rescale + optional isotropic Z resample` used by
-`DOWNSCALE_XY`, applied to the RAW preprocessing chain (no shading correction, no CLAHE, no
-deconvolution — just the same `XY cubic rescale + optional
-isotropic Z resample` used by `DOWNSCALE_XY`, applied to the RAW
-input).
+Shading correction, Z flattening, and isotropic resampling make segmentation easier but hide the real intensity when interpreting tracks. `raw_export` runs `XY cubic rescale + optional isotropic Z resample` on the **raw** input (no shading correction) so you can load it as a viewer overlay:
 
 ```json
-{
-  "raw_export": {
-    "enabled": true,
-    "factor": 0.33,
-    "isotropic_reslice": true
-  }
-}
+{ "raw_export": { "enabled": true, "factor": 0.33, "isotropic_reslice": true } }
 ```
 
-| Field | What it does |
+| Field | Effect |
 | --- | --- |
-| `enabled`        | Turns the export on (`true`) / off (`false`). Off by default — you opt in. |
-| `factor`         | XY scale factor (<1.0 = downscale). Pick a value appropriate for napari display (typically `0.25`–`0.5` for a multi-GB acquisition). |
-| `isotropic_reslice` | Resample Z so the voxel size matches the downscaled XY pixel size. Required for correct registration with the tracks (tracks are emitted in isotropic coordinates). |
+| `enabled`            | Turn the export on/off |
+| `factor`             | XY downscale; pick by RAM budget (typically `0.25`–`0.5`) |
+| `isotropic_reslice`  | Match XY pixel size to Z so tracks register in viewer coordinates |
 
-Output goes to `01b_raw_isotropic/<name>_raw_iso_Channel*.tif`
-(per-timepoint ImageJ TIFFs matching the same voxel geometry as the
-preprocessed chain) plus the merged `4D_hyperstack_raw_iso.tif` when
-`output.skip_merge = false`.
-
-> The preprocessed chain is **not** affected — it still operates on
-> the original-resolution raw input. The raw export is a purely
-> additive overlay for visualisation.
+Output: `01b_raw_isotropic/<name>_raw_iso_Channel*.tif` (and the merged `4D_hyperstack_raw_iso.tif` when `output.skip_merge = false`). The preprocessed chain is unaffected — `raw_export` is purely additive.
 
 ---
 
-## Part 2 · Visualise the results with `ultrack_viewer` (on the HIVE)
+## Part 2 · Visualise results with `ultrack_viewer` (HIVE)
 
-`ultrack_viewer.py` is a napari-based GUI for browsing the preprocessed volume, segmentation labels, and tracks side-by-side.
+`ultrack_viewer.py` is a napari GUI for browsing the processed volume, segmentation labels, and tracks side-by-side.
 
-### 2.1 Open a PowerShell session on the HIVE
+### 2.1 Create the conda env (once)
 
-1. Remote-desktop / connect to the **HIVE** workstation (the Windows-based one).
-2. Open **PowerShell**.
-
-### 2.2 Create the conda environment (once)
-
-The viewer needs a small conda env with napari, dask, zarr, etc. The env file is shipped in the repo:
+Open PowerShell on the HIVE and run:
 
 ```powershell
-# go to the repo you cloned earlier (or copy the yml to the HIVE)
 cd path\to\spim_preprocessing
-
-# create the env with mamba (faster than conda)
 mamba env create -f ultrack_viewer_env.yml
-
-# activate it
 mamba activate ultrack-viewer
 ```
 
-### 2.3 Go to your results folder
+### 2.2 Reach your results
 
-- If the results are on the **HIVE local disk**: just `cd` into the output folder.
-- If the results are still on the **main server (`/groups/pinheiro/...`)**, the HIVE sees it as the **`V:`** drive. Mount it first:
+- HIVE local disk → `cd <path>`.
+- Still on `/groups/pinheiro/...` → the HIVE sees it as `V:`:
 
   ```powershell
-  V:
-  cd V:\path\to\my_experiment
+  V: ; cd V:\path\to\my_experiment
   ```
 
-### 2.4 Launch the viewer
+### 2.3 Launch the viewer
 
-The viewer accepts three layers that are all optional but work best together:
-
-| Layer   | Flag           | Typical file |
-| ------- | -------------- | ------------ |
+| Layer   | Flag           | File |
+| ------- | -------------- | --- |
 | Tracks  | `--tracks`     | `03_tracking/results/tracks.csv` |
 | Labels  | `--segments`   | `03_tracking/results/segments.zarr` |
-| Volume  | `--processed`  | `01_preprocessed/<name>_processed.tif` (or `01b_raw_isotropic/4D_hyperstack_raw_iso.tif` if you enabled `raw_export`) |
+| Volume  | `--processed`  | `01_preprocessed/4D_hyperstack_processed.tif` (or `01b_raw_isotropic/4D_hyperstack_raw_iso.tif` if `raw_export` is on) |
 
-A typical launch on the preprocessed volume:
+Typical launch:
 
 ```powershell
 mamba activate ultrack-viewer
-
 python ultrack_viewer.py `
     --tracks    03_tracking\results\tracks.csv `
     --segments  03_tracking\results\segments.zarr `
@@ -436,42 +235,19 @@ python ultrack_viewer.py `
     --load-downsample 2
 ```
 
-To overlay the tracks on the **raw** signal instead (so you can see
-the unprocessed intensity under the nuclei), swap the `--processed`
-path to the raw export:
+Both volumes share the same voxel geometry, so `--processed` works against either file. Useful flags:
 
-```powershell
-python ultrack_viewer.py `
-    --tracks    03_tracking\results\tracks.csv `
-    --segments  03_tracking\results\segments.zarr `
-    --processed 01b_raw_isotropic\4D_hyperstack_raw_iso.tif `
-    --preload `
-    --load-downsample 2
-```
+- `--preload` — whole `segments.zarr` in RAM; much smoother scrubbing. Only if HIVE has enough RAM.
+- `--load_downsample 2` — keep volume in RAM at half res (8× less RAM, recommended for big datasets).
+- `--downsample 2` — display-only downsample (full-res in RAM).
 
-Both volumes share the same voxel geometry (isotropic + same
-downscaling), so the cross-section viewer and the sphere overlay
-work identically against either layer.
-
-Flag cheatsheet:
-
-- `--preload` — load the whole `segments.zarr` into RAM and use a GPU-friendly display volume. This makes scrubbing across time **much** smoother. Only use it if the HIVE has enough RAM for your volume.
-- `--load_downsample 2` — keep the volume in RAM at half resolution (8× less RAM). **Recommended** for big datasets; the analysis still works at half-res.
-- `--downsample 2` — display-only downsample (full-res is still in RAM). Use this if you only want a faster on-screen render.
-
-> Paths with spaces: wrap them in double quotes, e.g. `--tracks "03_tracking\results\my tracks.csv"`.
-
-Once napari opens, use the layer panel to toggle the processed volume, the segmentation labels, and the tracks on/off. The time slider scrubs through timepoints.
+> Paths with spaces: wrap in double quotes, e.g. `--tracks "03_tracking\results\my tracks.csv"`.
 
 ---
 
 ## Preprocessing details
 
-The preprocessing chain is intentionally **modular**: each correction is its
-own small Python script under `bin/`, its own Nextflow process, and its own
-SLURM resource profile. This makes every step independently tunable,
-testable, and re-runnable with `nextflow run -resume` after a parameter
-change.
+The chain is **modular** — each correction is its own script under `bin/`, its own Nextflow process, and its own SLURM profile. Every step is independently tunable and re-runnable via `nextflow run -resume`.
 
 ```
 SPLIT_INPUT_FILE (optional, for hyperstack inputs)
@@ -480,31 +256,34 @@ SPLIT_INPUT_FILE (optional, for hyperstack inputs)
   CROP_WITH_ROI (optional)
        │
        ▼
-PLANAR_CORRECTION ──► DEPTH_CORRECTION ──► ISOTROPIC ──► Cellpose → ultrack
+PLANAR_CORRECTION ──► DEPTH_CORRECTION ──► ISOTROPIC ──► DOWNSCALE_XY (optional)
+                                                                │
+                                                                ▼
+                                                        CELLPOSE_SEGMENT
+                                                                │
+                                                                ▼
+                                                       MERGE_HYPERSTACKS
+                                                                │
+                                                                ▼
+                                                PREP_ULTRACK → ULTRACK_SEGMENT
+                                                                │
+                                                                ▼
+                                                ULTRACK_LINK → ULTRACK_SOLVE → ULTRACK_EXPORT
 ```
 
-| Step | Script | What it does | Default parameters |
+| Step | Script | What it does | Default |
 | --- | --- | --- | --- |
-| Planar (XY) shading | `bin/planar_intensity_correction.py` | Estimates a smooth flat-field from the mean-Z projection and divides every slice by it. | `sigma_xy = 64` |
-| Depth (Z) intensity | `bin/depth_intensity_correction.py` | Rescales each Z slice so a robust per-slice statistic is constant along Z, with moving-average smoothing. | `mode = p99`, `smooth_window = 9`, `gain_clip = [0.25, 4.0]` |
-| Isotropic resample | `bin/isotropic_resample.py` | Resamples Z so the voxel size matches the smallest XY pixel size. | `target_um = 0.374`, `order = 3` (cubic) |
+| Planar (XY) shading | `bin/planar_intensity_correction.py` | Estimates flat-field from mean-Z, divides every slice by it | `sigma_xy = 64` |
+| Depth (Z) intensity | `bin/depth_intensity_correction.py` | Rescales each Z slice so a robust per-slice statistic is constant in Z | `mode = p99`, `smooth_window = 9`, `gain_clip = [0.25, 4.0]` |
+| Isotropic resample  | `bin/isotropic_resample.py` | Resamples Z to match the smallest XY pixel size | `target_um = 0.374`, `order = 3` (cubic) |
 
-All three are pure NumPy + SciPy, run on CPU, and chain via Nextflow. The
-math is ported **verbatim** from the AIAF-32 modular scripts and adapted
-to read/write plain TIFFs with ImageJ metadata (voxel sizes round-trip
-through every step, so downstream Cellpose / ultrack / viewer see the
-corrected geometry automatically).
+All three are pure NumPy + SciPy on CPU. The math is ported **verbatim** from AIAF-32; `tests/test_aiaf32_equivalence.py` verifies bit-identical output. ImageJ metadata round-trips through every step so Cellpose / ultrack / the viewer see the corrected geometry automatically.
 
-> **Bit-equivalence verified.** `tests/test_aiaf32_equivalence.py` runs
-> all three scripts on a synthetic stack and compares the output arrays
-> against the AIAF-32 reference math imported directly. They are
-> **bit-identical** (max abs diff = 0). Run it with:
->
-> ```bash
-> /usr/local/bin/python3 tests/test_aiaf32_equivalence.py
-> ```
+```bash
+/usr/local/bin/python3 tests/test_aiaf32_equivalence.py   # max abs diff = 0
+```
 
-To tune any step, edit its block in `config.json`:
+To tune any step, edit its block:
 
 ```json
 {
@@ -517,55 +296,23 @@ To tune any step, edit its block in `config.json`:
 }
 ```
 
-When **all** options are enabled, the full Nextflow chain is:
-
-```
-SPLIT_INPUT_FILE (optional, for hyperstack inputs)
-       │
-       ▼
-  CROP_WITH_ROI (optional)
-       │
-       ▼
-PLANAR_CORRECTION ──► DEPTH_CORRECTION ──► ISOTROPIC ──► DOWNSCALE_XY (optional)
-       │                                                       │
-       │                                                       ▼
-       │                                                  CELLPOSE_SEGMENT
-       │                                                       │
-       ▼                                                       ▼
-                                                       MERGE_HYPERSTACKS
-                                                              │
-                                                              ▼
-                                              PREP_ULTRACK → ULTRACK_SEGMENT
-                                                              │
-                                                              ▼
-                                              ULTRACK_LINK → ULTRACK_SOLVE
-                                                              │
-                                                              ▼
-                                                       ULTRACK_EXPORT
-```
-
-`EXPORT_RAW_ISOTROPIC` runs in parallel for the viewer overlay.
-
-To disable preprocessing entirely (e.g. you already have preprocessed
-TIFFs from another tool) set `preprocessing.enabled = false` and point
-`preprocessing.preprocessed_dir` at the folder containing the timepoint
-TIFFs.
+To skip preprocessing entirely, set `preprocessing.enabled = false` and point `preprocessing.preprocessed_dir` at the folder of timepoint TIFFs you already have.
 
 ---
 
 ## Troubleshooting
 
-**`sbatch` job stays in `PD` forever.** The cluster is busy. `squeue --me` will show the reason. If you need GPU, queue `g` is the bottleneck.
+**`sbatch` job stays `PD` forever.** Cluster is busy — check `squeue --me`. If you need GPU, queue `g` is the bottleneck.
 
-**Pipeline fails immediately with "Input path does not exist".** Check the path in `config.json`. Use `ls` from the login node to confirm. Remember: no backslash-escaped spaces in JSON strings.
+**"Input path does not exist".** Verify the path in `config.json` with `ls` from the login node. No backslash-escaped spaces in JSON strings.
 
-**Container not found error.** Either the pre-pulled container is missing from `system.container_image` (see [§ 1.5](#15-container-images)), or it has been deleted from the default location. Pre-pull your own copy (the [§ 1.5](#15-container-images) section has the `apptainer pull` commands) and update the path in `config.json`, or run `./setup_container.sh` from the login node to repopulate the maintainer's shared folder (needs internet, ~30 min).
+**Container not found.** The `.img`/`.sif` is missing from `system.container_image` (§ 1.4) or the default location was deleted. Pre-pull your own copy (§ 1.4) and update `config.json`. Maintainers can repopulate the shared folder with `./setup_container.sh` from the login node (needs internet, ~30 min).
 
-**Tracking fails but everything else works.** Check the Gurobi licence (see [§ 1.5](#15-gurobi-licence-required-for-tracking)) — most often the `.lic` is missing, the path in `system.gurobi_license_path` is wrong, or it has expired (WLS Academic is 90 days). Also confirm `segmentation.enabled = true` (tracking consumes the segmentation labels).
+**Tracking fails, everything else works.** Gurobi licence is missing, expired (90-day WLS Academic), or `system.gurobi_license_path` is wrong — see § 1.5. Also confirm `segmentation.enabled = true` (tracking consumes those labels).
 
-**Viewer is sluggish / crashes on load.** Drop `--preload`, set `--load_downsample 4`, or set `--downsample 4` for a low-res display.
+**Viewer sluggish / crashes on load.** Drop `--preload`, raise `--load_downsample` / `--downsample` to `4`.
 
-**Want to re-use finished tasks.** `system.resume = true` (default) makes Nextflow skip already-done work. Just `sbatch submit_pipeline.sh config.json` again.
+**Re-use finished work.** `system.resume = true` (default) skips already-done tasks. Just re-run `sbatch submit_pipeline.sh config.json`.
 
 ---
 
