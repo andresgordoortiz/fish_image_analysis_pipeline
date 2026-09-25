@@ -356,21 +356,34 @@ def main():
     out_cfg = config.get("output", {})
     output_formats = parse_output_formats(out_cfg)
 
-    # Find files based on data type. The 'processed' data type accepts BOTH
-    # naming conventions because the final preproc step depends on whether
-    # downscaling is enabled:
-    #   - downscaling.enabled=false  -> ISOTROPIC emits t####_processed.tif
-    #   - downscaling.enabled=true   -> DOWNSCALE_XY emits t####_dscale_Channel*.tif
+    # Find files based on data type. The 'processed' data type accepts THREE
+    # naming conventions because the final preproc step depends on which
+    # branch of the workflow produced it:
+    #   - preprocessing.enabled=true + downscaling.enabled=false
+    #       -> ISOTROPIC emits t####_processed.tif
+    #   - downscaling.enabled=true  (preprocessing on OR off)
+    #       -> DOWNSCALE_XY emits t####_dscale_Channel*.tif
+    #   - preprocessing.enabled=false + isotropic_reslice=true
+    #       -> RESLICE_ISOTROPIC emits t####_iso_Channel*.tif
     # The downstream hyperstack (4D_hyperstack_processed.tif) and tracking
-    # prep (PREP_ULTRACK) consume either form interchangeably; what matters
-    # is that we collect all per-timepoint frames. Without this dual-pattern
-    # handling, runs with downscaling.enabled=true see 0 'processed' files
-    # here AND in the MERGE_HYPERSTACKS bash wrapper, so the merge silently
-    # skips and PREP_ULTRACK never schedules (regression introduced when the
-    # planar->depth->[isotropic|downscale_xy] chain was added; tracked in
-    # the onComplete warning block of spim_pipeline.nf).
+    # prep (PREP_ULTRACK) consume any form interchangeably; what matters
+    # is that we collect all per-timepoint frames.
+    #
+    # The third pattern (_iso_Channel*) was added to fix a silent tracking
+    # skip: with preprocessing.enabled=false + isotropic_reslice=true, the
+    # pipeline ran RESLICE_ISOTROPIC -> CELLPOSE_SEGMENT fine, but
+    # MERGE_HYPERSTACKS silently skipped 'processed' because neither
+    # _processed.tif nor _dscale_Channel*.tif existed in the workdir. Result:
+    # 4D_hyperstack_processed.tif was never produced, the processed_tif emit
+    # was empty, PREP_ULTRACK never scheduled, and tracking silently never
+    # ran even with tracking.enabled=true. The MERGE_HYPERSTACKS bash
+    # wrapper has the same three-pattern list (kept in sync with this one).
     if data_type == "processed":
-        file_patterns = ["t*_processed.tif", "t*_dscale_Channel*.tif"]
+        file_patterns = [
+            "t*_processed.tif",
+            "t*_dscale_Channel*.tif",
+            "t*_iso_Channel*.tif",
+        ]
         label = "processed"
     elif data_type == "segmented":
         file_patterns = ["t*_segmented.tif"]

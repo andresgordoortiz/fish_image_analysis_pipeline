@@ -2509,7 +2509,7 @@ process MERGE_HYPERSTACKS {
     // cache) and uses a hardlink in workdir to satisfy the emit. The
     // hardlink is just an inode alias — same FS, same inode, same page
     // cache — so no double-cache blow-up.
-    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v10-dest-write-workdir-hardlink"
+    def merge_stage_layout_version = "MERGE_STAGE_LAYOUT=v11-add-iso-channel-glob"
     """
     #!/usr/bin/env bash
     set -euo pipefail
@@ -2609,16 +2609,35 @@ PYTHON_CONFIG
         local dt="\$1"
 
         # Determine the per-timepoint glob(s) for this data type.
-        # 'processed' has TWO valid naming conventions depending on the
+        # 'processed' has THREE valid naming conventions depending on the
         # final preproc step in the chain:
-        #   - t*_processed.tif        (ISOTROPIC, when downscaling.enabled=false)
+        #   - t*_processed.tif        (ISOTROPIC, when preprocessing is ON
+        #                              and downscaling.enabled=false)
         #   - t*_dscale_Channel*.tif  (DOWNSCALE_XY, when downscaling.enabled=true)
+        #   - t*_iso_Channel*.tif     (RESLICE_ISOTROPIC, when
+        #                              preprocessing.enabled=false AND
+        #                              preprocessing.isotropic_reslice=true)
+        #
+        # The third pattern was missing from this glob (commit v10). When
+        # users disable the full preprocessing chain but still want isotropic
+        # voxels (for overlaying raw + tracks), the workflow takes the
+        # RESLICE_ISOTROPIC path. RESLICE_ISOTROPIC emits t*_iso_Channel*.tif
+        # into 00b_isotropic/, then that output is fed straight into
+        # CELLPOSE_SEGMENT AND into MERGE_HYPERSTACKS's processed_ch. But
+        # the merge glob didn't list _iso_Channel*.tif, so the merge bash
+        # layer printed "⏭  Skipping processed — no files matching any of:
+        # t*_processed.tif t*_dscale_Channel*.tif", produced no
+        # 4D_hyperstack_processed.tif, and PREP_ULTRACK (which subscribes
+        # to processed_tif + segmented_tif) was never scheduled. Tracking
+        # silently never ran even with tracking.enabled=true. Adding the
+        # third pattern fixes the silent skip.
+        #
         # Downstream consumers (merge_hyperstack.py, PREP_ULTRACK) treat the
-        # two naming conventions interchangeably — what matters is that we
+        # three naming conventions interchangeably — what matters is that we
         # collect all per-timepoint frames so the 4D_hyperstack_processed.tif
         # is produced and PREP_ULTRACK has something to schedule against.
         # 'patterns' is a bash variable below (space-separated list of globs)
-        # so 'ls' + the fallback 'find' loop match either convention in a
+        # so 'ls' + the fallback 'find' loop match any convention in a
         # single pass.
         # IMPORTANT: never write a bare dollar-sign + identifier, or a
         # backtick-quoted form of any bash variable, in a Groovy triple-
@@ -2629,7 +2648,7 @@ PYTHON_CONFIG
         if [ "\$dt" = "raw_iso" ]; then
             patterns="t*_raw_iso_*.tif"
         elif [ "\$dt" = "processed" ]; then
-            patterns="t*_processed.tif t*_dscale_Channel*.tif"
+            patterns="t*_processed.tif t*_dscale_Channel*.tif t*_iso_Channel*.tif"
         else
             patterns="t*_\${dt}.tif"
         fi
@@ -2890,6 +2909,7 @@ PYTHON_CONFIG
     done < <(
         find . -type f -name 't*_processed.tif'         2>/dev/null
         find . -type f -name 't*_dscale_Channel*.tif'  2>/dev/null
+        find . -type f -name 't*_iso_Channel*.tif'      2>/dev/null
         find . -type f -name 't*_segmented.tif'         2>/dev/null
         find . -type f -name 't*_raw_iso_Channel*.tif'  2>/dev/null
     )
@@ -4289,6 +4309,13 @@ If it does not, force-rebuild merge with:
 
 (use the work-dir hash printed in the previous run log for the actual
 MERGE_HYPERSTACKS task; the placeholder above is the hash from 2026-08-25.)
+
+If you are running with preprocessing.enabled=false +
+preprocessing.isotropic_reslice=true, this also used to fire because
+the merge glob did not list t*_iso_Channel*.tif (only t*_processed.tif
+and t*_dscale_Channel*.tif). Both the bash wrapper and merge_hyperstack.py
+now accept all three patterns, so -resume should re-run merge and produce
+the processed hyperstack. If not, force-rebuild as above.
 ================================================================================
 """.stripIndent()
         }
