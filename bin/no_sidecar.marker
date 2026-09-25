@@ -1,0 +1,52 @@
+# Sentinel file for the EXTRACT_METADATA process `voxel_sidecar` input.
+#
+# Background
+# ----------
+# SPLIT_INPUT_FILE emits a `voxel_size.json` sidecar on the .ims / .h5 /
+# .hdf5 input paths so EXTRACT_METADATA can read the Imaris HDF5 voxel
+# metadata directly (TIFF tags / ImageJ metadata are unreliable for these
+# formats — see repo-memory "voxel_metadata_handling"). On the .czi /
+# .tif hyperstack paths and on the plain folder-of-per-timepoint-TTIFFs
+# path SPLIT_INPUT_FILE never runs, so no sidecar exists.
+#
+# Why this sentinel exists
+# ------------------------
+# Nextflow DSL2 forbids `optional: true` on a *path INPUT* (it's only
+# valid on a path OUTPUT). Before this sentinel existed, the EXTRACT_METADATA
+# input was declared as `path voxel_sidecar, optional: true`, which Nextflow
+# rejected at script-parse time with:
+#
+#     No such property: optional for class: nextflow.script.params.FileInParam
+#     Possible solutions: options
+#
+# i.e. the pipeline failed at launch before any task could run. The fix
+# is to ALWAYS stage a real file (either the real voxel_size.json or this
+# sentinel) and let the bash-layer's existing
+#
+#     sidecar_path = Path('voxel_size.json')
+#     if sidecar_path.exists(): ...
+#
+# guard handle the absence. The sentinel is named differently so the
+# guard above correctly skips it as data and the script falls back to
+# the user-supplied config.voxel_size / auto-detect-from-TIFF-tags path.
+#
+# Why the basename must differ from voxel_size.json
+# -------------------------------------------------
+# Nextflow stages path inputs under their basename by default. If this
+# sentinel were named `voxel_size.json`, it would always exist in the
+# EXTRACT_METADATA workdir (overriding the real sidecar in a -resume
+# scenario where the upstream task cached an empty sidecar) and the
+# bash script would happily try to JSON-decode an empty file. The .marker
+# suffix keeps it out of the JSON lookup while still satisfying the
+# "must stage something" contract of a DSL2 path input.
+#
+# Why not pass an empty Channel.value([]) instead
+# -----------------------------------------------
+# A Channel.value([]) emits ONE element (an empty list). Nextflow will
+# still invoke EXTRACT_METADATA once, and `voxel_sidecar` becomes an
+# empty list in the bash script. That technically works (the .exists()
+# check fails and the script falls back), but it interacts badly with
+# future refactors — e.g. any `*.json` publishDir pattern would never
+# match, and Nextflow prints a warning at task start that "no files
+# were staged for path input `voxel_sidecar`". The sentinel gives a
+# clean success path with no warnings and a self-documenting workdir.

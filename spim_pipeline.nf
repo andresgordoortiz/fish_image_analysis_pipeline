@@ -1599,7 +1599,16 @@ process EXTRACT_METADATA {
     input:
     tuple val(timepoint), path(image_file)
     val was_cropped
-    path voxel_sidecar, optional: true  // emitted by SPLIT_INPUT_FILE on .ims / .h5 paths
+    // Nextflow DSL2 forbids `optional: true` on a path INPUT (only valid
+    // on a path OUTPUT). The "no sidecar" case is handled at the channel
+    // level by staging a sentinel file (bin/no_sidecar.marker) whose
+    // basename differs from voxel_size.json, so the bash-layer's
+    // `Path('voxel_size.json').exists()` check correctly skips it.
+    // Real sidecar is emitted by SPLIT_INPUT_FILE on .ims / .h5 / .hdf5
+    // inputs (the embedded Imaris HDF5 metadata is the source of truth
+    // for voxel sizes on those paths — see repo-memory
+    // "voxel_metadata_handling").
+    path voxel_sidecar
 
     output:
     path "shared_metadata.json", emit: metadata
@@ -3773,17 +3782,21 @@ workflow {
 
     // 1. Extract/Configure metadata from FIRST timepoint
     first_timepoint = processing_input.first()
-    // voxel_sidecar is only emitted by SPLIT_INPUT_FILE on the .ims / .h5
-    // path; if we did not take that branch there's no sidecar — `optional: true`
-    // on the EXTRACT_METADATA input means an empty channel is fine, and the
-    // script-internal `Path('voxel_size.json').exists()` check will simply
-    // skip the sidecar lookup.
+    // voxel_sidecar is only emitted by SPLIT_INPUT_FILE on the .ims / .h5 /
+    // .hdf5 path. On the .czi / .tif / folder paths no sidecar exists.
+    // Nextflow DSL2 path INPUTS cannot be declared optional (only path
+    // OUTPUTS can); we therefore always stage a real file (the sidecar
+    // when present, bin/no_sidecar.marker otherwise). The sentinel is
+    // named differently from voxel_size.json so the bash-layer's
+    // `Path('voxel_size.json').exists()` guard correctly skips it and
+    // the script falls back to config.voxel_size / auto-detect.
+    def no_sidecar = file("${projectDir}/bin/no_sidecar.marker")
     if (params.input_file || hyperstack_input != null) {
         voxel_sidecar_ch = SPLIT_INPUT_FILE.out.voxel_sidecar
-            .ifEmpty { [] }
-            .collect()
+            .first()                                          // at most one sidecar; tolerate any stray dupes
+            .ifEmpty { no_sidecar }
     } else {
-        voxel_sidecar_ch = Channel.value([])
+        voxel_sidecar_ch = Channel.from(no_sidecar)
     }
     EXTRACT_METADATA(first_timepoint, was_cropped, voxel_sidecar_ch)
 
