@@ -132,13 +132,32 @@ export NXF_OPTS="-Xss4M"
 export NXF_JVM_ARGS="-Xms2g -Xmx6g"
 mkdir -p "$SINGULARITY_TMPDIR" "$NXF_TEMP"
 
-# Gurobi multi-user floating license (shared, lives next to the containers).
-# Export so any tool launched outside apptainer (e.g. login-node helpers)
-# can still find it; the apptainer container picks it up via
-# --env GRB_LICENSE_FILE=... set in nextflow.config.
-export GRB_LICENSE_FILE="$CONTAINERS_DIR/gurobi.lic"
+# Gurobi licence path. Read config.system.gurobi_license_path from config.json
+# if present (this is how each user points at their own .lic — see README
+# "Gurobi licence" for how to obtain one). If absent, fall back to the
+# shared container folder, which is also the hardcoded default in
+# nextflow.config.
+# `grep -o '"key" *: *"value"' ... | sed ...` matches the existing pattern
+# used for the Seqera Tower token above; both work with a plain shell.
+GRB_LIC_PATH=""
+GUROBI_LIC_LINE=$(grep -o '"gurobi_license_path"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_JSON" 2>/dev/null || true)
+if [ -n "$GUROBI_LIC_LINE" ]; then
+    GRB_LIC_PATH=$(echo "$GUROBI_LIC_LINE" | sed 's/.*: *"\([^"]*\)"/\1/')
+fi
+if [ -z "$GRB_LIC_PATH" ]; then
+    GRB_LIC_PATH="$CONTAINERS_DIR/gurobi.lic"
+fi
+export GUROBI_LICENSE_PATH="$GRB_LIC_PATH"
+# GRB_LICENSE_FILE is what the Gurobi SDK reads inside the apptainer
+# container; nextflow.config bakes it into apptainer.runOptions via
+# ${params.gurobi_license_file}, which itself reads $GUROBI_LICENSE_PATH
+# with the hardcoded fallback below.
+export GRB_LICENSE_FILE="$GUROBI_LICENSE_PATH"
+echo "Gurobi licence : $GRB_LICENSE_FILE"
 if [ ! -f "$GRB_LICENSE_FILE" ]; then
     echo "WARNING: Gurobi license not found at $GRB_LICENSE_FILE"
+    echo "         Tracking will fail until you install a valid .lic at this path."
+    echo "         See README section 'Gurobi licence' for instructions."
 fi
 
 # Check that container was pre-pulled (compute nodes often can't access internet)

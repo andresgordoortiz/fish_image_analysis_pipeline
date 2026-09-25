@@ -122,6 +122,8 @@
     "fiji_container_image": "docker://fiji/fiji:20220415",
     "profile": "standard",
     "_comment_resume": "true = reuse finished tasks on re-submission. false = force a clean re-run.",
-    "resume": true
+    "resume": true,
+    "_comment_gurobi_license_path": "Absolute path to your Gurobi .lic file. Required for tracking (the tracker uses Gurobi as its ILP solver). Override order: this key -> $GUROBI_LICENSE_PATH env var -> hardcoded fallback in nextflow.config. See README 'Gurobi licence' for how to obtain a free WLS Academic licence (90-day, renewable).",
+    "gurobi_license_path": "/groups/pinheiro/user/andres.gordo/containers_licences/gurobi.lic"
   }
 }

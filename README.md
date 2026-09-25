@@ -97,7 +97,93 @@ Toggles to control what runs (set to `true` / `false`):
 
 **Seqera token (optional but recommended).** Create a free account at [tower.nf](https://tower.nf), go to **Settings → Your tokens**, generate a token, and paste it into `seqera_tower.access_token`. This lets you watch the run live in the browser under **Runs**.
 
-### 1.5 Submit the pipeline
+### 1.5 Gurobi licence (required for tracking)
+
+The cell-tracking step (`ULTRACK_SOLVE`) uses **Gurobi** as its ILP solver, so a
+valid Gurobi licence file must be present on the cluster before any run with
+`tracking.enabled = true`. Without one, `ULTRACK_SOLVE` will fail and the rest of
+the pipeline will still produce segmentation + 4D hyperstacks — only tracking is
+skipped.
+
+#### Obtain a free WLS Academic licence
+
+1. Go to [https://www.gurobi.com](https://www.gurobi.com) and create an account
+   using your **institutional email** (`.ac.at`, `.edu`, `.univ-…`, …). Gurobi
+   rejects free academic licences for commercial email providers (gmail, outlook,
+   yahoo, …), so this step is mandatory.
+2. Sign in to the **User Portal** and click **Licenses → Request** in the left
+   sidebar.
+3. Under **ACADEMIC**, click **GENERATE NOW!** on the **WLS Academic** card:
+
+   ![WLS Academic licence request page](docs/images/gurobi_wls_academic_request.png)
+
+   WLS Academic is the right tier for this pipeline:
+   - **Free** and renewable indefinitely while you remain at an academic
+     institution.
+   - Valid for **90 days** at a time — set a calendar reminder to renew it from
+     the User Portal (Licenses → your licence → Renew) before it expires, or the
+     pipeline will start failing on `ULTRACK_SOLVE` without an obvious error.
+   - Runs on **multiple machines / containers** — exactly what an HPC + apptainer
+     setup needs.
+   - Requires an internet connection for the very first activation only; once
+     the licence is installed on the cluster, `ULTRACK_SOLVE` works fully offline.
+
+4. The portal generates and downloads `gurobi.lic`.
+
+> **Heads up.** The pipeline used to ship with a hardcoded licence at
+> `/groups/pinheiro/user/andres.gordo/containers_licences/gurobi.lic`. That
+> licence is tied to the original maintainer's Gurobi account and will stop
+> working as soon as it expires (or the account is closed). The
+> `system.gurobi_license_path` knob documented below is the supported way to
+> point at your own licence.
+
+#### Install it on the cluster
+
+Copy the file to a stable location on `/groups/…` so it survives reboots, quota
+flushes, and is visible from every compute node the pipeline may schedule on:
+
+```bash
+mkdir -p /groups/<your-area>/<your-user>/gurobi
+cp ~/Downloads/gurobi.lic /groups/<your-area>/<your-user>/gurobi/
+chmod 644 /groups/<your-area>/<your-user>/gurobi/gurobi.lic
+```
+
+#### Point the pipeline at it
+
+Edit your `config.json` and set `system.gurobi_license_path` to the absolute
+path of the file you just installed:
+
+```json
+{
+  "system": {
+    "gurobi_license_path": "/groups/<your-area>/<your-user>/gurobi/gurobi.lic"
+  }
+}
+```
+
+`submit_pipeline.sh` reads that key, exports it as `$GUROBI_LICENSE_PATH`, and
+`nextflow.config` injects it into every apptainer container via
+`--env GRB_LICENSE_FILE=…`.
+
+Override order (highest priority first):
+
+| Priority | Source | When to use it |
+| --- | --- | --- |
+| 1 | `system.gurobi_license_path` in `config.json` | **Recommended.** Same file as the rest of your run settings. |
+| 2 | `$GUROBI_LICENSE_PATH` environment variable | Useful when you launch `nextflow run` directly without `submit_pipeline.sh`. |
+| 3 | Hardcoded fallback in `nextflow.config` | The maintainer's shared path — useful only as a last-resort default. |
+
+The path must be **absolute** and readable from SLURM compute nodes. Anything
+under `/groups/`, `/users/`, or `/scratch-cbe/` works out of the box because the
+pipeline already bind-mounts those into the container.
+
+If `submit_pipeline.sh` cannot find the file at the configured path it prints
+a `WARNING` and continues — segmentation and 4D merging still run, but
+`ULTRACK_SOLVE` will fail later if you have `tracking.enabled = true`.
+
+---
+
+### 1.6 Submit the pipeline
 
 ```bash
 sbatch submit_pipeline.sh config.json
@@ -112,7 +198,7 @@ That is it. The script:
 
 If `config.json` or your input path contains spaces, just keep them as plain spaces — `submit_pipeline.sh` handles sanitisation.
 
-### 1.6 Monitor the run
+### 1.7 Monitor the run
 
 | Where | What to look at |
 | --- | --- |
@@ -129,7 +215,7 @@ sbatch submit_pipeline.sh config.json
 
 Set `system.resume = false` in `config.json` if you want a clean re-run.
 
-### 1.7 Output structure
+### 1.8 Output structure
 
 After the run completes, your `output.directory` will look like:
 
@@ -395,7 +481,7 @@ TIFFs.
 
 **Container not found error.** The pre-pulled container lives at `/groups/pinheiro/user/andres.gordo/containers_licences/`. If it is missing, ask Andrés to repopulate it, or run `./setup_container.sh` from the login node (needs internet, ~30 min).
 
-**Tracking fails but everything else works.** Make sure the Gurobi license is in `/groups/pinheiro/user/andres.gordo/containers_licences/gurobi.lic` and that `segmentation.enabled = true` (tracking consumes the segmentation labels).
+**Tracking fails but everything else works.** Check the Gurobi licence (see [§ 1.5](#15-gurobi-licence-required-for-tracking)) — most often the `.lic` is missing, the path in `system.gurobi_license_path` is wrong, or it has expired (WLS Academic is 90 days). Also confirm `segmentation.enabled = true` (tracking consumes the segmentation labels).
 
 **Viewer is sluggish / crashes on load.** Drop `--preload`, set `--load_downsample 4`, or set `--downsample 4` for a low-res display.
 
