@@ -209,12 +209,8 @@ conda env create -f ultrack_viewer_env.yml
 conda activate ultrack-viewer
 ```
 
-### 2.2 Reach your results
 
-- Local disk on GPU-1 → `cd <path>`.
-- Still on `/groups/pinheiro/...` → mount or `sshfs` the share, or copy the folder over.
-
-### 2.3 Launch the viewer
+### 2.2 Launch the viewer
 
 | Layer   | Flag           | File |
 | ------- | -------------- | --- |
