@@ -1934,9 +1934,7 @@ process DEPTH_CORRECTION {
     container params.container
 
     input:
-    tuple val(timepoint), path(image_file)
-    path metadata_json
-    path bin_dir
+    tuple val(timepoint), path(image_file), path(metadata_json), path(bin_dir)
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_depth.tif"), emit: corrected
@@ -1996,9 +1994,7 @@ process ISOTROPIC {
     container params.container
 
     input:
-    tuple val(timepoint), path(image_file)
-    path metadata_json
-    path bin_dir
+    tuple val(timepoint), path(image_file), path(metadata_json), path(bin_dir)
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_processed.tif"), emit: processed
@@ -4003,9 +3999,10 @@ input_channel = Channel.fromList(
 
         // Step 2: depth (Z) intensity correction, consumes planar output
         DEPTH_CORRECTION(
-            PLANAR_CORRECTION.out.corrected,
-            shared_metadata,
-            bin_dir_ch
+            PLANAR_CORRECTION.out.corrected
+                .combine(shared_metadata)
+                .combine(bin_dir_ch)
+                .map { it }
         )
 
         // Step 3: final geometric step. DOWNSCALE_XY (when downscaling is
@@ -4026,9 +4023,10 @@ input_channel = Channel.fromList(
         } else {
             log.info "Isotropic Z reslice to the raw XY voxel size"
             ISOTROPIC(
-                DEPTH_CORRECTION.out.corrected,
-                shared_metadata,
-                bin_dir_ch
+                DEPTH_CORRECTION.out.corrected
+                    .combine(shared_metadata)
+                    .combine(bin_dir_ch)
+                    .map { it }
             )
             segmentation_input = ISOTROPIC.out.processed
         }
