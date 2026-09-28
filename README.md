@@ -173,7 +173,7 @@ my_experiment/
 
 When the run is done, move it to the main server for sharing:
 
-`/groups/pinheiro/user/` is backed up and shared — keep it for finished results, never run jobs from there. I would recommend only moving to the server  01_preprocessed/  and 03_tracking/. 
+`/groups/pinheiro/user/` is backed up and shared — keep it for finished results, never run jobs from there. I would recommend only moving to the server  01_preprocessed/  and 03_tracking/, which already contains the segments.zarr with the segmentations masks from the tracking (see Ultrack Viewer below).
 
 ### 1.9 Overlay tracks on RAW signal (`raw_export`)
 
