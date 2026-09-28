@@ -175,6 +175,14 @@ When the run is done, move it to the main server for sharing:
 
 `/groups/pinheiro/user/` is backed up and shared — keep it for finished results, never run jobs from there. I would recommend only moving to the server  01_preprocessed/  and 03_tracking/, which already contains the segments.zarr with the segmentations masks from the tracking (see Ultrack Viewer below).
 
+To copy your data to the server, then:
+
+```bash
+cp output_folder /groups/pinheiro/user/<your_user>/ -r
+
+# Example : cp 03_tracking/ /groups/pinheiro/user/guilherme.ventura/2026/test/ -r
+```
+
 ### 1.9 Overlay tracks on RAW signal (`raw_export`)
 
 Shading correction, Z flattening, and isotropic resampling make segmentation easier but hide the real intensity when interpreting tracks. Only if you want to compare your processed image with the raw, then activate this. If you are not processing your images, this is redundant. `raw_export` runs `XY cubic rescale + optional isotropic Z resample` on the **raw** input (no shading correction) so you can load it as a viewer overlay:
