@@ -209,6 +209,7 @@ conda env create -f ultrack_viewer_env.yml
 conda activate ultrack-viewer
 ```
 
+You might find useful to copy the ultrack_viewer.py script to the folder where you data lies in the server.
 
 ### 2.2 Launch the viewer
 
