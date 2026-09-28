@@ -3745,17 +3745,34 @@ workflow {
             file_tuples = file_tuples.take(max_timepoints)
         }
 
+        // Build the channel the SAME way as the hyperstack path (Channel.fromPath
+        // + .map + .toSortedList + .flatMap). Previous attempts used
+        // `Channel.fromList(file_tuples.collect { ... })` which, on Nextflow
+        // 25.04.x with the existing terminal-operator chain, was producing
+        // exactly one downstream PLANAR_CORRECTION task regardless of the
+        // number of files. The fromList → queue bridge has subtle async
+        // interaction with later subscribers (first(), PLANAR) that does NOT
+        // affect the hyperstack path because that path produces its queue
+        // asynchronously from a process output. Using Channel.fromPath here
+        // goes through the same async path as SPLIT_INPUT_FILE.out.timepoints
+        // in the hyperstack branch.
         input_channel = Channel
-            .fromList(file_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) })
-            .ifEmpty { error "No TIF files could be loaded from: ${params.input_dir}" }
-            // NOTE: per-timepoint logging is done via `dump` (lazy) instead
-            // of `.subscribe`/`.view` here. Any terminal operator on the same
-            // channel as `PLANAR_CORRECTION(processing_input, ...)` can split
-            // or drain the queue in subtle ways depending on Nextflow version.
-            // See repo memory `folder_input_tap_subscribe_bug.md` for the
-            // full analysis. The per-timepoint log is purely cosmetic; the
-            // `Found N files matching pattern` line at parse time is
-            // sufficient to know the input enumeration succeeded.
+            .fromPath(input_dir_path.toString() + '/' + glob_pattern)
+            .map { f ->
+                def m = (f.getFileName().toString() =~ /t(\d+)_Channel/)
+                def tp = m.find() ? m.group(1).toInteger() : 0
+                tuple(tp, f)
+            }
+            .toSortedList { a, b -> a[0] <=> b[0] }
+            .flatMap { it }
+
+        // max_timepoints limit applied AFTER the toSortedList/flatMap so the
+        // sort is stable across runs (we always have all files in the sorted
+        // list, then drop the tail).
+        if (max_timepoints != null) {
+            log.info "Limiting input to first ${max_timepoints} timepoint(s) (input.max_timepoints)"
+            input_channel = input_channel.take(max_timepoints)
+        }
     } // end else (no hyperstack input)
 
     // OPTIONAL: ROI Cropping Step
