@@ -3745,34 +3745,20 @@ workflow {
             file_tuples = file_tuples.take(max_timepoints)
         }
 
-        // Build the channel the SAME way as the hyperstack path (Channel.fromPath
-        // + .map + .toSortedList + .flatMap). Previous attempts used
-        // `Channel.fromList(file_tuples.collect { ... })` which, on Nextflow
-        // 25.04.x with the existing terminal-operator chain, was producing
-        // exactly one downstream PLANAR_CORRECTION task regardless of the
-        // number of files. The fromList → queue bridge has subtle async
-        // interaction with later subscribers (first(), PLANAR) that does NOT
-        // affect the hyperstack path because that path produces its queue
-        // asynchronously from a process output. Using Channel.fromPath here
-        // goes through the same async path as SPLIT_INPUT_FILE.out.timepoints
-        // in the hyperstack branch.
-        input_channel = Channel
-            .fromPath(input_dir_path.toString() + '/' + glob_pattern)
-            .map { f ->
-                def m = (f.getFileName().toString() =~ /t(\d+)_Channel/)
-                def tp = m.find() ? m.group(1).toInteger() : 0
-                tuple(tp, f)
-            }
-            .toSortedList { a, b -> a[0] <=> b[0] }
-            .flatMap { it }
-
-        // max_timepoints limit applied AFTER the toSortedList/flatMap so the
-        // sort is stable across runs (we always have all files in the sorted
-        // list, then drop the tail).
-        if (max_timepoints != null) {
-            log.info "Limiting input to first ${max_timepoints} timepoint(s) (input.max_timepoints)"
-            input_channel = input_channel.take(max_timepoints)
-        }
+        // Build the channel with the MINIMUM operator chain: Channel.fromPath() →
+// .map(tuple). Previous attempts (Channel.fromList, then Channel.fromPath +
+// toSortedList + flatMap) were producing only ONE downstream PLANAR_CORRECTION
+// task even with 455 files. Drop every intermediate aggregator/transformer
+// operator and go straight from fromPath to a single .map(tuple). If the
+// queue still collapses to 1, the bug is downstream of the input channel —
+// not in it.
+input_channel = Channel.fromPath(
+    input_dir_path.toString() + '/' + glob_pattern
+).map { f ->
+    def m = (f.getFileName().toString() =~ /t(\d+)_Channel/)
+    def tp = m.find() ? m.group(1).toInteger() : 0
+    tuple(tp, f)
+}
     } // end else (no hyperstack input)
 
     // OPTIONAL: ROI Cropping Step
