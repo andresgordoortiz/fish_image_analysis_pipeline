@@ -221,7 +221,7 @@ conda activate ultrack-viewer
 Typical launch:
 
 ```powershell
-mamba activate ultrack-viewer
+conda activate ultrack-viewer
 python ultrack_viewer.py `
     --tracks    03_tracking\results\tracks.csv `
     --segments  03_tracking\results\segments.zarr `
