@@ -70,8 +70,8 @@ Toggles (`true` / `false`):
 | `roi_cropping.enabled`  | Crop each timepoint to a Fiji `.roi` |
 | `downscaling.enabled`   | XY downscale before segmentation (`downscaling.factor`) |
 | `raw_export.enabled`    | Export raw input sliced-isotropic + downscaled for viewer overlay (`raw_export`) |
-| `segmentation.enabled`  | Cellpose 3D |
-| `tracking.enabled`      | ultrack (needs `segmentation.enabled = true`) |
+| `segmentation.enabled`  | [Cellpose 3D](https://www.biorxiv.org/content/10.1101/2025.04.28.651001v1) |
+| `tracking.enabled`      | [ultrack](https://www.nature.com/articles/s41592-025-02778-0) (needs `segmentation.enabled = true`) |
 | `benchmark.enabled`     | Per-timepoint timing/memory report |
 
 **Path tips:** plain spaces (no `\"` escapes), absolute paths are safest, relative paths resolve against the repo dir. For tracking, set `voxel_size.{x,y,z}_um` explicitly (auto-detect is unreliable on some file formats).
