@@ -200,11 +200,13 @@ Output: `01b_raw_isotropic/<name>_raw_iso_Channel*.tif` (and the merged `4D_hype
 ### 2.1 Create the conda env (once)
 
 SSH / RDP into the GPU-1 server and run:
+**Git needs to be installed in your GPU-1 user**
 
 ```bash
-cd path/to/fish_image_analysis_pipeline
-mamba env create -f ultrack_viewer_env.yml
-mamba activate ultrack-viewer
+git clone https://github.com/andresgordoortiz/fish_image_analysis_pipeline.git
+cd fish_image_analysis_pipeline
+conda env create -f ultrack_viewer_env.yml
+conda activate ultrack-viewer
 ```
 
 ### 2.2 Reach your results
