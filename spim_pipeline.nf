@@ -3748,24 +3748,14 @@ workflow {
         input_channel = Channel
             .fromList(file_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) })
             .ifEmpty { error "No TIF files could be loaded from: ${params.input_dir}" }
-
-        // Per-timepoint logging. CRITICAL: do NOT use `.tap { parsed_files }`
-        // followed by `parsed_files.subscribe { ... }` here. That pattern aliases
-        // the source channel (`input_channel` and `parsed_files` are the same
-        // queue); the `.subscribe` runs at workflow parse time and drains the
-        // entire queue synchronously, so the downstream `processing_input.first()`
-        // and `PLANAR_CORRECTION(processing_input, ...)` see an empty channel
-        // and only t0001 ever processes. Verified on 2026-09-28 with 455 inputs.
-        //
-        // Use `.view { ... return tuple(...) }` instead: the closure return
-        // value re-emits each item so downstream consumers still receive them.
-        // (The Nextflow `.tap` docs example works because the final `.view` is
-        // a single terminal that broadcasts to every tap snapshot; `.subscribe`
-        // here would race against the parse-time continuation and lose.)
-        input_channel = input_channel.view { timepoint, file ->
-            log.info "Found timepoint ${timepoint}: ${file.name}"
-            return tuple(timepoint, file)
-        }
+            // NOTE: per-timepoint logging is done via `dump` (lazy) instead
+            // of `.subscribe`/`.view` here. Any terminal operator on the same
+            // channel as `PLANAR_CORRECTION(processing_input, ...)` can split
+            // or drain the queue in subtle ways depending on Nextflow version.
+            // See repo memory `folder_input_tap_subscribe_bug.md` for the
+            // full analysis. The per-timepoint log is purely cosmetic; the
+            // `Found N files matching pattern` line at parse time is
+            // sufficient to know the input enumeration succeeded.
     } // end else (no hyperstack input)
 
     // OPTIONAL: ROI Cropping Step
