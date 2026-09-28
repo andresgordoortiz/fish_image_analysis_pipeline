@@ -1305,8 +1305,8 @@ process DOWNSCALE_XY {
     container params.container
 
     input:
-    tuple val(timepoint), path(image_file), path(metadata_json), path(bin_dir),
-          val scale_factor, val reslice_isotropic
+    tuple val(timepoint), path(image_file), path(metadata_json), path(bin_dir)
+    val scale_factor, val reslice_isotropic
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_dscale_Channel*.tif"), emit: downscaled
@@ -1875,12 +1875,6 @@ process PLANAR_CORRECTION {
     container params.container
 
     input:
-    // CRITICAL: every per-timepoint input MUST be inside ONE `tuple`. On
-    // Nextflow 25.04.7, having `tuple val+path` first input PLUS a second
-    // `path` input collapses the cartesian product to a single task
-    // (verified locally on 2026-09-28, see repo memory
-    // nextflow_multi_path_input_cartesian_collapse.md). The fix is to
-    // consolidate into one tuple built at the call site via `.combine()`.
     tuple val(timepoint), path(image_file), path(metadata_json), path(bin_dir)
 
     output:
@@ -1941,7 +1935,9 @@ process DEPTH_CORRECTION {
     container params.container
 
     input:
-    tuple val(timepoint), path(image_file), path(metadata_json), path(bin_dir)
+    tuple val(timepoint), path(image_file)
+    path metadata_json
+    path bin_dir
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_depth.tif"), emit: corrected
@@ -2001,7 +1997,9 @@ process ISOTROPIC {
     container params.container
 
     input:
-    tuple val(timepoint), path(image_file), path(metadata_json), path(bin_dir)
+    tuple val(timepoint), path(image_file)
+    path metadata_json
+    path bin_dir
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_processed.tif"), emit: processed
@@ -2063,8 +2061,11 @@ process CELLPOSE_SEGMENT {
     container params.container
 
     input:
-    tuple val(timepoint), path(processed_file), path(metadata_json), path(bin_dir),
-          val segment_config, val image_scaling
+    tuple val(timepoint), path(processed_file)
+    path metadata_json
+    val segment_config
+    val image_scaling
+    path bin_dir
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_segmented.tif"), emit: segmented
@@ -3921,10 +3922,7 @@ input_channel = Channel.fromList(
             // preserve whatever Z geometry the external files already carry.
             if (run_standalone_downscaling) {
                 log.info "Applying DOWNSCALE_XY (factor=${effective_scaling}) on user-supplied preprocessed files; Z reslice skipped"
-                DOWNSCALE_XY(segmentation_input
-                    .combine(shared_metadata)
-                    .combine(bin_dir_ch)
-                    .map { tup -> tup + [effective_scaling, false] })
+                DOWNSCALE_XY(segmentation_input, shared_metadata, effective_scaling, false, bin_dir_ch)
                 segmentation_input = DOWNSCALE_XY.out.downscaled
             }
         } else if (run_standalone_downscaling) {
@@ -3932,10 +3930,7 @@ input_channel = Channel.fromList(
             if (isotropic_reslice) {
                 log.info "  (also isotropic Z reslice, in the same DOWNSCALE_XY task)"
             }
-            DOWNSCALE_XY(processing_input
-                .combine(shared_metadata)
-                .combine(bin_dir_ch)
-                .map { tup -> tup + [effective_scaling, isotropic_reslice] })
+            DOWNSCALE_XY(processing_input, shared_metadata, effective_scaling, isotropic_reslice, bin_dir_ch)
             segmentation_input = DOWNSCALE_XY.out.downscaled
         } else if (isotropic_reslice) {
             log.info "Preprocessing SKIPPED — applying lightweight isotropic Z reslicing only (preprocessing.isotropic_reslice=true)"
@@ -3999,10 +3994,9 @@ input_channel = Channel.fromList(
 
         // Step 2: depth (Z) intensity correction, consumes planar output
         DEPTH_CORRECTION(
-            PLANAR_CORRECTION.out.corrected
-                .combine(shared_metadata)
-                .combine(bin_dir_ch)
-                .map { it }
+            PLANAR_CORRECTION.out.corrected,
+            shared_metadata,
+            bin_dir_ch
         )
 
         // Step 3: final geometric step. DOWNSCALE_XY (when downscaling is
@@ -4023,10 +4017,9 @@ input_channel = Channel.fromList(
         } else {
             log.info "Isotropic Z reslice to the raw XY voxel size"
             ISOTROPIC(
-                DEPTH_CORRECTION.out.corrected
-                    .combine(shared_metadata)
-                    .combine(bin_dir_ch)
-                    .map { it }
+                DEPTH_CORRECTION.out.corrected,
+                shared_metadata,
+                bin_dir_ch
             )
             segmentation_input = ISOTROPIC.out.processed
         }
@@ -4041,10 +4034,11 @@ input_channel = Channel.fromList(
 
         if (!bypass_hyperstacks) {
             CELLPOSE_SEGMENT(
-                segmentation_input
-                    .combine(shared_metadata)
-                    .combine(bin_dir_ch)
-                    .map { tup -> tup + [config.segmentation, effective_scaling] }
+                segmentation_input,
+                shared_metadata,
+                config.segmentation,
+                effective_scaling,
+                bin_dir_ch
             )
 
             // 4. OPTIONAL: Downscale segmented labels using Fiji headless (nearest-neighbor)
