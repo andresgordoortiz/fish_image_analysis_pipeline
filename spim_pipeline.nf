@@ -3748,11 +3748,23 @@ workflow {
         input_channel = Channel
             .fromList(file_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) })
             .ifEmpty { error "No TIF files could be loaded from: ${params.input_dir}" }
-            .tap { parsed_files }
 
-        // Log parsed files
-        parsed_files.subscribe { timepoint, file ->
+        // Per-timepoint logging. CRITICAL: do NOT use `.tap { parsed_files }`
+        // followed by `parsed_files.subscribe { ... }` here. That pattern aliases
+        // the source channel (`input_channel` and `parsed_files` are the same
+        // queue); the `.subscribe` runs at workflow parse time and drains the
+        // entire queue synchronously, so the downstream `processing_input.first()`
+        // and `PLANAR_CORRECTION(processing_input, ...)` see an empty channel
+        // and only t0001 ever processes. Verified on 2026-09-28 with 455 inputs.
+        //
+        // Use `.view { ... return tuple(...) }` instead: the closure return
+        // value re-emits each item so downstream consumers still receive them.
+        // (The Nextflow `.tap` docs example works because the final `.view` is
+        // a single terminal that broadcasts to every tap snapshot; `.subscribe`
+        // here would race against the parse-time continuation and lose.)
+        input_channel = input_channel.view { timepoint, file ->
             log.info "Found timepoint ${timepoint}: ${file.name}"
+            return tuple(timepoint, file)
         }
     } // end else (no hyperstack input)
 
