@@ -1305,8 +1305,7 @@ process DOWNSCALE_XY {
     container params.container
 
     input:
-    tuple val(timepoint), path(image_file), path(metadata_json), path(bin_dir)
-    val scale_factor, val reslice_isotropic
+    tuple val(timepoint), path(image_file), path(metadata_json), path(bin_dir), val(scale_factor), val(reslice_isotropic)
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_dscale_Channel*.tif"), emit: downscaled
@@ -3922,7 +3921,12 @@ input_channel = Channel.fromList(
             // preserve whatever Z geometry the external files already carry.
             if (run_standalone_downscaling) {
                 log.info "Applying DOWNSCALE_XY (factor=${effective_scaling}) on user-supplied preprocessed files; Z reslice skipped"
-                DOWNSCALE_XY(segmentation_input, shared_metadata, effective_scaling, false, bin_dir_ch)
+                DOWNSCALE_XY(
+                    segmentation_input
+                        .combine(shared_metadata)
+                        .combine(bin_dir_ch)
+                        .map { tup -> tuple(tup[0], tup[1], tup[2], tup[3], effective_scaling, false) }
+                )
                 segmentation_input = DOWNSCALE_XY.out.downscaled
             }
         } else if (run_standalone_downscaling) {
@@ -3930,7 +3934,12 @@ input_channel = Channel.fromList(
             if (isotropic_reslice) {
                 log.info "  (also isotropic Z reslice, in the same DOWNSCALE_XY task)"
             }
-            DOWNSCALE_XY(processing_input, shared_metadata, effective_scaling, isotropic_reslice, bin_dir_ch)
+            DOWNSCALE_XY(
+                processing_input
+                    .combine(shared_metadata)
+                    .combine(bin_dir_ch)
+                    .map { tup -> tuple(tup[0], tup[1], tup[2], tup[3], effective_scaling, isotropic_reslice) }
+            )
             segmentation_input = DOWNSCALE_XY.out.downscaled
         } else if (isotropic_reslice) {
             log.info "Preprocessing SKIPPED — applying lightweight isotropic Z reslicing only (preprocessing.isotropic_reslice=true)"
@@ -4010,7 +4019,7 @@ input_channel = Channel.fromList(
                 DEPTH_CORRECTION.out.corrected
                     .combine(shared_metadata)
                     .combine(bin_dir_ch)
-                    .map { tup -> tup + [effective_scaling, true] }
+                    .map { tup -> tuple(tup[0], tup[1], tup[2], tup[3], effective_scaling, true) }
                 // do_iso=true: reslice Z to match the new (halved) XY
             )
             segmentation_input = DOWNSCALE_XY.out.downscaled
