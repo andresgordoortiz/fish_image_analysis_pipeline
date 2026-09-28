@@ -2056,11 +2056,7 @@ process CELLPOSE_SEGMENT {
     container params.container
 
     input:
-    tuple val(timepoint), path(processed_file)
-    path metadata_json
-    val segment_config
-    val image_scaling
-    path bin_dir
+    tuple val(timepoint), path(processed_file), path(metadata_json), path(bin_dir), val(segment_config), val(image_scaling)
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_segmented.tif"), emit: segmented
@@ -4041,11 +4037,10 @@ input_channel = Channel.fromList(
 
         if (!bypass_hyperstacks) {
             CELLPOSE_SEGMENT(
-                segmentation_input,
-                shared_metadata,
-                config.segmentation,
-                effective_scaling,
-                bin_dir_ch
+                segmentation_input
+                    .combine(shared_metadata)
+                    .combine(bin_dir_ch)
+                    .map { tup -> tuple(tup[0], tup[1], tup[2], tup[3], config.segmentation, effective_scaling) }
             )
 
             // 4. OPTIONAL: Downscale segmented labels using Fiji headless (nearest-neighbor)
