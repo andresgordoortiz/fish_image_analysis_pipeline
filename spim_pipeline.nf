@@ -1174,8 +1174,7 @@ process RESLICE_ISOTROPIC {
     container params.container
 
     input:
-    tuple val(timepoint), path(image_file)
-    path metadata_json
+    tuple val(timepoint), path(image_file), path(metadata_json)
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_iso_Channel*.tif"), emit: resliced
@@ -3935,7 +3934,11 @@ input_channel = Channel.fromList(
             segmentation_input = DOWNSCALE_XY.out.downscaled
         } else if (isotropic_reslice) {
             log.info "Preprocessing SKIPPED — applying lightweight isotropic Z reslicing only (preprocessing.isotropic_reslice=true)"
-            RESLICE_ISOTROPIC(processing_input, shared_metadata)
+            RESLICE_ISOTROPIC(
+                processing_input
+                    .combine(shared_metadata)
+                    .map { it }
+            )
             segmentation_input = RESLICE_ISOTROPIC.out.resliced
         } else {
             log.info "Preprocessing SKIPPED — using raw input images for segmentation (no isotropic reslicing)"
