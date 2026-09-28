@@ -80,6 +80,8 @@ Toggles (`true` / `false`):
 
 ### 1.4 Container images
 
+> **What is a container?** A self-contained, portable software that bundles an application together with **all** of its dependencies — Python packages, system libraries, binaries, even a minimal OS — into a single image file. Running inside the image guarantees the same software environment everywhere (your laptop, the HPC login node, a compute node), regardless of what's installed on the host. This pipeline uses [Apptainer](https://apptainer.org/) (formerly Singularity), which is the container runtime supported on most HPC clusters.
+
 Every process runs inside Apptainer. The pipeline needs three pre-pulled images on a shared filesystem (compute nodes have no internet):
 
 | Container | Used by | Default |
