@@ -3745,20 +3745,21 @@ workflow {
             file_tuples = file_tuples.take(max_timepoints)
         }
 
-        // Build the channel with the MINIMUM operator chain: Channel.fromPath() →
-// .map(tuple). Previous attempts (Channel.fromList, then Channel.fromPath +
-// toSortedList + flatMap) were producing only ONE downstream PLANAR_CORRECTION
-// task even with 455 files. Drop every intermediate aggregator/transformer
-// operator and go straight from fromPath to a single .map(tuple). If the
-// queue still collapses to 1, the bug is downstream of the input channel —
-// not in it.
-input_channel = Channel.fromPath(
-    input_dir_path.toString() + '/' + glob_pattern
-).map { f ->
-    def m = (f.getFileName().toString() =~ /t(\d+)_Channel/)
-    def tp = m.find() ? m.group(1).toInteger() : 0
-    tuple(tp, f)
-}
+        // Build the channel from the already-enumerated and sorted file_tuples
+// list. The list was built via `Files.list(input_dir_path)` + Java's glob
+// `PathMatcher` (lines 3558-3563), which correctly handles literal spaces
+// in the glob pattern (unlike `Channel.fromPath` which on Nextflow 25.04.7
+// collapses to 1 emit when the glob contains a space — verified locally
+// with 10 fake `t*_Channel 2.tif` files on 2026-09-28, see repo memory
+// `folder_input_glob_space_bug.md`).
+//
+// Do NOT add `.tap { x }` followed by `x.subscribe { ... }` here either:
+// that pattern aliases the source channel and Nextflow's `subscribe`
+// operator (nextflow-io/nextflow#5354) partitions items across the two
+// subscribers non-deterministically — only t0001 reliably reaches PLANAR.
+input_channel = Channel.fromList(
+    file_tuples.collect { tp, f -> tuple(tp, file(f.toPath())) }
+)
     } // end else (no hyperstack input)
 
     // OPTIONAL: ROI Cropping Step
