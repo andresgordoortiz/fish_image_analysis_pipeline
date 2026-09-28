@@ -173,11 +173,7 @@ my_experiment/
 
 When the run is done, move it to the main server for sharing:
 
-```bash
-rsync -avh --progress /scratch-cbe/users/$USER/results/my_experiment/ /groups/pinheiro/user/$USER/
-```
-
-`/groups/pinheiro/user/` is backed up and shared — keep it for finished results, never run jobs from there.
+`/groups/pinheiro/user/` is backed up and shared — keep it for finished results, never run jobs from there. I would recommend only moving to the server  01_preprocessed/  and 03_tracking/. 
 
 ### 1.9 Overlay tracks on RAW signal (`raw_export`)
 
