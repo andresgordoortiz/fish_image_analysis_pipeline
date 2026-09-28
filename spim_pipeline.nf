@@ -1530,10 +1530,7 @@ process EXPORT_RAW_ISOTROPIC {
     container params.container
 
     input:
-    tuple val(timepoint), path(image_file)
-    path metadata_json
-    val scale_factor
-    val reslice_isotropic
+    tuple val(timepoint), path(image_file), path(metadata_json), val(scale_factor), val(reslice_isotropic)
 
     output:
     tuple val(timepoint), path("t${String.format('%04d', timepoint)}_raw_iso_Channel*.tif"), emit: raw_iso
@@ -3834,10 +3831,9 @@ input_channel = Channel.fromList(
     if (raw_export_enabled) {
         log.info "Raw export ENABLED — producing downscaled+isotropic RAW volumes for track overlay (factor=${raw_export_factor}, iso=${raw_export_iso})"
         EXPORT_RAW_ISOTROPIC(
-            processing_input,
-            shared_metadata,
-            raw_export_factor,
-            raw_export_iso
+            processing_input
+                .combine(shared_metadata)
+                .map { tup -> tuple(tup[0], tup[1], raw_export_factor, raw_export_iso) }
         )
         raw_iso_input = EXPORT_RAW_ISOTROPIC.out.raw_iso
     } else {
