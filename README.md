@@ -20,7 +20,7 @@ cd fish_image_analysis_pipeline
 
 # 2. Edit config.json — at minimum set input.directory, output.directory.
 #    Containers, Gurobi licence, Seqera token: see § 1.5, § 1.6, § 1.4.
-
+nano config.json
 # 3. Submit
 sbatch submit_pipeline.sh config.json
 ```
