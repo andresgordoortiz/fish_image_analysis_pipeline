@@ -177,7 +177,7 @@ When the run is done, move it to the main server for sharing:
 
 ### 1.9 Overlay tracks on RAW signal (`raw_export`)
 
-Shading correction, Z flattening, and isotropic resampling make segmentation easier but hide the real intensity when interpreting tracks. Only if you want to compare your processed image with the raw actiavte this. If youa re not processing your images, this is redundant. `raw_export` runs `XY cubic rescale + optional isotropic Z resample` on the **raw** input (no shading correction) so you can load it as a viewer overlay:
+Shading correction, Z flattening, and isotropic resampling make segmentation easier but hide the real intensity when interpreting tracks. Only if you want to compare your processed image with the raw, then activate this. If you are not processing your images, this is redundant. `raw_export` runs `XY cubic rescale + optional isotropic Z resample` on the **raw** input (no shading correction) so you can load it as a viewer overlay:
 
 ```json
 { "raw_export": { "enabled": true, "factor": 0.33, "isotropic_reslice": true } }
