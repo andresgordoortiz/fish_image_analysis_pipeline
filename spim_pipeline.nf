@@ -1561,7 +1561,14 @@ process EXPORT_RAW_ISOTROPIC {
     # `decode('latin-1', errors='replace')` etc -- those tripped
     # Groovy's GString parser at the embedded `?"` sequence.
     # See script_block_gstring_escaping.md rounds 5 and 8.
-    cp "\${workflow.projectDir}/bin/_raw_iso_io.py" _raw_iso_io.py
+    # NOTE: \${workflow.projectDir} would let Groovy emit a literal
+    # `${workflow.projectDir}` to bash, which then fails with "bad
+    # substitution" because `workflow` is a Nextflow variable, not a
+    # bash variable. Interpolate here in Groovy so bash sees a resolved
+    # path. The same pattern exists at line ~557 in EXTRACT_METADATA's
+    # `cp _ims_reader.py` line — also a latent bug that only triggers
+    # for .ims/.h5/.hdf5 inputs.
+    cp "${workflow.projectDir}/bin/_raw_iso_io.py" _raw_iso_io.py
     python3 _raw_iso_io.py export \\
         "${filename}" \\
         "t${t_formatted}_raw_iso_Channel \$(echo "${filename}" | sed -nE 's/.*_Channel[ ]([0-9]+)\\.tif/\\1/p').tif" \\
