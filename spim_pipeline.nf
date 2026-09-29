@@ -3832,8 +3832,22 @@ input_channel = Channel.fromList(
         log.info "Raw export ENABLED — producing downscaled+isotropic RAW volumes for track overlay (factor=${raw_export_factor}, iso=${raw_export_iso})"
         EXPORT_RAW_ISOTROPIC(
             processing_input
+                // processing_input is tuple(timepoint, image_file) and
+                // .combine(shared_metadata) extends it to a 3-tuple
+                // (timepoint, image_file, metadata_json). EXPORT_RAW_ISOTROPIC
+                // declares a 5-element input tuple
+                //   tuple val(timepoint), path(image_file),
+                //          path(metadata_json), val(scale_factor),
+                //          val(reslice_isotropic)
+                // so we MUST forward tup[2] (metadata_json). A previous
+                // version of this .map only forwarded tup[0..1], which
+                // caused Nextflow to abort with "Input tuple does not
+                // match tuple declaration" (4-element offending value,
+                // missing metadata_json).
                 .combine(shared_metadata)
-                .map { tup -> tuple(tup[0], tup[1], raw_export_factor, raw_export_iso) }
+                .map { timepoint, image_file, metadata_json ->
+                    tuple(timepoint, image_file, metadata_json, raw_export_factor, raw_export_iso)
+                }
         )
         raw_iso_input = EXPORT_RAW_ISOTROPIC.out.raw_iso
     } else {
