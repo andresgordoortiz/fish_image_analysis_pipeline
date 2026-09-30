@@ -203,7 +203,9 @@ Output: `01b_raw_isotropic/<name>_raw_iso_Channel*.tif` (and the merged `4D_hype
 
 ## Part 2 · Visualise results with `ultrack_viewer` (GPU-1)
 
-`ultrack_viewer.py` is a napari GUI for browsing the processed volume, segmentation labels, and tracks side-by-side. Run it on the **GPU-1** server (GPU-2 is currently not configured for this viewer).
+`ultrack_viewer.py` is a napari GUI for browsing the processed volume, segmentation labels, and tracks side-by-side. Run it on the **GPU-1** server (GPU-2 is currently not configured for this viewer). 
+
+**Important**: Please be mindful of the expected amount of RAM your dataset will use. The GPU-1 server has 500Gb of RAM available. If you load the --processed or --raw data, its total size will be loaded into RAM. Confocal images should cause no problem, but mindful when using lightsheet datasets.
 
 ### 2.1 Create the conda env (once)
 
